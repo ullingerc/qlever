@@ -571,6 +571,34 @@ TEST(ExportQueryExecutionTrees, GeoPoints) {
                            "literal", "POINT(50.000000 50.000000)")}),
       expectedXml};
   runSelectQueryTestCase(testCase);
+
+  // test that non-point literal is left untouched
+  std::string kg2 =
+      "<s> <p> "
+      "\"POLYGON(7.8 47.9, 40.0 40.5, 10.9 "
+      "20.5)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>.";
+  std::string query2 = "SELECT ?o WHERE {?s ?p ?o} ORDER BY ?o";
+  std::string expectedXml2 = makeXMLHeader({"o"}) +
+                             R"(
+  <result>
+    <binding name="o"><literal datatype="http://www.opengis.net/ont/geosparql#wktLiteral">POLYGON(7.8 47.9, 40.0 40.5, 10.9 20.5)</literal></binding>
+  </result>)" + xmlTrailer;
+  TestCaseSelectQuery testCase2{
+      kg2, query2, 1,
+      // TSV
+      "?o\n"
+      "\"POLYGON(7.8 47.9, 40.0 40.5, 10.9 "
+      "20.5)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>\n",
+      "o\n"
+      "\"POLYGON(7.8 47.9, 40.0 40.5, 10.9 20.5)\"\n",
+      makeExpectedQLeverJSON(
+          {"\"POLYGON(7.8 47.9, 40.0 40.5, 10.9 20.5)\""
+           "^^<http://www.opengis.net/ont/geosparql#wktLiteral>"s}),
+      makeExpectedSparqlJSON({makeJSONBinding(
+          "http://www.opengis.net/ont/geosparql#wktLiteral", "literal",
+          "POLYGON(7.8 47.9, 40.0 40.5, 10.9 20.5)")}),
+      expectedXml2};
+  runSelectQueryTestCase(testCase2);
 }
 
 // ____________________________________________________________________________
