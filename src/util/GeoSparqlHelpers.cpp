@@ -17,7 +17,7 @@
 #include <string_view>
 
 #include "global/Constants.h"
-#include "parser/GeoPoint.h"
+#include "parser/GeoPointImpl.h"
 #include "util/Exception.h"
 
 namespace ad_utility {
