@@ -13,8 +13,10 @@
 #include "index/vocabulary/PolymorphicVocabulary.h"
 #include "index/vocabulary/SplitVocabulary.h"
 #include "index/vocabulary/VocabularyTypes.h"
+#include "parser/Tokenizer.h"
+#include "rdfTypes/GeometryInfo.h"
+#include "rdfTypes/RdfEscaping.h"
 #include "util/Exception.h"
-#include "util/GeometryInfo.h"
 #include "util/HashSet.h"
 #include "util/TypeTraits.h"
 

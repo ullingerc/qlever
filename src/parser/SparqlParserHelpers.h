@@ -65,6 +65,11 @@ struct ParserAndVisitor {
                                          std::string{remainingString}};
   }
 };
+
+// This function returns true iff the argument is a valid name for a SPARQL
+// variable. It uses the SPARQL parser and is therefore relatively expensive.
+bool isValidVariableName(std::string_view var);
+
 }  // namespace sparqlParserHelpers
 
 #endif  // QLEVER_SPARQLPARSERHELPERS_H
