@@ -10,7 +10,6 @@
 #include "index/vocabulary/VocabularyInMemory.h"
 #include "index/vocabulary/VocabularyInternalExternal.h"
 #include "util/Exception.h"
-#include "util/GeometryInfo.h"
 
 // ____________________________________________________________________________
 template <typename V>

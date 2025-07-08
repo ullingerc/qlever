@@ -10,9 +10,9 @@
 #include <string>
 
 #include "index/vocabulary/VocabularyTypes.h"
+#include "rdfTypes/GeometryInfo.h"
 #include "util/ExceptionHandling.h"
 #include "util/File.h"
-#include "util/GeometryInfo.h"
 
 using ad_utility::GeometryInfo;
 
