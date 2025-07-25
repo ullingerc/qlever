@@ -31,7 +31,8 @@ WKTParser::WKTParser(sj::Sweeper* sweeper, size_t numThreads,
       _numSkipped(numThreads),
       _usePrefiltering(usePrefiltering),
       _prefilterLatLngBox(prefilterLatLngBox),
-      _index(index) {
+      _index(index),
+      _boundingBoxCache(index.getVocab().getBoundingBoxCache()) {
   for (size_t i = 0; i < _thrds.size(); i++) {
     _thrds[i] = std::thread(&WKTParser::processQueue, this, i);
   }
@@ -217,7 +218,8 @@ void WKTParser::processQueue(size_t t) {
         // bounding box for the geometry this `VocabIndex` is referring to.
         if (_usePrefiltering &&
             SpatialJoinAlgorithms::prefilterGeoByBoundingBox(
-                _prefilterLatLngBox, _index, job.valueId.getVocabIndex())) {
+                _prefilterLatLngBox, _boundingBoxCache, _index,
+                job.valueId.getVocabIndex())) {
           prefilterCounter++;
           continue;
         }

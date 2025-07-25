@@ -40,19 +40,36 @@ SpatialJoinAlgorithms::SpatialJoinAlgorithms(
 // ____________________________________________________________________________
 bool SpatialJoinAlgorithms::prefilterGeoByBoundingBox(
     const std::optional<util::geo::DBox>& prefilterLatLngBox,
-    const Index& index, VocabIndex vocabIndex) {
+    const ad_utility::BoundingBoxCache& bbCache, const Index& index,
+    VocabIndex vocabIndex) {
   if (prefilterLatLngBox.has_value()) {
-    auto geoInfo = index.getVocab().getGeoInfo(vocabIndex);
-    if (geoInfo.has_value()) {
-      // We have a bounding box: Check intersection with prefilter box.
-      auto boundingBox = ad_utility::detail::boundingBoxToUtilBox(
-          geoInfo.value().getBoundingBox());
-      return !util::geo::intersects(prefilterLatLngBox.value(), boundingBox);
+    if (bbCache.has_value()) {
+      static constexpr size_t mask = ad_utility::bitMaskForLowerBits(59);
+      auto encBB = (bbCache.value()->at(vocabIndex.get() & mask));
+      if (!encBB.has_value()) {
+        return true;
+      }
+      auto ll =
+          GeoPoint::fromBitRepresentation(encBB.value().lowerLeftEncoded_);
+      auto ur =
+          GeoPoint::fromBitRepresentation(encBB.value().upperRightEncoded_);
+      return !util::geo::intersects(
+          prefilterLatLngBox.value(),
+          util::geo::DBox{{ll.getLng(), ll.getLat()},
+                          {ur.getLng(), ur.getLat()}});
     } else {
-      // Since we know that this function is only called if we have a
-      // `GeoVocabulary`, we know that a geometry without precomputed bounding
-      // box must be invalid and can thus be skipped.
-      return true;
+      auto geoInfo = index.getVocab().getGeoInfo(vocabIndex);
+      if (geoInfo.has_value()) {
+        // We have a bounding box: Check intersection with prefilter box.
+        auto boundingBox = ad_utility::detail::boundingBoxToUtilBox(
+            geoInfo.value().getBoundingBox());
+        return !util::geo::intersects(prefilterLatLngBox.value(), boundingBox);
+      } else {
+        // Since we know that this function is only called if we have a
+        // `GeoVocabulary`, we know that a geometry without precomputed bounding
+        // box must be invalid and can thus be skipped.
+        return true;
+      }
     }
   }
   // If we don't have the required information, we cannot discard the geometry.

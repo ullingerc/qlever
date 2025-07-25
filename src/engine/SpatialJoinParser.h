@@ -77,6 +77,8 @@ class WKTParser {
   bool _usePrefiltering;
   const std::optional<util::geo::DBox>& _prefilterLatLngBox;
   const Index& _index;
+
+  const ad_utility::BoundingBoxCache _boundingBoxCache;
 };
 
 }  // namespace sjTemp
