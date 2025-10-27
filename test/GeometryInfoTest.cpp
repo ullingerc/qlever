@@ -14,6 +14,7 @@
 #include "rdfTypes/GeometryInfoHelpersImpl.h"
 #include "util/GTestHelpers.h"
 #include "util/GeoConverters.h"
+#include "util/Timer.h"
 #include "util/geo/Collection.h"
 #include "util/geo/Geo.h"
 
@@ -415,6 +416,22 @@ TEST(GeometryInfoTest, ComputeMetricAreaMultipolygon) {
   // Edge case: multipolygon with only one member
   testMetricArea<MultiP>(litSmallRealWorldPolygon2AsMulti,
                          areaSmallRealWorldPolygon2);
+}
+
+TEST(GeometryInfoTest, areaperf) {
+  using namespace ad_utility::detail;
+  // const auto parsed = getGeometryOfTypeOrThrow<MultiPolygon<CoordType>>(
+  //     litRealWorldMultiPolygonHoleIntersection);
+  ad_utility::Timer x{ad_utility::Timer::Started};
+
+  for (size_t i = 0; i < 1'000'000; ++i) {
+    // computeMetricArea(ParsedWkt{parsed});
+    // GeometryInfo::fromWktLiteral(litRealWorldMultiPolygonHoleIntersection);
+    GeometryInfo::fromWktLiteral(litSmallRealWorldPolygon1);
+    // GeometryInfo::fromWktLiteral(litShortRealWorldLine);
+  }
+
+  std::cout << "TIMER " << x.msecs().count() << std::endl;
 }
 
 // ____________________________________________________________________________

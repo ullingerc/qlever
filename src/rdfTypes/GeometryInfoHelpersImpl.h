@@ -342,6 +342,38 @@ inline MultiPolygon<CoordType> collectionToMultiPolygon(
   return polygons;
 }
 
+inline double areaLambert(::util::geo::DMultiPolygon _geom) {
+  // poly in area preserving projection
+  ::util::geo::DMultiPolygon lambertPoly;
+  lambertPoly.resize(_geom.size());
+
+  double EARTH_RAD = 6371008.7714;  // mean radius
+
+  for (size_t i = 0; i < _geom.size(); i++) {
+    const auto& poly = _geom[i];
+    lambertPoly[i].getOuter().reserve(poly.getOuter().size());
+    for (const auto& p : poly.getOuter()) {
+      lambertPoly[i].getOuter().push_back(
+          ::util::geo::DPoint{EARTH_RAD * (p.getX() * util::geo::RAD),
+                              EARTH_RAD * (sin(p.getY() * util::geo::RAD))});
+    }
+
+    lambertPoly[i].getInners().reserve(poly.getInners().size());
+
+    for (const auto& inner : poly.getInners()) {
+      lambertPoly[i].getInners().push_back({});
+      lambertPoly[i].getInners().back().reserve(inner.size());
+      for (const auto& p : inner) {
+        lambertPoly[i].getInners().back().push_back(
+            ::util::geo::DPoint{EARTH_RAD * (p.getX() * util::geo::RAD),
+                                EARTH_RAD * (sin(p.getY() * util::geo::RAD))});
+      }
+    }
+  }
+
+  return ::util::geo::area(lambertPoly);
+}
+
 // Helper to implement the computation of metric area for the different
 // geometry types.
 struct MetricAreaVisitor {
@@ -352,10 +384,12 @@ struct MetricAreaVisitor {
   }
 
   double operator()(const Polygon<CoordType>& polygon) const {
+    // return areaLambert({polygon});
     return MetricAreaVisitor{}(makeS2Polygon(polygon));
   }
 
   double operator()(const MultiPolygon<CoordType>& polygons) const {
+    // return areaLambert(polygons);
     // Empty multipolygon has empty area
     if (polygons.empty()) {
       return 0.0;
