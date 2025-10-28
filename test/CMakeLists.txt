@@ -173,6 +173,8 @@ addLinkAndDiscoverTestNoLibs(HashMapTest)
 
 addLinkAndDiscoverTest(HashSetTest)
 
+addLinkAndDiscoverTestSerial(AreaPerf engine)
+
 addLinkAndDiscoverTestSerial(GroupByTest engine)
 
 addLinkAndDiscoverTest(VocabularyGeneratorTest index)

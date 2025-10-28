@@ -418,22 +418,6 @@ TEST(GeometryInfoTest, ComputeMetricAreaMultipolygon) {
                          areaSmallRealWorldPolygon2);
 }
 
-TEST(GeometryInfoTest, areaperf) {
-  using namespace ad_utility::detail;
-  // const auto parsed = getGeometryOfTypeOrThrow<MultiPolygon<CoordType>>(
-  //     litRealWorldMultiPolygonHoleIntersection);
-  ad_utility::Timer x{ad_utility::Timer::Started};
-
-  for (size_t i = 0; i < 1'000'000; ++i) {
-    // computeMetricArea(ParsedWkt{parsed});
-    // GeometryInfo::fromWktLiteral(litRealWorldMultiPolygonHoleIntersection);
-    GeometryInfo::fromWktLiteral(litSmallRealWorldPolygon1);
-    // GeometryInfo::fromWktLiteral(litShortRealWorldLine);
-  }
-
-  std::cout << "TIMER " << x.msecs().count() << std::endl;
-}
-
 // ____________________________________________________________________________
 TEST(GeometryInfoTest, ComputeMetricAreaCollection) {
   using namespace ad_utility::detail;

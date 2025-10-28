@@ -400,13 +400,22 @@ struct MetricAreaVisitor {
     }
     // For a multipolygon with multiple members, we need to compute the union of
     // the polygons to determine their area.
-    // TODO<ullingerc>: the number of steps could be reduced by building the
-    // union in pairs (like divide-and-conquer) or using `S2Builder`
-    auto unionPolygon = makeS2Polygon(polygons.at(0));
-    for (size_t i = 1; i < polygons.size(); ++i) {
-      unionPolygon.InitToUnion(unionPolygon, makeS2Polygon(polygons.at(i)));
+    std::vector<std::unique_ptr<S2Polygon>> s2polygons;
+    s2polygons.reserve(polygons.size());
+    for (const auto& poly : polygons) {
+      auto s2poly = makeS2Polygon(poly);
+      s2polygons.push_back(std::make_unique<S2Polygon>(std::move(s2poly)));
     }
-    return MetricAreaVisitor{}(unionPolygon);
+    // static const S1Angle snapRadius = S1Angle::Radians(1e-7);
+    // auto unionPolygon =
+    //     S2Polygon::DestructiveApproxUnion(std::move(s2polygons), snapRadius);
+    auto unionPolygon = S2Polygon::DestructiveUnion(std::move(s2polygons));
+    return S2Earth::SteradiansToSquareMeters(unionPolygon->GetArea());
+    // auto unionPolygon = makeS2Polygon(polygons.at(0));
+    // for (size_t i = 1; i < polygons.size(); ++i) {
+    //   unionPolygon.InitToUnion(unionPolygon, makeS2Polygon(polygons.at(i)));
+    // }
+    // return MetricAreaVisitor{}(unionPolygon);
   }
 
   // Compute the area in square meters of a geometry collection
