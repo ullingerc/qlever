@@ -5,12 +5,16 @@
 #ifndef QLEVER_SRC_INDEX_VOCABULARY_GEOVOCABULARY_H
 #define QLEVER_SRC_INDEX_VOCABULARY_GEOVOCABULARY_H
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <queue>
 #include <string>
+#include <thread>
 
 #include "index/vocabulary/VocabularyTypes.h"
 #include "rdfTypes/GeometryInfo.h"
+#include "util/BatchedPipeline.h"
 #include "util/ExceptionHandling.h"
 #include "util/File.h"
 
@@ -107,6 +111,15 @@ class GeoVocabulary {
     size_t numInvalidGeometries_ = 0;
     size_t numInvalidPolygonArea_ = 0;
 
+    size_t counter_ = 0;
+
+    //
+    std::thread pipelineThread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::queue<std::pair<std::string_view, bool>> queue_;
+    bool finished_ = false;
+
    public:
     // Initialize the `geoInfoFile_` by writing its header and open a word
     // writer on the underlying vocabulary.
@@ -120,6 +133,49 @@ class GeoVocabulary {
     // Finish the writing on the underlying writer and close the `geoInfoFile_`
     // file handle. After this no more calls to `operator()` are allowed.
     void finishImpl() override;
+
+    //
+    void startPipeline() {
+      pipelineThread_ = std::thread([this] {
+        auto p = ad_pipeline::setupParallelPipeline<8>(
+            20,
+            [this]() -> std::optional<std::pair<std::string_view, bool>> {
+              std::unique_lock lock{mutex_};
+              cv_.wait(lock, [&] { return finished_ || !queue_.empty(); });
+              if (queue_.empty()) {
+                return std::nullopt;
+              }
+              auto v = queue_.front();
+              queue_.pop();
+              return v;
+            },
+            [](const std::pair<std::string_view, bool> x)
+                -> std::tuple<std::string_view, bool,
+                              std::optional<GeometryInfo>> {
+              return {x.first, x.second, GeometryInfo::fromWktLiteral(x.first)};
+            });
+        while (auto opt = p.getNextValue()) {
+          const auto& [word, isExternal, info] = opt.value();
+          // Store the WKT literal as a string in the underlying vocabulary
+          (*underlyingWordWriter_)(word, isExternal);
+
+          // Precompute `GeometryInfo` and write the `GeometryInfo` to disk, or
+          // write a zero buffer of the same size (indicating an invalid
+          // geometry). This is required to ensure direct access by index is
+          // still possible on the file.
+          const void* ptr = &invalidGeoInfoBuffer;
+          if (info.has_value()) {
+            if (!info.value().getMetricArea().isValid()) {
+              ++numInvalidPolygonArea_;
+            }
+            ptr = &info.value();
+          } else {
+            ++numInvalidGeometries_;
+          }
+          geoInfoFile_.write(ptr, geoInfoOffset);
+        }
+      });
+    }
 
     ~WordWriter() override;
   };

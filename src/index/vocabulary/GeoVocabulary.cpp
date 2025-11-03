@@ -57,27 +57,14 @@ GeoVocabulary<V>::WordWriter::WordWriter(const V& vocabulary,
 template <typename V>
 uint64_t GeoVocabulary<V>::WordWriter::operator()(std::string_view word,
                                                   bool isExternal) {
-  uint64_t index;
-
-  // Store the WKT literal as a string in the underlying vocabulary
-  index = (*underlyingWordWriter_)(word, isExternal);
-
-  // Precompute `GeometryInfo` and write the `GeometryInfo` to disk, or write a
-  // zero buffer of the same size (indicating an invalid geometry). This is
-  // required to ensure direct access by index is still possible on the file.
-  const void* ptr = &invalidGeoInfoBuffer;
-  auto info = GeometryInfo::fromWktLiteral(word);
-  if (info.has_value()) {
-    if (!info.value().getMetricArea().isValid()) {
-      ++numInvalidPolygonArea_;
-    }
-    ptr = &info.value();
-  } else {
-    ++numInvalidGeometries_;
+  {
+    std::lock_guard lock{mutex_};
+    queue_.push({word, isExternal});
   }
-  geoInfoFile_.write(ptr, geoInfoOffset);
+  cv_.notify_one();
+  // Queue size limit and otherwise block this thread until free ?
 
-  return index;
+  return ++counter_;
 };
 
 // ____________________________________________________________________________
@@ -85,6 +72,15 @@ template <typename V>
 void GeoVocabulary<V>::WordWriter::finishImpl() {
   // `WordWriterBase` ensures that this is not called twice and we thus do not
   // try to close the file handle twice
+  {
+    std::lock_guard lock(mutex_);
+    finished_ = true;
+  }
+  cv_.notify_all();
+  if (pipelineThread_.joinable()) {
+    pipelineThread_.join();
+  }
+
   underlyingWordWriter_->finish();
   geoInfoFile_.close();
 
