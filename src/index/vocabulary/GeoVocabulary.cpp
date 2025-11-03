@@ -51,6 +51,52 @@ GeoVocabulary<V>::WordWriter::WordWriter(const V& vocabulary,
       geoInfoFile_{getGeoInfoFilename(filename), "w"} {
   // Initialize geo info file with header
   geoInfoFile_.write(&ad_utility::GEOMETRY_INFO_VERSION, geoInfoHeader);
+  for (size_t i = 0; i < num_threads; ++i) {
+    workers.emplace_back([&]() {
+      while (auto item = work_queue.pop()) {
+        mytest::Result r = process(*item);
+        {
+          std::lock_guard lock(result_mutex);
+          results[r.index] = std::move(r);
+        }
+        result_cv.notify_one();
+      }
+    });
+  }
+
+  writer = std::thread([&]() {
+    size_t next = 0;
+
+    std::unique_lock lock(result_mutex);
+    for (;;) {
+      result_cv.wait(
+          lock, [&] { return done_processing || results.count(next) > 0; });
+
+      while (results.count(next)) {
+        auto info = results[next].output;
+
+        // Precompute `GeometryInfo` and write the `GeometryInfo` to disk, or
+        // write a
+        // zero buffer of the same size (indicating an invalid geometry). This
+        // is required to ensure direct access by index is still possible on the
+        // file.
+        const void* ptr = &invalidGeoInfoBuffer;
+        if (info.has_value()) {
+          if (!info.value().getMetricArea().isValid()) {
+            ++numInvalidPolygonArea_;
+          }
+          ptr = &info.value();
+        } else {
+          ++numInvalidGeometries_;
+        }
+        geoInfoFile_.write(ptr, geoInfoOffset);
+
+        results.erase(next++);
+      }
+
+      if (done_processing && results.empty()) break;
+    }
+  });
 };
 
 // ____________________________________________________________________________
@@ -62,20 +108,7 @@ uint64_t GeoVocabulary<V>::WordWriter::operator()(std::string_view word,
   // Store the WKT literal as a string in the underlying vocabulary
   index = (*underlyingWordWriter_)(word, isExternal);
 
-  // Precompute `GeometryInfo` and write the `GeometryInfo` to disk, or write a
-  // zero buffer of the same size (indicating an invalid geometry). This is
-  // required to ensure direct access by index is still possible on the file.
-  const void* ptr = &invalidGeoInfoBuffer;
-  auto info = GeometryInfo::fromWktLiteral(word);
-  if (info.has_value()) {
-    if (!info.value().getMetricArea().isValid()) {
-      ++numInvalidPolygonArea_;
-    }
-    ptr = &info.value();
-  } else {
-    ++numInvalidGeometries_;
-  }
-  geoInfoFile_.write(ptr, geoInfoOffset);
+  work_queue.push({index, std::string(word)});
 
   return index;
 };
@@ -85,6 +118,12 @@ template <typename V>
 void GeoVocabulary<V>::WordWriter::finishImpl() {
   // `WordWriterBase` ensures that this is not called twice and we thus do not
   // try to close the file handle twice
+  work_queue.close();
+  for (auto& w : workers) w.join();
+  done_processing = true;
+  result_cv.notify_all();
+  writer.join();
+
   underlyingWordWriter_->finish();
   geoInfoFile_.close();
 

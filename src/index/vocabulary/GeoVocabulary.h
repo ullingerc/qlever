@@ -5,14 +5,74 @@
 #ifndef QLEVER_SRC_INDEX_VOCABULARY_GEOVOCABULARY_H
 #define QLEVER_SRC_INDEX_VOCABULARY_GEOVOCABULARY_H
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <queue>
 #include <string>
 
 #include "index/vocabulary/VocabularyTypes.h"
 #include "rdfTypes/GeometryInfo.h"
 #include "util/ExceptionHandling.h"
 #include "util/File.h"
+
+///-------------------------
+
+namespace mytest {
+// Thread-safe bounded queue
+template <typename T>
+class BoundedQueue {
+  std::queue<T> q;
+  std::mutex m;
+  std::condition_variable cv_full, cv_empty;
+  size_t capacity;
+  bool done = false;
+
+ public:
+  explicit BoundedQueue(size_t cap) : capacity(cap) {}
+
+  void push(T value) {
+    std::unique_lock lock(m);
+    cv_full.wait(lock, [&] { return q.size() < capacity; });
+    q.push(std::move(value));
+    cv_empty.notify_one();
+  }
+
+  std::optional<T> pop() {
+    std::unique_lock lock(m);
+    cv_empty.wait(lock, [&] { return done || !q.empty(); });
+    if (q.empty()) return std::nullopt;
+    T value = std::move(q.front());
+    q.pop();
+    cv_full.notify_one();
+    return value;
+  }
+
+  void close() {
+    std::lock_guard lock(m);
+    done = true;
+    cv_empty.notify_all();
+  }
+};
+
+struct WorkItem {
+  size_t index;
+  std::string data;
+};
+
+struct Result {
+  size_t index;
+  std::optional<ad_utility::GeometryInfo> output;
+};
+
+// Simulated expensive computation
+inline Result process(const WorkItem& item) {
+  return {item.index, ad_utility::GeometryInfo::fromWktLiteral(item.data)};
+}
+
+}  // namespace mytest
+
+//----------------------------------------------------
 
 // A `GeoVocabulary` holds Well-Known Text (WKT) literals. In contrast to the
 // regular vocabulary classes it does not only store the strings. Instead it
@@ -106,6 +166,20 @@ class GeoVocabulary {
     ad_utility::File geoInfoFile_;
     size_t numInvalidGeometries_ = 0;
     size_t numInvalidPolygonArea_ = 0;
+
+    const size_t num_threads = std::thread::hardware_concurrency();
+    const size_t queue_capacity = 1000;
+
+    mytest::BoundedQueue<mytest::WorkItem> work_queue =
+        mytest::BoundedQueue<mytest::WorkItem>(queue_capacity);
+    std::mutex result_mutex;
+    std::condition_variable result_cv;
+    std::map<size_t, mytest::Result> results;
+    std::atomic<size_t> next_to_write = 0;
+    bool done_producing = false;
+    bool done_processing = false;
+    std::vector<std::thread> workers;
+    std::thread writer;
 
    public:
     // Initialize the `geoInfoFile_` by writing its header and open a word
