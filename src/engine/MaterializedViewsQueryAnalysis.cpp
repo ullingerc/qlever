@@ -13,6 +13,7 @@
 #include "engine/MaterializedViews.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/SparqlParser.h"
+#include "rdfTypes/Iri.h"
 
 namespace materializedViewsQueryAnalysis {
 
@@ -85,6 +86,48 @@ std::optional<UserQueryChain> QueryPatternCache::checkSimpleChain(
 }
 
 // _____________________________________________________________________________
+std::optional<UserQueryStar> QueryPatternCache::checkStar(
+    const BasicGraphPattern& triples) const {
+  ad_utility::HashMap<Variable, ad_utility::HashSet<Variable>> starUsedObjects;
+  ad_utility::HashMap<
+      Variable,
+      ad_utility::HashMap<ad_utility::triple_component::Iri, Variable>>
+      starPredicates;
+
+  for (const auto& triple : triples._triples) {
+    if (!triple.getSimplePredicate().has_value()) {
+      continue;
+    }
+    const auto simpleTriple = triple.getSimple();
+    if (!simpleTriple.s_.isVariable() || !simpleTriple.p_.isIri() ||
+        !simpleTriple.o_.isVariable()) {
+      // TODO fixed object?
+      continue;
+    }
+    const auto& s = simpleTriple.s_.getVariable();
+    const auto& p = simpleTriple.s_.getIri();
+    const auto& o = simpleTriple.s_.getVariable();
+    if (s == o) {
+      continue;
+    }
+    if (!starPredicates.contains(s)) {
+      starPredicates[s] = {};
+      starUsedObjects[s] = {};
+    } else if (starPredicates.at(s).contains(p) ||
+               starUsedObjects.at(s).contains(o)) {
+      // This triple would add a connection between arms of a star. Ignore it -
+      // it needs to be joined outside of the materialized view scan.
+      continue;
+    }
+    starPredicates.at(s).insert({p, o});
+    starUsedObjects.at(s).insert(o);
+  }
+  // TODO check against actual views
+  // TODO optional,
+  return std::nullopt;
+}
+
+// _____________________________________________________________________________
 bool QueryPatternCache::analyzeSimpleChain(ViewPtr view, const SparqlTriple& a,
                                            const SparqlTriple& b) {
   // Check predicates.
@@ -129,8 +172,41 @@ bool QueryPatternCache::analyzeSimpleChain(ViewPtr view, const SparqlTriple& a,
 }
 
 // _____________________________________________________________________________
+bool QueryPatternCache::analyzeStar(ViewPtr view,
+                                    const std::vector<SparqlTriple>& triples) {
+  // All triples must have the same subject, a variable.
+  if (triples.size() < 2 || !triples.at(0).s_.isVariable()) {
+    return false;
+  }
+  const Variable& subject = triples.at(0).s_.getVariable();
+  ad_utility::HashSet<Variable> usedObjects;
+  using VarAndIsOptional = std::pair<Variable, bool>;
+  ad_utility::HashMap<ad_utility::triple_component::Iri, VarAndIsOptional>
+      predicates;
+
+  for (const auto& triple : triples) {
+    if (!triple.s_.isVariable() || triple.s_.getVariable() != subject ||
+        !triple.o_.isVariable() || !triple.getSimplePredicate().has_value() ||
+        usedObjects.contains(triple.o_.getVariable())) {
+      return false;
+    }
+    const auto simpleTriple = triple.getSimple();
+    if (!simpleTriple.p_.isIri()) {
+      return false;
+    }
+    const auto& o = triple.o_.getVariable();
+    const auto& p = simpleTriple.p_.getIri();
+    usedObjects.insert(o);
+    predicates.insert({p, {o, false}});
+  }
+
+  // TODO data structure
+  // TODO optionals containing single triple (and without coalesce behavior)
+  return false;
+}
+
+// _____________________________________________________________________________
 bool QueryPatternCache::analyzeView(ViewPtr view) {
-  AD_LOG_INFO << view->name() << std::endl;
   const auto& query = view->originalQuery();
   if (!query.has_value()) {
     return false;
@@ -182,7 +258,7 @@ bool QueryPatternCache::analyzeView(ViewPtr view) {
     }
   }
 
-  // TODO<ullingerc> Add support for other patterns, in particular, stars.
+  patternFound = patternFound || analyzeStar(view, triples);
 
   // Remember predicates that appear in certain views, only if any pattern is
   // detected.

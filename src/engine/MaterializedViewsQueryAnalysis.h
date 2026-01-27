@@ -8,6 +8,7 @@
 #define QLEVER_SRC_ENGINE_MATERIALIZEDVIEWSQUERYANALYSIS_H_
 
 #include "parser/GraphPatternOperation.h"
+#include "parser/MaterializedViewQuery.h"
 #include "parser/SparqlTriple.h"
 #include "parser/TripleComponent.h"
 #include "rdfTypes/Variable.h"
@@ -22,6 +23,8 @@ class IndexScan;
 namespace materializedViewsQueryAnalysis {
 
 using ViewPtr = std::shared_ptr<const MaterializedView>;
+using RequestedColumns = parsedQuery::MaterializedViewQuery::RequestedColumns;
+using parsedQuery::BasicGraphPattern;
 
 // Key and value types of the cache for simple chains, that is queries of the
 // form `?s <p1> ?m . ?m <p2> ?o`.
@@ -65,6 +68,17 @@ struct UserQueryChain {
   std::shared_ptr<const std::vector<ChainInfo>> chainInfos_;
 };
 
+// This struct represents a join star that can be (partially) rewritten to a
+// scan on a materialized view. If `remainingTriples_` is not empty, the
+// included triples need to be planned separately and joined with the
+// materialized view scan.
+struct UserQueryStar {
+  // TODO multiple stars
+  ViewPtr view_;
+  RequestedColumns requestedCols_;
+  BasicGraphPattern remainingTriples_;
+};
+
 // Cache data structure for the `MaterializedViewsManager`. This object can be
 // used for quickly looking up if a given query can be optimized by making use
 // of an existing materialized view.
@@ -88,6 +102,11 @@ class QueryPatternCache {
   std::optional<UserQueryChain> checkSimpleChain(
       std::shared_ptr<IndexScan> left, std::shared_ptr<IndexScan> right) const;
 
+  // Check if a subset of the given triples constitutes a join star that can be
+  // rewritten by a scan on one of the loaded materialized views.
+  std::optional<UserQueryStar> checkStar(
+      const BasicGraphPattern& triples) const;
+
  private:
   // Helper for `analyzeView`, that checks for a simple chain. It returns `true`
   // iff a simple chain `a->b` is present.
@@ -95,6 +114,10 @@ class QueryPatternCache {
   // with `a` and `b` switched if it returns `false`.
   bool analyzeSimpleChain(ViewPtr view, const SparqlTriple& a,
                           const SparqlTriple& b);
+
+  // Helper for `analyzeView`, that checks for a join star. It returns wether a
+  // star was found.
+  bool analyzeStar(ViewPtr view, const std::vector<SparqlTriple>& triples);
 };
 
 }  // namespace materializedViewsQueryAnalysis
