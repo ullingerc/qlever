@@ -155,11 +155,9 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   std::optional<std::string> originalQuery_;
   std::optional<ParsedQuery> parsedQuery_;
 
-  // Cache for detecting `BIND` statements from the view. Since this is specific
-  // to a single view and not a cache for all views, it is stored directly in
-  // the `MaterializedView` object. `coveredBinds_` maps the cache keys of the
-  // `BIND` expressions (based on the column indices in the view) to their
-  // target column index.
+  // Lookup table for `BIND` statements from the view's query. Maps the cache
+  // keys of the `BIND` expressions (based on the column indices in the view) to
+  // the target column index.
   materializedViewsQueryAnalysis::BindExpressionAndTargetCol coveredBinds_;
 
   using AdditionalScanColumns = SparqlTripleSimple::AdditionalScanColumns;
@@ -256,6 +254,10 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   // indices as in the view while generating the cache key.
   std::optional<size_t> lookupBindTargetColumn(
       const std::string& bindCacheKey) const;
+
+  // Dummy variables for internal use.
+  static const Variable& dummyPredicate();
+  static const Variable& dummyObject();
 };
 
 // Shorthand for query rewriting helper class.
