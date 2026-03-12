@@ -1259,6 +1259,10 @@ TEST_F(MaterializedViewsTest, BindRewrite) {
                      "2 * ?s", V{"?x1"}));
   }
 
+  // TODO<ullingerc> Add tests for `Exists`, `Minus`, `MultiColumnJoin`,
+  // `Optional`, `Union`, `NeutralOptional`, `Bind`, `CartesianProductJoin`,
+  // `Filter`.
+
   // Test the variable to permutation column index map.
   {
     // The column `?b3` is the fifth column in the permutation, but the second
