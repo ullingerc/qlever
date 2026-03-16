@@ -1538,6 +1538,11 @@ QueryPlanner::runDynamicProgrammingOnConnectedComponent(
   // (there might be duplicates because we already have multiple candidates
   // for each index scan with different permutations.
   dpTab.push_back(std::move(connectedComponent));
+  // If there are single-triple replacement plans (e.g. from single-predicate
+  // materialized views), inject them as additional seed candidates.
+  if (!replacementPlans.empty()) {
+    ql::ranges::move(replacementPlans[0], std::back_inserter(dpTab[0]));
+  }
   size_t numSeeds = findUniqueNodeIds(dpTab.back(), false);
 
   for (size_t k = 2; k <= numSeeds; ++k) {

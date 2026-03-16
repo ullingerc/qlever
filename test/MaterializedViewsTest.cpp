@@ -1053,3 +1053,77 @@ INSTANTIATE_TEST_SUITE_P(
         // An additional `BIND` is ignored and the view can still be used for
         // query rewriting. Also uses a different sorting.
         RewriteTestParams{std::string{simpleChainRenamedPlusBind}, 1500}));
+
+// _____________________________________________________________________________
+// Example queries for testing single-scan query rewriting.
+constexpr std::string_view singleScanQuery =
+    "SELECT * { ?s <p1> ?o }";
+
+class MaterializedViewsSingleScanRewriteTest
+    : public MaterializedViewsQueryRewriteTest {};
+
+// _____________________________________________________________________________
+TEST_P(MaterializedViewsSingleScanRewriteTest, singleScan) {
+  RewriteTestParams p = GetParam();
+  auto cleanup =
+      setRuntimeParameterForTest<&RuntimeParameters::queryPlanningBudget_>(
+          p.queryPlanningBudget_);
+
+  const std::string singleTtl =
+      " <s1> <p1> <o1> . \n"
+      " <s2> <p1> <o2> . \n"
+      " <s1> <p3> <o3> . \n";
+  const std::string onDiskBase = "_materializedViewRewriteSingle";
+  const std::string viewName = "testViewSingle";
+
+  materializedViewsTestHelpers::makeTestIndex(onDiskBase, singleTtl);
+  auto cleanUp = absl::MakeCleanup(
+      [&]() { materializedViewsTestHelpers::removeTestIndex(onDiskBase); });
+  qlever::EngineConfig config;
+  config.baseName_ = onDiskBase;
+  qlever::Qlever qlv{config};
+
+  // Write a single-predicate view and verify it is detected.
+  MaterializedViewsManager manager{onDiskBase};
+  manager.writeViewToDisk(viewName, qlv.parseAndPlanQuery(p.writeQuery_));
+  qlv.loadMaterializedView(viewName);
+
+  // Verify the view was added to the query pattern cache (view was detected).
+  EXPECT_THAT(log_.str(),
+              ::testing::HasSubstr("was added to the query pattern cache"));
+
+  // Verify that the `makeJoinReplacementIndexScans` function produces a
+  // single-scan replacement.
+  {
+    auto [qet, qec, parsed] =
+        qlv.parseAndPlanQuery(std::string{singleScanQuery});
+    auto triples = std::get<parsedQuery::BasicGraphPattern>(
+        parsed._rootGraphPattern._graphPatterns.at(0));
+    auto replacements =
+        qec->materializedViewsManager().makeJoinReplacementIndexScans(
+            qec.get(), triples);
+    ASSERT_GE(replacements.size(), 1u);
+
+    // At least one replacement should cover exactly 1 triple (the single-scan).
+    bool foundSingleReplacement = false;
+    for (const auto& r : replacements) {
+      if (r.coveredTriples_.size() == 1) {
+        auto view = r.indexScan_->permutation().materializedView();
+        if (view != nullptr && view->name() == viewName) {
+          foundSingleReplacement = true;
+        }
+      }
+    }
+    EXPECT_TRUE(foundSingleReplacement);
+  }
+}
+
+// _____________________________________________________________________________
+INSTANTIATE_TEST_SUITE_P(
+    MaterializedViewsTest, MaterializedViewsSingleScanRewriteTest,
+    ::testing::Values(
+        // Default case.
+        RewriteTestParams{std::string{singleScanQuery}, 1500},
+
+        // Forced greedy planning.
+        RewriteTestParams{std::string{singleScanQuery}, 1}));

@@ -66,6 +66,16 @@ QueryPatternCache::makeJoinReplacementIndexScans(
       // This triple could be the left side of a chain join.
       chainLeft[triple.o_.getVariable()].push_back(tripleIdx);
     }
+
+    // Check for single-scan replacement: `something <pred> ?var`.
+    auto ssIt = singleScanCache_.find(iri.value());
+    if (ssIt != singleScanCache_.end()) {
+      for (const auto& scanInfo : ssIt->second) {
+        result.push_back(
+            {makeScanForSingleScan(qec, scanInfo, triple.s_, triple.o_),
+             {static_cast<size_t>(tripleIdx)}});
+      }
+    }
   }
 
   // Using the information collected by the pass over all triples, assemble all
@@ -135,6 +145,19 @@ std::shared_ptr<IndexScan> QueryPatternCache::makeScanForSingleChain(
 }
 
 // _____________________________________________________________________________
+std::shared_ptr<IndexScan> QueryPatternCache::makeScanForSingleScan(
+    QueryExecutionContext* qec, const SingleScanInfo& cached,
+    TripleComponent subject, TripleComponent object) const {
+  parsedQuery::MaterializedViewQuery::RequestedColumns cols{
+      {cached.subject_, std::move(subject)},
+      {cached.object_, std::move(object)},
+  };
+  return cached.view_->makeIndexScan(
+      qec, parsedQuery::MaterializedViewQuery{cached.view_->name(),
+                                              std::move(cols)});
+}
+
+// _____________________________________________________________________________
 bool QueryPatternCache::analyzeSimpleChain(ViewPtr view, const SparqlTriple& a,
                                            const SparqlTriple& b) {
   // Check predicates.
@@ -180,6 +203,27 @@ bool QueryPatternCache::analyzeSimpleChain(ViewPtr view, const SparqlTriple& a,
 }
 
 // _____________________________________________________________________________
+bool QueryPatternCache::analyzeSingleScan(ViewPtr view,
+                                          const SparqlTriple& triple) {
+  auto pred = triple.getSimplePredicate();
+  if (!pred.has_value()) {
+    return false;
+  }
+  if (!triple.s_.isVariable()) {
+    return false;
+  }
+  if (!triple.o_.isVariable()) {
+    return false;
+  }
+  if (triple.s_.getVariable() == triple.o_.getVariable()) {
+    return false;
+  }
+  singleScanCache_[std::string(pred.value())].push_back(SingleScanInfo{
+      triple.s_.getVariable(), triple.o_.getVariable(), view});
+  return true;
+}
+
+// _____________________________________________________________________________
 bool QueryPatternCache::analyzeView(ViewPtr view) {
   auto explainIgnore = [&](const std::string& reason) {
     AD_LOG_INFO << "Materialized view '" << view->name()
@@ -214,6 +258,11 @@ bool QueryPatternCache::analyzeView(ViewPtr view) {
     return false;
   }
   bool patternFound = false;
+
+  // Single-predicate pattern `?s <pred> ?o`.
+  if (triples.size() == 1) {
+    patternFound = analyzeSingleScan(view, triples.at(0));
+  }
 
   // TODO<ullingerc> Possibly handle chain by property path.
   if (triples.size() == 2) {
@@ -274,6 +323,13 @@ void QueryPatternCache::removeView(ViewPtr view) {
   // Remove `view` from predicate cache.
   for (auto& [pred, views] : predicateInView_) {
     ql::erase_if(views, [&view](ViewPtr pView) { return pView == view; });
+  }
+
+  // Remove `view` from single-scan cache.
+  for (auto& [pred, infos] : singleScanCache_) {
+    ql::erase_if(infos, [&view](const SingleScanInfo& info) {
+      return info.view_ == view;
+    });
   }
 }
 

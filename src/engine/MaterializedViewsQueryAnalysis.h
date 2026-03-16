@@ -42,6 +42,13 @@ using SimpleChainCache =
     ad_utility::StringPairHashMap<std::shared_ptr<std::vector<ChainInfo>>>;
 using ChainSideCandidates = ad_utility::HashMap<Variable, std::vector<size_t>>;
 
+// Cached info for a single-predicate view of the form `?s <pred> ?o`.
+struct SingleScanInfo {
+  Variable subject_;
+  Variable object_;
+  ViewPtr view_;
+};
+
 // Helper class that represents a possible join replacement and indicates the
 // subset of triples it handles.
 struct MaterializedViewJoinReplacement {
@@ -63,6 +70,10 @@ class QueryPatternCache {
   // Cache for predicates appearing in a materialized view. The `ViewPtr`s are
   // kept sorted.
   ad_utility::HashMap<std::string, std::vector<ViewPtr>> predicateInView_;
+
+  // Cache for single-predicate views `?s <pred> ?o`, keyed by predicate IRI.
+  ad_utility::HashMap<std::string, std::vector<SingleScanInfo>>
+      singleScanCache_;
 
   // TODO<ullinger> Data structure for join stars.
 
@@ -91,6 +102,11 @@ class QueryPatternCache {
       QueryExecutionContext* qec, ChainInfo cached, TripleComponent subject,
       std::optional<Variable> chain, Variable object) const;
 
+  // Construct an `IndexScan` for a single-predicate view replacement.
+  std::shared_ptr<IndexScan> makeScanForSingleScan(
+      QueryExecutionContext* qec, const SingleScanInfo& cached,
+      TripleComponent subject, TripleComponent object) const;
+
  private:
   // Helper for `analyzeView`, that checks for a simple chain. It returns `true`
   // iff a simple chain `a->b` is present.
@@ -98,6 +114,10 @@ class QueryPatternCache {
   // with `a` and `b` switched if it returns `false`.
   bool analyzeSimpleChain(ViewPtr view, const SparqlTriple& a,
                           const SparqlTriple& b);
+
+  // Helper for `analyzeView`, that checks for a single-predicate pattern
+  // `?s <pred> ?o`.
+  bool analyzeSingleScan(ViewPtr view, const SparqlTriple& triple);
 
   // Given potential left and right sides of simple chains, check for available
   // replacement index scans, construct them and insert them into the `result`
