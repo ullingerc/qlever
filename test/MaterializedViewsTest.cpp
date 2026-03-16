@@ -1036,7 +1036,8 @@ TEST_P(MaterializedViewsChainRewriteTest, simpleChain) {
            h::Join(chainView("?s", "?_QLever_internal_variable_qp_0", "?o"),
                    h::IndexScanFromStrings("?s", "<p3>", "?o2")));
 
-  // TODO<ullingerc> Test overlapping view plans.
+  // TODO<ullingerc> Test overlapping view plans. And wrong column sort + fixed
+  // subject.
 }
 
 // _____________________________________________________________________________
