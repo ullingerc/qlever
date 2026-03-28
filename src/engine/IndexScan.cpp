@@ -249,16 +249,15 @@ VariableToColumnMap IndexScan::computeVariableToColumnMap() const {
     return !varsToKeep_.has_value() || varsToKeep_.value().contains(var);
   };
   auto addCol = [&isContained, &variableToColumnMap,
-                 nextColIdx = ColumnIndex{0}](const Variable& var) mutable {
-    if (!isContained(var)) {
-      return;
+                 nextColIdx = ColumnIndex{0},
+                 permutationColIdx = ColumnIndex{0},
+                 this](const Variable& var) mutable {
+    if (isContained(var)) {
+      variableToColumnMap[var] = {
+          nextColIdx, permutation().getColumnUndefStatus(permutationColIdx)};
+      ++nextColIdx;
     }
-    // All the columns of an index scan only contain defined values.
-    // TODO<ullingerc> This is not true for materialized views. We should
-    // remember the definedness of columns from the time of writing the view and
-    // store it in the permutation.
-    variableToColumnMap[var] = makeAlwaysDefinedColumn(nextColIdx);
-    ++nextColIdx;
+    ++permutationColIdx;
   };
 
   for (const TripleComponent* const ptr : getPermutedTriple()) {
@@ -887,7 +886,9 @@ std::unique_ptr<Operation> IndexScan::cloneImpl() const {
 bool IndexScan::columnOriginatesFromGraphOrUndef(
     const Variable& variable) const {
   AD_CONTRACT_CHECK(getExternallyVisibleVariableColumns().contains(variable));
-  return variable == subject_ || variable == predicate_ || variable == object_;
+  return permutation().permutationType() == Permutation::Type::NORMAL &&
+         // In RDF only subjects and objects are considered nodes.
+         (variable == subject_ || variable == object_);
 }
 
 // _____________________________________________________________________________
