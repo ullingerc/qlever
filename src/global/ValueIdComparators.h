@@ -419,6 +419,12 @@ inline std::vector<std::pair<RandomIt, RandomIt>> getRangesForId(
       // `[Local]VocabIndex` that are greater than or less than the encoded IRI.
       // (This also goes for the other way round).
     case Datatype::EncodedVal:
+    // TODO<ullingerc> Like for `EncodedVal`, range comparisons other than
+    // equality against a `ViewVocabIndex` are only correct within the range of
+    // IDs of a single view (which is the common case, as a scan of a view only
+    // yields IDs of that view). Full ordering is handled in
+    // `ValueId::compareThreeWay`.
+    case Datatype::ViewVocabIndex:
     case Datatype::Bool:
     case Datatype::Date:
     case Datatype::GeoPoint:
@@ -461,6 +467,7 @@ inline std::vector<std::pair<RandomIt, RandomIt>> getRangesForEqualIds(
       AD_FAIL();
     // TODO<joka921> check what the correct behavior is here.
     case Datatype::EncodedVal:
+    case Datatype::ViewVocabIndex:
     case Datatype::VocabIndex:
     case Datatype::LocalVocabIndex:
     case Datatype::WordVocabIndex:
@@ -509,10 +516,14 @@ ComparisonResult compareIdsImpl(ValueId a, ValueId b, Comparator comparator) {
     }
   }
 
-  // If any of the entries is a `LocalVocabIndex`, then the ordinary comparison
-  // on ValueIds already does the right thing.
+  // If any of the entries is a `LocalVocabIndex` or a `ViewVocabIndex`, then
+  // the ordinary comparison on ValueIds already does the right thing
+  // (`LocalVocabIndex` is handled explicitly in `ValueId::compareThreeWay`;
+  // `ViewVocabIndex` will be, in a follow-up, and currently compares bitwise).
   if (a.getDatatype() == Datatype::LocalVocabIndex ||
-      b.getDatatype() == Datatype::LocalVocabIndex) {
+      b.getDatatype() == Datatype::LocalVocabIndex ||
+      a.getDatatype() == Datatype::ViewVocabIndex ||
+      b.getDatatype() == Datatype::ViewVocabIndex) {
     return fromBool(std::invoke(comparator, a, b));
   }
 
@@ -535,9 +546,10 @@ ComparisonResult compareIdsImpl(ValueId a, ValueId b, Comparator comparator) {
     if constexpr (ranges::invocable<Comparator, A, B>) {
       return fromBool(std::invoke(comparator, aValue, bValue));
     } else {
-      static_assert((!std::is_same_v<A, B>) ||
-                    ad_utility::SameAsAny<A, LocalVocabIndex, GeoPoint,
-                                          Id::UndefinedType>);
+      static_assert(
+          (!std::is_same_v<A, B>) ||
+          ad_utility::SameAsAny<A, LocalVocabIndex, GeoPoint,
+                                Id::ViewVocabIndexParts, Id::UndefinedType>);
       AD_LOG_ERROR << "Comparison not implemented for types "
                    << toString(a.getDatatype()) << " and "
                    << toString(b.getDatatype()) << std::endl;

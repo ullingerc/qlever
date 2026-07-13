@@ -42,7 +42,11 @@ enum struct Datatype {
   WordVocabIndex,
   BlankNodeIndex,
   EncodedVal,
-  MaxValue = EncodedVal
+  // Refers to a string in the dedicated vocabulary of a materialized view. The
+  // 60 data bits are split into [viewId (12) | sortHelper (10) | index (38)];
+  // see the `ValueId` class comment for details.
+  ViewVocabIndex,
+  MaxValue = ViewVocabIndex
   // Note: Unfortunately, we cannot easily get the size of an enum.
   // If members are added to this enum, then the `MaxValue`
   // alias must always be equal to the last member,
@@ -91,6 +95,8 @@ inline QL_CONSTEXPR std::string_view toString(Datatype type) {
       return "GeoPoint";
     case Datatype::BlankNodeIndex:
       return "BlankNodeIndex";
+    case Datatype::ViewVocabIndex:
+      return "ViewVocabIndex";
   }
   // This line is reachable if we cast an arbitrary invalid int to this enum
   AD_FAIL();
@@ -98,6 +104,15 @@ inline QL_CONSTEXPR std::string_view toString(Datatype type) {
 
 /// Encode values of different types (the types from the `Datatype` enum above)
 /// using 4 bits for the datatype and 60 bits for the value.
+///
+/// For `ViewVocabIndex`, the 60 data bits are split into three parts (from most
+/// to least significant): the materialized view ID (12 bits), a sorting helper
+/// (10 bits), and the index into that view's dedicated vocabulary (38 bits).
+/// The sorting helper records in which of 1024 equal-sized parts of the main
+/// vocabulary the referenced word would be located; it is intended to let most
+/// comparisons against other `ValueId`s be decided without a (potentially
+/// expensive) string comparison. The comparison logic that uses it is added in
+/// a follow-up; for now `compareThreeWay` compares `ViewVocabIndex`s bitwise.
 class ValueId {
  public:
   using T = uint64_t;
@@ -130,9 +145,12 @@ class ValueId {
       Datatype::VocabIndex, Datatype::LocalVocabIndex};
 
   // A mapping that decides if a Datatype is bitwise comparable or not. See
-  // `canBeComparedBitwise()` below.
-  static constexpr std::array<bool, 12> isTypeBitwiseComparable_{
-      true, true, true, true, true, false, true, true, true, true, true, true};
+  // `canBeComparedBitwise()` below. The two non-bitwise entries are
+  // `LocalVocabIndex` (index 5) and `ViewVocabIndex` (index 12), both of which
+  // require a string comparison to be ordered correctly against other types.
+  static constexpr std::array<bool, 13> isTypeBitwiseComparable_{
+      true, true, true, true, true, false, true,
+      true, true, true, true, true, false};
 
   // Assert that the types in `stringTypes_` are directly adjacent. This is
   // required to make the comparison of IDs in `ValueIdComparators.h` work.
@@ -234,7 +252,7 @@ class ValueId {
   auto compareWithoutLocalVocab(const ValueId& other) const {
     // NOTE: If this static assertion is violated at some point, make sure to
     // check all callers of this function if they are still correct.
-    static_assert(isOnlyLocalVocabNotBitwiseComparable);
+    static_assert(onlyLocalAndViewVocabNotBitwiseComparable);
     AD_EXPENSIVE_CHECK(canBeComparedBitwise());
     AD_EXPENSIVE_CHECK(other.canBeComparedBitwise());
     return ql::compareThreeWay(_bits, other._bits);
@@ -374,6 +392,55 @@ class ValueId {
     return BlankNodeIndex::make(removeDatatypeBits(_bits));
   }
 
+  // The bit layout of the 60 data bits of a `ViewVocabIndex` (from most to
+  // least significant). See the `ValueId` class comment for the semantics.
+  static constexpr T numViewIdBits = 12;
+  static constexpr T numViewSortHelperBits = 10;
+  static constexpr T numViewVocabIndexBits = 38;
+  static_assert(numViewIdBits + numViewSortHelperBits + numViewVocabIndexBits ==
+                numDataBits);
+
+  // The three parts a `ViewVocabIndex` is decoded into.
+  struct ViewVocabIndexParts {
+    uint64_t viewId_;
+    uint64_t sortHelper_;
+    uint64_t index_;
+    QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR_LOCAL(ViewVocabIndexParts, viewId_,
+                                                sortHelper_, index_)
+  };
+
+  // Create a `ValueId` of type `ViewVocabIndex` from its three parts.
+  static ValueId makeFromViewVocabIndex(uint64_t viewId, uint64_t sortHelper,
+                                        uint64_t index) {
+    AD_CONTRACT_CHECK(viewId < (1ULL << numViewIdBits));
+    AD_CONTRACT_CHECK(sortHelper < (1ULL << numViewSortHelperBits));
+    AD_CONTRACT_CHECK(index < (1ULL << numViewVocabIndexBits));
+    T data = (viewId << (numViewSortHelperBits + numViewVocabIndexBits)) |
+             (sortHelper << numViewVocabIndexBits) | index;
+    return addDatatypeBits(data, Datatype::ViewVocabIndex);
+  }
+
+  // The materialized view ID stored in a `ViewVocabIndex`.
+  [[nodiscard]] constexpr uint64_t getViewVocabId() const noexcept {
+    return removeDatatypeBits(_bits) >>
+           (numViewSortHelperBits + numViewVocabIndexBits);
+  }
+  // The sorting helper stored in a `ViewVocabIndex`.
+  [[nodiscard]] constexpr uint64_t getViewVocabSortHelper() const noexcept {
+    return (_bits >> numViewVocabIndexBits) &
+           ad_utility::bitMaskForLowerBits(numViewSortHelperBits);
+  }
+  // The index into the view's vocabulary stored in a `ViewVocabIndex`.
+  [[nodiscard]] constexpr uint64_t getViewVocabIndexInVocab() const noexcept {
+    return _bits & ad_utility::bitMaskForLowerBits(numViewVocabIndexBits);
+  }
+  // All three parts of a `ViewVocabIndex` at once.
+  [[nodiscard]] constexpr ViewVocabIndexParts getViewVocabIndex()
+      const noexcept {
+    return {getViewVocabId(), getViewVocabSortHelper(),
+            getViewVocabIndexInVocab()};
+  }
+
   // Store or load a `Date` object.
   static ValueId makeFromDate(DateYearOrDuration d) noexcept {
     return addDatatypeBits(absl::bit_cast<uint64_t>(d), Datatype::Date);
@@ -406,18 +473,23 @@ class ValueId {
   // `isTypeBitwiseComparable_` says so. This is currently the case for all
   // datatypes except for the local vocab index.
   constexpr bool canBeComparedBitwise() const {
-    static_assert(isOnlyLocalVocabNotBitwiseComparable);
+    static_assert(onlyLocalAndViewVocabNotBitwiseComparable);
     return isTypeBitwiseComparable_.at(static_cast<size_t>(getDatatype()));
   }
 
-  // Constant to be used in `static_assert` statements to indicate that
-  // behavior is relying on the local vocab entry to be the only datatype that
-  // is not bitwise comparable.
-  constexpr static bool isOnlyLocalVocabNotBitwiseComparable =
+  // Constant to be used in `static_assert` statements to indicate that behavior
+  // relies on `LocalVocabIndex` and `ViewVocabIndex` being the only datatypes
+  // that are not bitwise comparable. If this ever changes, revisit all callers
+  // of `compareWithoutLocalVocab` and `canBeComparedBitwise` (in particular the
+  // fast paths during index building, which assume that the IDs they see are
+  // bitwise comparable).
+  constexpr static bool onlyLocalAndViewVocabNotBitwiseComparable =
       isTypeBitwiseComparable_.size() ==
           static_cast<size_t>(Datatype::MaxValue) + 1 &&
       !isTypeBitwiseComparable_.at(
-          static_cast<size_t>(Datatype::LocalVocabIndex));
+          static_cast<size_t>(Datatype::LocalVocabIndex)) &&
+      !isTypeBitwiseComparable_.at(
+          static_cast<size_t>(Datatype::ViewVocabIndex));
 
   /// Return the smallest and largest possible `ValueId` wrt the underlying
   /// representation
@@ -438,7 +510,7 @@ class ValueId {
     // of simpler values actually being hashed (here: bits or hash expansion of
     // the LocalVocabEntry).
     if (id.getDatatype() != Datatype::LocalVocabIndex) {
-      static_assert(isOnlyLocalVocabNotBitwiseComparable);
+      static_assert(onlyLocalAndViewVocabNotBitwiseComparable);
       return H::combine(std::move(h), id._bits, 0);
     }
     auto [lower, upper] = id.getLocalVocabIndex()->positionInVocab();
@@ -489,6 +561,8 @@ class ValueId {
         return std::invoke(visitor, getGeoPoint());
       case Datatype::BlankNodeIndex:
         return std::invoke(visitor, getBlankNodeIndex());
+      case Datatype::ViewVocabIndex:
+        return std::invoke(visitor, getViewVocabIndex());
     }
     AD_FAIL();
   }
@@ -518,6 +592,8 @@ class ValueId {
       } else if constexpr (ad_utility::isSimilar<T, LocalVocabIndex>) {
         AD_CORRECTNESS_CHECK(value != nullptr);
         ostr << value->toStringRepresentation();
+      } else if constexpr (ad_utility::isSimilar<T, ViewVocabIndexParts>) {
+        ostr << "view " << value.viewId_ << ", index " << value.index_;
       } else {
         // T is `VocabIndex | TextRecordIndex`
         ostr << std::to_string(value.get());

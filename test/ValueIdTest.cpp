@@ -486,4 +486,37 @@ TEST(ValueId, canBeComparedBitwise) {
   EXPECT_TRUE(Id::makeFromBlankNodeIndex(BlankNodeIndex::make(17))
                   .canBeComparedBitwise());
   EXPECT_TRUE(Id::makeFromEncodedVal(738).canBeComparedBitwise());
+  EXPECT_FALSE(Id::makeFromViewVocabIndex(0, 0, 0).canBeComparedBitwise());
+}
+
+// _____________________________________________________________________________
+TEST(ValueId, ViewVocabIndexBitLayout) {
+  // Round-trip of the three parts through the bit layout.
+  auto check = [](uint64_t viewId, uint64_t sortHelper, uint64_t index) {
+    auto id = Id::makeFromViewVocabIndex(viewId, sortHelper, index);
+    EXPECT_EQ(id.getDatatype(), Datatype::ViewVocabIndex);
+    EXPECT_EQ(id.getViewVocabId(), viewId);
+    EXPECT_EQ(id.getViewVocabSortHelper(), sortHelper);
+    EXPECT_EQ(id.getViewVocabIndexInVocab(), index);
+    EXPECT_EQ(id.getViewVocabIndex(),
+              (Id::ViewVocabIndexParts{viewId, sortHelper, index}));
+  };
+  check(0, 0, 0);
+  check(1, 2, 3);
+  // Maximum value in each field (12, 10, 38 bits respectively). The parts must
+  // not bleed into each other.
+  constexpr uint64_t maxViewId = (1ULL << Id::numViewIdBits) - 1;
+  constexpr uint64_t maxSortHelper = (1ULL << Id::numViewSortHelperBits) - 1;
+  constexpr uint64_t maxIndex = (1ULL << Id::numViewVocabIndexBits) - 1;
+  check(maxViewId, maxSortHelper, maxIndex);
+  check(maxViewId, 0, 0);
+  check(0, maxSortHelper, 0);
+  check(0, 0, maxIndex);
+
+  EXPECT_EQ(toString(Datatype::ViewVocabIndex), "ViewVocabIndex");
+
+  // Out-of-range parts are rejected.
+  EXPECT_ANY_THROW(Id::makeFromViewVocabIndex(maxViewId + 1, 0, 0));
+  EXPECT_ANY_THROW(Id::makeFromViewVocabIndex(0, maxSortHelper + 1, 0));
+  EXPECT_ANY_THROW(Id::makeFromViewVocabIndex(0, 0, maxIndex + 1));
 }
