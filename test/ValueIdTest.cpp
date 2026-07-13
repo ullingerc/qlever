@@ -520,3 +520,218 @@ TEST(ValueId, ViewVocabIndexBitLayout) {
   EXPECT_ANY_THROW(Id::makeFromViewVocabIndex(0, maxSortHelper + 1, 0));
   EXPECT_ANY_THROW(Id::makeFromViewVocabIndex(0, 0, maxIndex + 1));
 }
+
+namespace {
+// A mock implementation of `ViewVocabComparisonHooks` for testing the
+// `ViewVocabIndex` comparison and hashing logic without a real index. It maps
+// `ValueId` bit patterns to explicit string values and buckets, and counts how
+// often the (expensive) full string comparison is invoked.
+class MockViewVocabHooks : public ViewVocabComparisonHooks {
+ public:
+  ad_utility::HashMap<uint64_t, std::string> strings_;
+  ad_utility::HashMap<uint64_t, uint64_t> buckets_;
+  mutable size_t compareByStringCalls_ = 0;
+
+  // Resolve any comparable id to its string: a `LocalVocabIndex` via its entry
+  // (like the real hooks would), everything else via the explicit map.
+  std::string stringOf(ValueId id) const {
+    if (id.getDatatype() == Datatype::LocalVocabIndex) {
+      return id.getLocalVocabIndex()->toStringRepresentation();
+    }
+    return strings_.at(id.getBits());
+  }
+  std::string viewVocabString(ValueId id) const override {
+    return strings_.at(id.getBits());
+  }
+  ql::strong_ordering compareByString(ValueId a, ValueId b) const override {
+    ++compareByStringCalls_;
+    auto sa = stringOf(a);
+    auto sb = stringOf(b);
+    if (sa < sb) return ql::strong_ordering::less;
+    if (sa > sb) return ql::strong_ordering::greater;
+    return ql::strong_ordering::equal;
+  }
+  uint64_t mainVocabBucket(ValueId id) const override {
+    return buckets_.at(id.getBits());
+  }
+};
+
+// RAII helper that registers a hooks instance and clears it on destruction.
+struct ScopedViewVocabHooks {
+  explicit ScopedViewVocabHooks(const ViewVocabComparisonHooks* hooks) {
+    setViewVocabComparisonHooks(hooks);
+  }
+  ~ScopedViewVocabHooks() { setViewVocabComparisonHooks(nullptr); }
+};
+}  // namespace
+
+// _____________________________________________________________________________
+TEST(ValueId, ViewVocabIndexComparison) {
+  MockViewVocabHooks hooks;
+  ScopedViewVocabHooks scoped{&hooks};
+  auto view = [](uint64_t v, uint64_t sh, uint64_t idx) {
+    return Id::makeFromViewVocabIndex(v, sh, idx);
+  };
+
+  // Same view: order by the in-vocab index, sort helper is irrelevant, and no
+  // string comparison is needed.
+  EXPECT_LT(view(1, 5, 10), view(1, 7, 20));
+  EXPECT_GT(view(1, 7, 20), view(1, 5, 10));
+  EXPECT_EQ(view(1, 5, 10), view(1, 5, 10));
+  // Same view, larger sort helper but smaller index still orders by index.
+  EXPECT_LT(view(1, 9, 3), view(1, 2, 8));
+  EXPECT_EQ(hooks.compareByStringCalls_, 0u);
+
+  // Different views, different sort helper: order by sort helper (bucket), no
+  // string comparison.
+  EXPECT_LT(view(1, 3, 100), view(2, 8, 0));
+  EXPECT_GT(view(2, 8, 0), view(1, 3, 100));
+  EXPECT_EQ(hooks.compareByStringCalls_, 0u);
+
+  // Different views, same sort helper: fall back to full string comparison.
+  auto apple = view(1, 5, 0);
+  auto banana = view(2, 5, 0);
+  hooks.strings_[apple.getBits()] = "apple";
+  hooks.strings_[banana.getBits()] = "banana";
+  EXPECT_LT(apple, banana);
+  EXPECT_GT(banana, apple);
+  EXPECT_EQ(hooks.compareByStringCalls_, 2u);
+}
+
+// _____________________________________________________________________________
+TEST(ValueId, ViewVocabIndexComparisonAgainstOtherTypes) {
+  MockViewVocabHooks hooks;
+  ScopedViewVocabHooks scoped{&hooks};
+
+  // Against a `VocabIndex`: shortcut via the bucket when they differ.
+  auto v = Id::makeFromViewVocabIndex(1, 4, 0);
+  auto vocab = Id::makeFromVocabIndex(VocabIndex::make(50));
+  hooks.buckets_[vocab.getBits()] = 9;  // view bucket 4 < 9
+  EXPECT_LT(v, vocab);
+  EXPECT_GT(vocab, v);  // inverted correctly
+  EXPECT_EQ(hooks.compareByStringCalls_, 0u);
+
+  // Same bucket: fall back to full string comparison.
+  auto v2 = Id::makeFromViewVocabIndex(1, 7, 0);
+  auto vocab2 = Id::makeFromVocabIndex(VocabIndex::make(60));
+  hooks.buckets_[vocab2.getBits()] = 7;
+  hooks.strings_[v2.getBits()] = "mango";
+  hooks.strings_[vocab2.getBits()] = "lemon";
+  EXPECT_GT(v2, vocab2);  // "mango" > "lemon"
+  EXPECT_LT(vocab2, v2);  // inverted
+  EXPECT_EQ(hooks.compareByStringCalls_, 2u);
+
+  // Against an `EncodedVal`: a `ViewVocabIndex` (a main-vocabulary-space word)
+  // is always less, with no string comparison.
+  auto encoded = Id::makeFromEncodedVal(1234);
+  EXPECT_LT(v, encoded);
+  EXPECT_GT(encoded, v);
+  EXPECT_EQ(hooks.compareByStringCalls_, 2u);  // unchanged from above
+
+  // Against non-string types: a `ViewVocabIndex` must sort like the other
+  // string types, i.e. after numeric/boolean types and before the rest -
+  // regardless of its own (highest) datatype value. This is what prevents an
+  // ordering cycle such as `view < vocab < geoPoint < view`.
+  EXPECT_GT(v, Id::makeFromInt(42));
+  EXPECT_GT(v, Id::makeFromDouble(1.5));
+  EXPECT_GT(v, Id::makeFromBool(true));
+  EXPECT_GT(v, Id::makeUndefined());
+  EXPECT_LT(v, Id::makeFromGeoPoint(GeoPoint{0, 0}));
+  EXPECT_LT(v, Id::makeFromTextRecordIndex(TextRecordIndex::make(0)));
+  EXPECT_LT(v, Id::makeFromBlankNodeIndex(BlankNodeIndex::make(0)));
+  // A `VocabIndex` (an actual main-vocabulary string) sorts the same way, so
+  // `ViewVocabIndex` is consistent with it.
+  auto vocabWord = Id::makeFromVocabIndex(VocabIndex::make(0));
+  EXPECT_GT(vocabWord, Id::makeFromInt(42));
+  EXPECT_LT(vocabWord, Id::makeFromGeoPoint(GeoPoint{0, 0}));
+}
+
+// _____________________________________________________________________________
+// Sorting a column that mixes `VocabIndex`, `EncodedVal`, `ViewVocabIndex` and
+// non-string types must not violate the strict-weak-ordering requirement (which
+// would be undefined behavior in `std::sort`). This exercises the transitivity
+// of the comparison across all those combinations.
+TEST(ValueId, ViewVocabIndexSortIsConsistent) {
+  MockViewVocabHooks hooks;
+  ScopedViewVocabHooks scoped{&hooks};
+
+  // A view word "m" in bucket 5, a vocab word bucketed at 3 ("a") and 8 ("z"),
+  // an encoded value and a few non-string values.
+  auto view = Id::makeFromViewVocabIndex(1, 5, 0);
+  auto vocabLow = Id::makeFromVocabIndex(VocabIndex::make(10));
+  auto vocabHigh = Id::makeFromVocabIndex(VocabIndex::make(20));
+  hooks.buckets_[vocabLow.getBits()] = 3;
+  hooks.buckets_[vocabHigh.getBits()] = 8;
+  std::vector<ValueId> ids{view,
+                           vocabLow,
+                           vocabHigh,
+                           Id::makeFromEncodedVal(7),
+                           Id::makeFromInt(1),
+                           Id::makeFromDouble(2.0),
+                           Id::makeFromGeoPoint(GeoPoint{1, 1}),
+                           Id::makeUndefined()};
+  // `std::sort` requires a strict weak ordering; a violation is UB and
+  // typically manifests as a crash or a non-sorted result. Sort and verify the
+  // invariant
+  // `!(b < a)` for every adjacent pair, and that comparison is antisymmetric.
+  std::sort(ids.begin(), ids.end());
+  for (size_t i = 1; i < ids.size(); ++i) {
+    EXPECT_FALSE(ids[i] < ids[i - 1]);
+  }
+  // Transitivity spot check across the tricky trio.
+  EXPECT_LT(view, Id::makeFromEncodedVal(7));  // view < encoded
+  EXPECT_LT(view, vocabHigh);                  // bucket 5 < 8
+  EXPECT_GT(view, vocabLow);                   // bucket 5 > 3
+}
+
+// _____________________________________________________________________________
+TEST(ValueId, ViewVocabIndexHashing) {
+  MockViewVocabHooks hooks;
+  ScopedViewVocabHooks scoped{&hooks};
+
+  // Equal words from different views compare equal and must hash equally.
+  auto a = Id::makeFromViewVocabIndex(1, 5, 0);
+  auto b = Id::makeFromViewVocabIndex(2, 5, 3);
+  hooks.strings_[a.getBits()] = "same";
+  hooks.strings_[b.getBits()] = "same";
+  EXPECT_EQ(a, b);
+  EXPECT_EQ(absl::HashOf(a), absl::HashOf(b));
+
+  // Different words hash (almost surely) differently and compare unequal.
+  auto c = Id::makeFromViewVocabIndex(2, 5, 4);
+  hooks.strings_[c.getBits()] = "different";
+  EXPECT_NE(a, c);
+  EXPECT_NE(absl::HashOf(a), absl::HashOf(c));
+}
+
+// _____________________________________________________________________________
+// A `ViewVocabIndex` and a `LocalVocabIndex` that hold the same string (a word
+// not in the main vocabulary) must compare equal AND hash equal, otherwise
+// hash-based DISTINCT/GROUP BY/JOIN over such a column would give wrong
+// results.
+TEST_F(ValueIdTest, ViewVocabIndexEqualsLocalVocab) {
+  MockViewVocabHooks hooks;
+  ScopedViewVocabHooks scoped{&hooks};
+
+  // A literal that is (almost surely) not in the test index' vocabulary, so the
+  // local-vocab entry hashes by its string representation.
+  LocalVocabEntry entry = LocalVocabEntry::fromStringRepresentation(
+      "\"__view_vocab_absent_literal__\"", qec_->getLocalVocabContext());
+  auto localId = ValueId::makeFromLocalVocabIndex(&entry);
+  ASSERT_EQ(localId.getDatatype(), Datatype::LocalVocabIndex);
+
+  // A `ViewVocabIndex` whose (mocked) string value equals the local word.
+  auto viewId = Id::makeFromViewVocabIndex(3, 6, 42);
+  hooks.strings_[viewId.getBits()] = entry.toStringRepresentation();
+
+  EXPECT_EQ(viewId, localId);
+  EXPECT_EQ(localId, viewId);  // comparison is symmetric
+  EXPECT_EQ(absl::HashOf(viewId), absl::HashOf(localId));
+
+  // A different local word neither compares nor hashes equal.
+  LocalVocabEntry other = LocalVocabEntry::fromStringRepresentation(
+      "\"__view_vocab_absent_literal_2__\"", qec_->getLocalVocabContext());
+  auto otherLocalId = ValueId::makeFromLocalVocabIndex(&other);
+  EXPECT_NE(viewId, otherLocalId);
+  EXPECT_NE(absl::HashOf(viewId), absl::HashOf(otherLocalId));
+}
