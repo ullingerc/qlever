@@ -36,17 +36,26 @@
 class QueryExecutionContext;
 class QueryExecutionTree;
 class IndexScan;
+class MaterializedViewsManager;
 
 // For the future, materialized views save their version. If we change something
 // about the way materialized views are stored, we can break the existing ones
 // cleanly without breaking the entire index format.
 static constexpr size_t MATERIALIZED_VIEWS_VERSION = 1;
 
-// The ID of a materialized view. Each materialized view of an index has a
-// unique and fixed ID in the range `[0, MATERIALIZED_VIEW_MAX_ID]`. IDs are
-// assigned when a view is written. At query time, each view knows its own ID
-// from its `viewinfo.json`. The full list of all views and their IDs is only
-// needed when writing a view; it is kept in a single JSON file per index
+// The ID of a materialized view. Not every view needs one: assigning an ID is
+// only necessary for views that are referenced in a way that requires a
+// compact, fixed identifier (e.g. views containing local-vocabulary entries,
+// which need such an encoding, planned in a follow-up). Whether a view needs
+// an ID can only be decided while its contents are being written (for the
+// local-vocabulary case: whether any occur in the result at all), so the
+// `MaterializedViewWriter` itself decides this, rather than the caller that
+// requests the view to be written. By default a view does not get an ID. If
+// needed, each view of an index gets a unique and fixed ID in the range
+// `[0, MATERIALIZED_VIEW_MAX_ID]`, assigned while the view is written. At
+// query time, a view that has an ID knows it from its `viewinfo.json`. The
+// full list of all views that have an ID assigned is only needed when writing
+// a view; it is kept in a single JSON file per index
 // (`<onDiskBase>.views.json`).
 using MaterializedViewId = uint64_t;
 
@@ -64,8 +73,15 @@ class MaterializedViewWriter {
   std::string onDiskBase_;
   std::string name_;
 
-  // The fixed ID assigned to this view. It is stored in the view's metadata.
-  MaterializedViewId viewId_;
+  // The manager that owns the central views list, used to assign this view a
+  // fixed ID once `computeResultAndWritePermutation` has determined (from the
+  // query result) that one is needed.
+  const MaterializedViewsManager* manager_;
+
+  // The fixed ID assigned to this view, if it needs one. Unset until
+  // `computeResultAndWritePermutation` has decided whether one is needed. If
+  // set, it is stored in the view's metadata.
+  std::optional<MaterializedViewId> viewId_;
 
   // Query plan to retrieve the view's rows.
   std::shared_ptr<const QueryExecutionTree> qet_;
@@ -100,10 +116,11 @@ class MaterializedViewWriter {
 
   // Initialize a writer given the base filename of the view and a planned
   // query. The view will be written to files prefixed with the index basename
-  // followed by the view name.
+  // followed by the view name. `manager` is used to assign this view a fixed
+  // ID, if one turns out to be needed.
   MaterializedViewWriter(std::string onDiskBase, std::string name,
                          const PlannedQuery& plannedQuery,
-                         MaterializedViewId viewId,
+                         const MaterializedViewsManager* manager,
                          ad_utility::MemorySize memoryLimit,
                          ad_utility::AllocatorWithLimit<Id> allocator);
 
@@ -159,8 +176,11 @@ class MaterializedViewWriter {
   void writeViewMetadata() const;
 
   // Actually computes, permutes and if needed externally sorts the query result
-  // and writes the view (SPO permutation and metadata) to disk.
-  void computeResultAndWritePermutation() const;
+  // and writes the view (SPO permutation and metadata) to disk. Once the
+  // permutation has been written (and it is therefore known whether the view
+  // needs a fixed ID), assigns one via `manager_` if needed and stores it in
+  // `viewId_` before writing the metadata.
+  void computeResultAndWritePermutation();
 
   friend MaterializedViewsManager;
 };
@@ -315,9 +335,10 @@ class MaterializedViewsManager {
   mutable std::unique_ptr<std::mutex> viewsListMutex_{
       std::make_unique<std::mutex>()};
 
-  // The central list of all materialized views of the index, mapping each
-  // view's name to its fixed ID. It is only needed when writing views; at query
-  // time, each view knows its own ID from its `viewinfo.json`.
+  // The central list of the materialized views of the index that have a fixed
+  // ID, mapping each such view's name to its ID. Views that do not need an ID
+  // are not listed here. This list is only needed when writing views; at
+  // query time, each view knows its own ID (if any) from its `viewinfo.json`.
   using ViewsList = ad_utility::HashMap<std::string, MaterializedViewId>;
 
   // Return the filename of the central views list file for this index.
@@ -333,6 +354,15 @@ class MaterializedViewsManager {
   // Return the smallest free ID in `[0, MATERIALIZED_VIEW_MAX_ID]` given the
   // currently used IDs, throwing if no free ID is available.
   static MaterializedViewId smallestFreeViewId(const ViewsList& views);
+
+  // Assign the view with the given name a fixed ID, recording it in the
+  // central views list, and return it. Called by a `MaterializedViewWriter`
+  // once it has determined (from the query result) that its view needs one.
+  MaterializedViewId assignId(const std::string& name) const;
+
+  friend class MaterializedViewWriter;
+  FRIEND_TEST(MaterializedViewsTest, ViewIdsAndCentralList);
+  FRIEND_TEST(MaterializedViewsTest, ViewIdsCorruptedFiles);
 
  public:
   MaterializedViewsManager() = default;
@@ -377,7 +407,10 @@ class MaterializedViewsManager {
 
   // Write a `MaterializedView` given a valid `name` (consisting only of
   // alphanumerics and hyphens) and a `plannedQuery` to be executed. The query's
-  // result is written to the view.
+  // result is written to the view. Whether the view is assigned a fixed
+  // `MaterializedViewId` is decided internally by the `MaterializedViewWriter`
+  // itself while writing (see the comment on `MaterializedViewId`); most views
+  // do not need one.
   //
   // If a view with the same name is already loaded, it is unloaded before
   // writing.

@@ -773,16 +773,21 @@ TEST_F(MaterializedViewsTest, ViewIdsAndCentralList) {
   MaterializedViewsManager manager{testIndexBase_};
   auto plan = qlv().parseAndPlanQuery(simpleWriteQuery_);
 
-  // Helper to read the `id` field of a view's metadata JSON file.
-  auto readViewId = [&](const std::string& name) {
-    nlohmann::json viewInfo;
-    ad_utility::makeIfstream(
-        absl::StrCat(testIndexBase_, ".view.", name, ".viewinfo.json")) >>
-        viewInfo;
-    return viewInfo.at("id").get<MaterializedViewId>();
-  };
+  // By default, a `MaterializedViewWriter` currently never determines that a
+  // view needs a fixed ID (this will change once materialized views support
+  // storing local-vocabulary entries, in a follow-up PR). So writing a view
+  // via the public API does not assign it one.
+  manager.writeViewToDisk("testView1", plan);
+  nlohmann::json viewInfo1;
+  ad_utility::makeIfstream(
+      absl::StrCat(testIndexBase_, ".view.testView1.viewinfo.json")) >>
+      viewInfo1;
+  EXPECT_FALSE(viewInfo1.contains("id"));
+  EXPECT_FALSE(manager.getView("testView1")->id().has_value());
 
-  // Helper to read the central views list file.
+  // The underlying ID bookkeeping used by `MaterializedViewWriter` once it
+  // does determine that a view needs an ID: `assignId` hands out ascending
+  // IDs, starting from zero, and records them in the central views list.
   const std::string viewsListFilename =
       absl::StrCat(testIndexBase_, ".views.json");
   auto readViewsList = [&]() {
@@ -791,25 +796,18 @@ TEST_F(MaterializedViewsTest, ViewIdsAndCentralList) {
     return viewsList;
   };
 
-  // Writing views assigns ascending IDs, starting from zero, stored both in the
-  // central views list and in the views' own metadata files.
-  manager.writeViewToDisk("testView1", plan);
-  manager.writeViewToDisk("testView2", plan);
-  EXPECT_EQ(readViewId("testView1"), 0u);
-  EXPECT_EQ(readViewId("testView2"), 1u);
+  EXPECT_EQ(manager.assignId("testView2"), 0u);
+  EXPECT_EQ(manager.assignId("testView3"), 1u);
   EXPECT_TRUE(std::filesystem::exists(viewsListFilename));
   {
     auto viewsList = readViewsList();
-    EXPECT_EQ(viewsList.at("testView1").get<MaterializedViewId>(), 0u);
-    EXPECT_EQ(viewsList.at("testView2").get<MaterializedViewId>(), 1u);
+    EXPECT_EQ(viewsList.at("testView2").get<MaterializedViewId>(), 0u);
+    EXPECT_EQ(viewsList.at("testView3").get<MaterializedViewId>(), 1u);
   }
 
-  // A loaded view exposes its own ID (read from its metadata).
-  EXPECT_THAT(manager.getView("testView1")->id(), ::testing::Optional(0u));
-
-  // Overwriting a view keeps its existing ID.
-  manager.writeViewToDisk("testView1", plan);
-  EXPECT_EQ(readViewId("testView1"), 0u);
+  // Assigning an ID to a view that already has one (e.g. it is being
+  // rewritten) keeps the existing ID.
+  EXPECT_EQ(manager.assignId("testView2"), 0u);
 }
 
 // _____________________________________________________________________________
@@ -825,22 +823,24 @@ TEST_F(MaterializedViewsTest, ViewIdsCorruptedFiles) {
 
   // Central views list: not a JSON object (array instead).
   writeViewsList("[1, 2, 3]");
-  AD_EXPECT_THROW_WITH_MESSAGE(manager.writeViewToDisk("testView1", plan),
+  AD_EXPECT_THROW_WITH_MESSAGE(manager.assignId("testView1"),
                                ::testing::HasSubstr("expected a JSON object"));
 
   // Central views list: ID is a string, not an unsigned integer.
   writeViewsList(R"({"testView1": "notAnId"})");
-  AD_EXPECT_THROW_WITH_MESSAGE(manager.writeViewToDisk("testView1", plan),
+  AD_EXPECT_THROW_WITH_MESSAGE(manager.assignId("testView1"),
                                ::testing::HasSubstr("not an unsigned integer"));
 
   // Central views list: ID exceeds MATERIALIZED_VIEW_MAX_ID.
   writeViewsList(
       absl::StrCat(R"({"testView1": )", MATERIALIZED_VIEW_MAX_ID + 1, "}"));
   AD_EXPECT_THROW_WITH_MESSAGE(
-      manager.writeViewToDisk("testView1", plan),
+      manager.assignId("testView1"),
       ::testing::HasSubstr("exceeds the maximum allowed ID"));
 
-  // Remove the corrupted list so the next write succeeds.
+  // Remove the corrupted list, then write the view (which does not touch the
+  // list, as it does not need an ID) to get a `viewinfo.json` to tamper with
+  // below.
   std::filesystem::remove(viewsListFilename);
   manager.writeViewToDisk("testView1", plan);
 
