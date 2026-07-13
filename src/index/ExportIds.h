@@ -162,6 +162,7 @@ std::optional<std::pair<std::string, const char*>> idToStringAndType(
     }
     case VocabIndex:
     case LocalVocabIndex:
+    case ViewVocabIndex:
       return handleIriOrLiteral(
           getLiteralOrIriFromVocabIndex(index.getImpl(), id, localVocab));
     case EncodedVal:

@@ -21,9 +21,12 @@
 #include "engine/MaterializedViewsQueryAnalysis.h"
 #include "engine/VariableToColumnMap.h"
 #include "engine/idTable/CompressedExternalIdTable.h"
+#include "global/ValueId.h"
 #include "index/DeltaTriples.h"
 #include "index/ExternalSortFunctors.h"
 #include "index/Permutation.h"
+#include "index/Vocabulary.h"
+#include "index/vocabulary/VocabularyType.h"
 #include "libqlever/QleverTypes.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/MaterializedViewQuery.h"
@@ -37,6 +40,8 @@ class QueryExecutionContext;
 class QueryExecutionTree;
 class IndexScan;
 class MaterializedViewsManager;
+class IndexImpl;
+class Index;
 
 // For the future, materialized views save their version. If we change something
 // about the way materialized views are stored, we can break the existing ones
@@ -172,10 +177,6 @@ class MaterializedViewWriter {
   // sorted).
   void buildViewVocabularyAndReplace(IdTable& table);
 
-  // Filename suffix (appended to `getFilenameBase()`) of the view's dedicated
-  // vocabulary.
-  static constexpr std::string_view viewVocabularySuffix_ = ".vocabulary";
-
   // Helper for `computeResultAndWritePermutation`: If the query given by the
   // user is already sorted correctly, this function can be used to obtain the
   // permuted blocks.
@@ -230,6 +231,12 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   // views written before view IDs were introduced.
   std::optional<MaterializedViewId> viewId_;
 
+  // The view's dedicated vocabulary, if it has one (i.e. its write query
+  // produced local-vocabulary words that are neither in the main index nor
+  // encodable). Used to resolve the index part of a `ViewVocabIndex` to its
+  // string.
+  std::optional<RdfsVocabulary> viewVocab_;
+
   // Lookup table for `BIND` statements from the view's query. Maps the cache
   // keys of the `BIND` expressions (based on the column indices in the view) to
   // the target column index.
@@ -268,6 +275,20 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
 
   // Get the fixed ID of this view, if it has one.
   const std::optional<MaterializedViewId>& id() const { return viewId_; }
+
+  // Whether this view has a dedicated vocabulary (see `viewVocab_`).
+  bool hasVocabulary() const { return viewVocab_.has_value(); }
+
+  // Resolve the index part of a `ViewVocabIndex` (the `indexInVocab`) to its
+  // string via this view's dedicated vocabulary. Must only be called if
+  // `hasVocabulary()`.
+  std::string resolveViewVocabString(uint64_t indexInVocab) const;
+
+  // Filename suffix (appended to the view's base filename, see
+  // `getFilenameBase`) and vocabulary type of a view's dedicated vocabulary.
+  // Shared by the writer and the reader.
+  static constexpr std::string_view viewVocabularySuffix_ = ".vocabulary";
+  static ad_utility::VocabularyType viewVocabularyType();
 
   // Get a parsed version of the original query, used for query analysis.
   const std::optional<ParsedQuery>& parsedQuery() const { return parsedQuery_; }
@@ -344,14 +365,25 @@ using materializedViewsQueryAnalysis::MaterializedViewJoinReplacement;
 // The `MaterializedViewsManager` is part of the `QueryExecutionContext` and is
 // used to manage the currently loaded `MaterializedViews` in a `Server` or
 // `Qlever` instance.
-class MaterializedViewsManager {
+class MaterializedViewsManager : public ViewVocabComparisonHooks {
  private:
   std::string onDiskBase_;
+
+  // Pointer to the main index. Needed by the `ViewVocabComparisonHooks`
+  // implementation (see below) to compute main-vocabulary buckets and to
+  // resolve/compare against main-vocabulary and encoded IRIs. Set via
+  // `setIndex`, and stable because the manager and the index live together in
+  // a non-moveable `Qlever::IndexAndViews`.
+  const IndexImpl* index_ = nullptr;
 
   // Helper struct to unify the locking of loaded views and `QueryPatternCache`.
   struct LoadedViews {
     ad_utility::HashMap<std::string, std::shared_ptr<MaterializedView>> views_;
     materializedViewsQueryAnalysis::QueryPatternCache queryPatternCache_;
+    // Views that have a fixed ID, indexed by that ID, so that a
+    // `ViewVocabIndex` (which stores the view ID) can be resolved.
+    ad_utility::HashMap<MaterializedViewId, std::shared_ptr<MaterializedView>>
+        viewsById_;
   };
 
   mutable ad_utility::Synchronized<LoadedViews> loadedViews_;
@@ -397,10 +429,35 @@ class MaterializedViewsManager {
   explicit MaterializedViewsManager(std::string onDiskBase)
       : onDiskBase_{std::move(onDiskBase)} {};
 
+  // Unregister this manager as the process-wide `ViewVocabComparisonHooks` if
+  // it was registered (see `loadView`).
+  ~MaterializedViewsManager() override;
+
+  // Keep the manager moveable (required by `Qlever::IndexAndViews`); the
+  // user-declared destructor would otherwise suppress the moves. Moves only
+  // happen at construction time, before any view (and thus any hook
+  // registration) is loaded, so the registered `this` pointer never becomes
+  // stale through a move.
+  MaterializedViewsManager(MaterializedViewsManager&&) noexcept = default;
+  MaterializedViewsManager& operator=(MaterializedViewsManager&&) noexcept =
+      default;
+
   // For use with the default constructor: set the index basename after creation
   // of the `MaterializedViewsManager`. This should only be called once and
   // before any calls to `loadView` and `getView`.
   void setOnDiskBase(const std::string& onDiskBase);
+
+  // Set the main index used by the `ViewVocabComparisonHooks` implementation.
+  // Must be called once (before any view with a vocabulary is loaded), with an
+  // index that outlives this manager (they live together in
+  // `Qlever::IndexAndViews`).
+  void setIndex(const Index& index);
+
+  // `ViewVocabComparisonHooks` implementation (used by `ValueId` comparison and
+  // hashing for `ViewVocabIndex` values). See the base class for the contract.
+  std::string viewVocabString(ValueId viewVocabIndexId) const override;
+  ql::strong_ordering compareByString(ValueId a, ValueId b) const override;
+  uint64_t mainVocabBucket(ValueId mainVocabId) const override;
 
   // Check if a materialized view is currently loaded.
   bool isViewLoaded(const std::string& name) const;

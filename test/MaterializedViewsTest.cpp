@@ -530,6 +530,33 @@ TEST_F(MaterializedViewsTest, LocalVocabViewWriter) {
 }
 
 // _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, LocalVocabViewRoundTrip) {
+  // Write a view whose (materialized, via `ORDER BY`) result contains a
+  // local-vocabulary word, then read that column back and check that the string
+  // round-trips through the dedicated view vocabulary (write side: step that
+  // builds the vocabulary; read side: resolution via the registered hooks).
+  qlv().writeMaterializedView(
+      "lvView",
+      "SELECT ?s ?g { ?s ?p ?o . BIND(\"someLocalVocabString\" AS ?g) } "
+      "ORDER BY ?g");
+  auto res = qlv().query(
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> "
+      "SELECT ?g { ?s view:lvView-g ?g } LIMIT 1",
+      ad_utility::MediaType::tsv);
+  EXPECT_THAT(res, ::testing::HasSubstr("someLocalVocabString"));
+
+  // Ordering a mix of a view-vocabulary word and a main-vocabulary word also
+  // works (exercises the comparison hooks): the local word sorts after the IRIs
+  // from the index (which start with '<').
+  auto ordered = qlv().query(
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> "
+      "SELECT ?g { { ?s view:lvView-g ?g } UNION { BIND(<a> AS ?g) } } "
+      "ORDER BY ?g LIMIT 2",
+      ad_utility::MediaType::tsv);
+  EXPECT_THAT(ordered, ::testing::HasSubstr("someLocalVocabString"));
+}
+
+// _____________________________________________________________________________
 TEST_F(MaterializedViewsTest, ManualConfigurations) {
   MaterializedViewsManager manager{testIndexBase_};
   auto plan = qlv().parseAndPlanQuery(simpleWriteQuery_);

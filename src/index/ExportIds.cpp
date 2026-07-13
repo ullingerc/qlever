@@ -88,6 +88,7 @@ std::optional<Literal> idToLiteral(const IndexImpl& index, Id id,
                                 onlyReturnLiteralsWithXsdString);
     case VocabIndex:
     case LocalVocabIndex:
+    case ViewVocabIndex:
       return handleIriOrLiteral(
           getLiteralOrIriFromVocabIndex(index, id, localVocab),
           onlyReturnLiteralsWithXsdString);
@@ -155,6 +156,7 @@ std::optional<LiteralOrIri> idToLiteralOrIri(const IndexImpl& index, Id id,
     case VocabIndex:
     case LocalVocabIndex:
     case EncodedVal:
+    case ViewVocabIndex:
       return ql::exportIds::getLiteralOrIriFromVocabIndex(index, id,
                                                           localVocab);
     case TextRecordIndex:
@@ -201,6 +203,16 @@ LiteralOrIri getLiteralOrIriFromVocabIndex(const IndexImpl& index, Id id,
     }
     case Datatype::EncodedVal:
       return encodedIdToLiteralOrIri(id, index);
+    case Datatype::ViewVocabIndex: {
+      // Resolve via the process-wide hooks registered by the
+      // `MaterializedViewsManager` (a `ViewVocabIndex` only exists while a view
+      // with a dedicated vocabulary is loaded, so the hooks are set).
+      const auto* hooks = getViewVocabComparisonHooks();
+      AD_CONTRACT_CHECK(hooks != nullptr,
+                        "Encountered a `ViewVocabIndex` but no materialized "
+                        "view vocabulary is registered.");
+      return LiteralOrIri::fromStringRepresentation(hooks->viewVocabString(id));
+    }
     default:
       AD_FAIL();
   }
