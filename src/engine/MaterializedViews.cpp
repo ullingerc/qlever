@@ -632,8 +632,10 @@ MaterializedView::MaterializedView(std::string onDiskBase, std::string name)
     }
     viewId_ = id;
 
-    // A view with a fixed ID has a dedicated vocabulary; load it. (The
-    // vocabulary files are written by `MaterializedViewWriter`.)
+    // A view has a fixed ID iff it has a dedicated vocabulary (see
+    // `MaterializedViewWriter::buildViewVocabularyAndReplace`, which is the
+    // only place that assigns an ID). So a view with an ID always has
+    // vocabulary files on disk, written by `MaterializedViewWriter`; load them.
     auto vocabFilename =
         absl::StrCat(filename, MaterializedView::viewVocabularySuffix_);
     viewVocab_.emplace();
@@ -923,11 +925,10 @@ void MaterializedViewsManager::setOnDiskBase(const std::string& onDiskBase) {
 
 // _____________________________________________________________________________
 MaterializedViewsManager::~MaterializedViewsManager() {
-  // Only clear the process-wide hooks if they still point to this instance
-  // (another manager may have registered itself in the meantime).
-  if (getViewVocabComparisonHooks() == this) {
-    setViewVocabComparisonHooks(nullptr);
-  }
+  // Clear the process-wide hooks, but (atomically) only if they still point to
+  // this instance, so we do not clobber another manager that registered itself
+  // in the meantime.
+  clearViewVocabComparisonHooksIfCurrent(this);
 }
 
 // _____________________________________________________________________________
@@ -950,6 +951,13 @@ std::string MaterializedViewsManager::viewVocabString(
 
 // _____________________________________________________________________________
 uint64_t MaterializedViewsManager::mainVocabBucket(ValueId mainVocabId) const {
+  // NOTE: The sort helper stored in a `ViewVocabIndex` (computed by the writer)
+  // and this bucket must be computed against the same main vocabulary: two
+  // differing buckets decide the order without a string comparison, so a stale
+  // bucket (from a changed main vocabulary) could misorder. This is safe
+  // because a materialized view is tied to the index generation it was written
+  // against - its stored `VocabIndex` values would likewise be invalid if the
+  // main vocabulary changed, so a view is never read against a different one.
   AD_CORRECTNESS_CHECK(index_ != nullptr);
   const auto& vocab = index_->getVocab();
   uint64_t size = vocab.size();

@@ -157,6 +157,15 @@ inline const ViewVocabComparisonHooks* getViewVocabComparisonHooks() {
   return detail::viewVocabHooksStorage().load(std::memory_order_acquire);
 }
 
+// Atomically clear the hooks, but only if they currently equal `expected`.
+// Used when a hooks instance is destroyed, so that it does not clobber a
+// different instance that was registered concurrently in the meantime.
+inline void clearViewVocabComparisonHooksIfCurrent(
+    const ViewVocabComparisonHooks* expected) {
+  detail::viewVocabHooksStorage().compare_exchange_strong(
+      expected, nullptr, std::memory_order_acq_rel);
+}
+
 /// Encode values of different types (the types from the `Datatype` enum above)
 /// using 4 bits for the datatype and 60 bits for the value.
 ///
