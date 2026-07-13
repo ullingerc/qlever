@@ -460,6 +460,9 @@ class ValueId {
   static constexpr T numViewVocabIndexBits = 38;
   static_assert(numViewIdBits + numViewSortHelperBits + numViewVocabIndexBits ==
                 numDataBits);
+  // The number of equal-sized parts the main vocabulary is split into for the
+  // sorting helper (`2 ** numViewSortHelperBits`).
+  static constexpr T numViewSortHelperParts = 1ULL << numViewSortHelperBits;
 
   // The three parts a `ViewVocabIndex` is decoded into.
   struct ViewVocabIndexParts {

@@ -144,9 +144,37 @@ class MaterializedViewWriter {
     return columnPermutation_.size() + numAddEmptyColumns_;
   }
 
-  // Helper to permute an `IdTable` according to `columnPermutation_` and verify
-  // that there are no `LocalVocabEntry` values in any of the selected columns.
+  // Helper to permute an `IdTable` according to `columnPermutation_` (and add
+  // the empty padding columns).
+  void permuteIdTable(IdTable& block) const;
+
+  // Like `permuteIdTable`, but additionally throws if any selected column
+  // contains a `LocalVocabIndex`. Used on the streaming (lazy-result) path,
+  // which cannot build a per-view vocabulary; see `getBlocksWithViewVocabulary`
+  // for the (fully-materialized) path that does support local-vocabulary
+  // entries.
   void permuteIdTableAndCheckNoLocalVocabEntries(IdTable& block) const;
+
+  // Handle a fully-materialized result that contains local-vocabulary entries:
+  // permute and sort the single `IdTable`, then build the view's dedicated
+  // vocabulary and replace the `LocalVocabIndex` values (see
+  // `buildViewVocabularyAndReplace`). Returns the single sorted, permuted and
+  // rewritten block.
+  RangeOfIdTables getBlocksWithViewVocabulary(
+      std::shared_ptr<const Result> result);
+
+  // Given a sorted, permuted `IdTable` that may contain `LocalVocabIndex`
+  // values, replace each such value by its cheapest persistent representation:
+  // a `VocabIndex`/`EncodedVal` if the word is in the main index, otherwise a
+  // `ViewVocabIndex` into a newly built, dedicated view vocabulary (written to
+  // disk). If any `ViewVocabIndex` is needed, this assigns the view a fixed ID
+  // via `manager_`. The replacement preserves the row order (so the table stays
+  // sorted).
+  void buildViewVocabularyAndReplace(IdTable& table);
+
+  // Filename suffix (appended to `getFilenameBase()`) of the view's dedicated
+  // vocabulary.
+  static constexpr std::string_view viewVocabularySuffix_ = ".vocabulary";
 
   // Helper for `computeResultAndWritePermutation`: If the query given by the
   // user is already sorted correctly, this function can be used to obtain the

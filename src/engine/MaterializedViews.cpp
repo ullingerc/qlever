@@ -26,6 +26,11 @@
 #include "engine/idTable/CompressedExternalIdTable.h"
 #include "index/DeltaTriples.h"
 #include "index/ExternalSortFunctors.h"
+#include "index/IdTableUtils.h"
+#include "index/IndexImpl.h"
+#include "index/LocalVocabEntry.h"
+#include "index/Vocabulary.h"
+#include "index/vocabulary/VocabularyType.h"
 #include "libqlever/Qlever.h"
 #include "parser/MaterializedViewQuery.h"
 #include "parser/ParsedQuery.h"
@@ -42,8 +47,7 @@
 MaterializedViewWriter::MaterializedViewWriter(
     std::string onDiskBase, std::string name,
     const qlever::PlannedQuery& plannedQuery,
-    const MaterializedViewsManager* manager,
-    ad_utility::MemorySize memoryLimit,
+    const MaterializedViewsManager* manager, ad_utility::MemorySize memoryLimit,
     ad_utility::AllocatorWithLimit<Id> allocator)
     : onDiskBase_{std::move(onDiskBase)},
       name_{std::move(name)},
@@ -208,8 +212,7 @@ MaterializedViewWriter::getIdTableColumnNamesAndPermutation() const {
 }
 
 // _____________________________________________________________________________
-void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
-    IdTable& block) const {
+void MaterializedViewWriter::permuteIdTable(IdTable& block) const {
   // The `IdTable` may have a different column ordering from the
   // `SELECT` statement, thus we must permute this to the column
   // ordering we want to have in our materialized view. In
@@ -226,10 +229,18 @@ void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
       block.at(row, col) = ValueId::makeUndefined();
     }
   }
+}
+
+// _____________________________________________________________________________
+void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
+    IdTable& block) const {
+  permuteIdTable(block);
 
   // Check that there are no values of type `LocalVocabIndex` in the selected
-  // columns of the `IdTable` as materialized views do not support them as of
-  // now.
+  // columns of the `IdTable`. This is only reached on the streaming (lazy
+  // result) path, which cannot build a per-view vocabulary; a
+  // fully-materialized result with local-vocabulary entries is instead handled
+  // by `getBlocksWithViewVocabulary`.
   bool hasLocalVocab =
       ql::ranges::any_of(block.getColumns(), [](const auto& col) {
         return ql::ranges::any_of(col, [](ValueId id) {
@@ -239,10 +250,11 @@ void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
   if (hasLocalVocab) {
     throw std::runtime_error{
         "The query to write a materialized view returned a string not "
-        "contained in the index (local vocabulary entry). This could be "
-        "the result of a string-related function in your query or the "
-        "presence of SPARQL UPDATEs in this instance of Qlever. Both are "
-        "currently not supported in materialized views."};
+        "contained in the index (local vocabulary entry) in a streaming "
+        "result. This could be the result of a string-related function in "
+        "your query or the presence of SPARQL UPDATEs in this instance of "
+        "Qlever. Materialized views can store such local-vocabulary entries, "
+        "but only when the query result is fully materialized (not streamed)."};
   }
 }
 
@@ -398,6 +410,121 @@ void MaterializedViewWriter::writeViewMetadata() const {
 }
 
 // _____________________________________________________________________________
+MaterializedViewWriter::RangeOfIdTables
+MaterializedViewWriter::getBlocksWithViewVocabulary(
+    std::shared_ptr<const Result> result) {
+  AD_LOG_INFO << "Query result for materialized view \"" << name_
+              << "\" contains local-vocabulary entries; building a dedicated "
+                 "view vocabulary"
+              << std::endl;
+  IdTable table = result->cloneIdTable();
+  permuteIdTable(table);
+
+  // Sort by the leading columns (which the SPO permutation is keyed on, see
+  // `writePermutation`) using the full, local-vocabulary-aware comparison.
+  std::vector<ColumnIndex> sortColumns;
+  for (ColumnIndex i = 0;
+       i < std::min<size_t>(ADDITIONAL_COLUMN_GRAPH_ID + 1, numCols()); ++i) {
+    sortColumns.push_back(i);
+  }
+  IdTableUtils::sort(table, sortColumns);
+
+  buildViewVocabularyAndReplace(table);
+
+  std::vector<IdTableStatic<0>> singleIdTable;
+  singleIdTable.push_back(std::move(table));
+  return RangeOfIdTables{std::move(singleIdTable)};
+}
+
+// _____________________________________________________________________________
+void MaterializedViewWriter::buildViewVocabularyAndReplace(IdTable& table) {
+  const auto& mainVocab = qec_->getIndex().getImpl().getVocab();
+
+  // First pass: classify each distinct local-vocabulary entry. An entry whose
+  // word is already representable as a main-index `Id` (a `VocabIndex` for a
+  // word in the main vocabulary, or an `EncodedVal` for an encodable IRI) is
+  // mapped to that `Id` directly; all others need an entry in the view's
+  // dedicated vocabulary. `positionInVocab` already performs this distinction:
+  // it returns a half-open range `[lower, upper)` that is non-empty iff the
+  // word is representable in the main index.
+  ad_utility::HashMap<const LocalVocabEntry*, Id> replacement;
+  ad_utility::HashSet<const LocalVocabEntry*> seen;
+  // New words, with the (marker-carrying) main-vocabulary position they would
+  // occupy, used for the sorting helper below.
+  std::vector<std::pair<const LocalVocabEntry*, uint64_t>> newEntries;
+  for (size_t col = 0; col < table.numColumns(); ++col) {
+    for (size_t row = 0; row < table.numRows(); ++row) {
+      Id id = table.at(row, col);
+      if (id.getDatatype() != Datatype::LocalVocabIndex) {
+        continue;
+      }
+      const LocalVocabEntry* entry = id.getLocalVocabIndex();
+      if (!seen.insert(entry).second) {
+        continue;
+      }
+      auto pos = entry->positionInVocab();
+      Id lower = Id::fromBits(pos.lowerBound_.get());
+      Id upper = Id::fromBits(pos.upperBound_.get());
+      if (lower != upper) {
+        replacement.emplace(entry, lower);
+      } else {
+        newEntries.emplace_back(entry, lower.getVocabIndex().get());
+      }
+    }
+  }
+
+  // Second pass: if there are new words, build the view's dedicated vocabulary
+  // (which requires the view to have a fixed ID) and map each new word to a
+  // `ViewVocabIndex`.
+  if (!newEntries.empty()) {
+    viewId_ = manager_->assignId(name_);
+
+    ad_utility::HashSet<std::string> newWords;
+    for (const auto& [entry, pos] : newEntries) {
+      newWords.insert(entry->toStringRepresentation());
+    }
+    RdfsVocabulary viewVocab;
+    viewVocab.resetToType(ad_utility::VocabularyType{
+        ad_utility::VocabularyType::Enum::OnDiskCompressed});
+    viewVocab.createFromSet(
+        newWords, absl::StrCat(getFilenameBase(), viewVocabularySuffix_));
+
+    const uint64_t mainVocabSize = mainVocab.size();
+    for (const auto& [entry, mainVocabPos] : newEntries) {
+      VocabIndex viewVocabIndex;
+      bool found =
+          viewVocab.getId(entry->toStringRepresentation(), &viewVocabIndex);
+      AD_CORRECTNESS_CHECK(found);
+      // The sorting helper is the part (out of `numViewSortHelperParts`) of the
+      // main vocabulary in which the word would be located.
+      uint64_t cumulative = mainVocab.getCumulativeIndex(mainVocabPos);
+      uint64_t sortHelper =
+          mainVocabSize == 0
+              ? 0
+              : std::min<uint64_t>(cumulative *
+                                       ValueId::numViewSortHelperParts /
+                                       mainVocabSize,
+                                   ValueId::numViewSortHelperParts - 1);
+      replacement.emplace(
+          entry, ValueId::makeFromViewVocabIndex(viewId_.value(), sortHelper,
+                                                 viewVocabIndex.get()));
+    }
+  }
+
+  // Third pass: replace all local-vocabulary ids in place. Each replacement id
+  // sorts at the same position as the entry it replaces, so the table stays
+  // sorted.
+  for (size_t col = 0; col < table.numColumns(); ++col) {
+    for (size_t row = 0; row < table.numRows(); ++row) {
+      Id id = table.at(row, col);
+      if (id.getDatatype() == Datatype::LocalVocabIndex) {
+        table.at(row, col) = replacement.at(id.getLocalVocabIndex());
+      }
+    }
+  }
+}
+
+// _____________________________________________________________________________
 void MaterializedViewWriter::computeResultAndWritePermutation() {
   // Run query and sort the result externally (only if necessary).
   AD_LOG_INFO << "Computing query result for materialized view \"" << name_
@@ -405,24 +532,28 @@ void MaterializedViewWriter::computeResultAndWritePermutation() {
               << std::endl;
   auto result = qet_->getResult(true);
 
+  // A fully-materialized result that contains local-vocabulary entries is
+  // handled by a dedicated in-memory path that builds a per-view vocabulary
+  // (the external sorter cannot carry `LocalVocabIndex` values, which are
+  // pointers). All other results use the streaming path with the external
+  // sorter (which throws if a streamed result contains local-vocabulary
+  // entries). The sorter is only used by the latter, but is kept in this scope
+  // so that it outlives the range it produces.
   Sorter spoSorter{getFilenameBase() + ".spo-sorter.dat", numCols(),
                    memoryLimit_, allocator_};
-  RangeOfIdTables sortedBlocksSPO = getSortedBlocks(spoSorter, result);
+  RangeOfIdTables sortedBlocksSPO =
+      result->isFullyMaterialized() && !result->localVocab().empty()
+          ? getBlocksWithViewVocabulary(result)
+          : getSortedBlocks(spoSorter, result);
 
   // Write compressed relation to disk.
   AD_LOG_INFO << "Writing materialized view \"" << name_ << "\" to disk ..."
               << std::endl;
   auto spoMetaData = writePermutation(std::move(sortedBlocksSPO));
 
-  // Only now, after having written and thereby inspected the full query
-  // result, do we know whether this view needs a fixed ID (e.g. once
-  // materialized views support storing local-vocabulary entries, in a
-  // follow-up PR, this will be the case iff any occurred in the result). No
-  // such case exists yet, so no view currently needs one.
-  constexpr bool needsId = false;
-  if (needsId) {
-    viewId_ = manager_->assignId(name_);
-  }
+  // The view ID (if any) was assigned by `buildViewVocabularyAndReplace` while
+  // building the dedicated view vocabulary. Persist the metadata (including the
+  // ID, if set) now.
   writeViewMetadata();
 
   AD_LOG_INFO << "Statistics for view \"" << name_

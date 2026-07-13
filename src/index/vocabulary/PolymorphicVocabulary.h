@@ -73,6 +73,14 @@ class PolymorphicVocabulary {
   // Return the `i`-th word, throw if `i` is out of bounds.
   std::string operator[](uint64_t i) const;
 
+  // Map a (possibly marker-carrying) index onto the range `[0, size())` in the
+  // order in which the words are stored. For a `SplitVocabulary` this strips
+  // the marker bits and adds the sizes of the preceding sub-vocabularies (see
+  // `SplitVocabulary::getCumulativeIndex`); for all other (non-split)
+  // vocabularies the index is returned unchanged. Used to compute the sorting
+  // helper of a `ViewVocabIndex`.
+  uint64_t getCumulativeIndex(uint64_t indexWithMarker) const;
+
   // Return a reference to currently underlying vocabulary, as a variant of the
   // possible types.
   Variant& getUnderlyingVocabulary() { return vocab_; }

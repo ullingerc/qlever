@@ -34,6 +34,23 @@ std::string PolymorphicVocabulary::operator[](uint64_t i) const {
 }
 
 // _____________________________________________________________________________
+uint64_t PolymorphicVocabulary::getCumulativeIndex(
+    uint64_t indexWithMarker) const {
+  return std::visit(
+      [indexWithMarker](const auto& vocab) -> uint64_t {
+        using V = std::decay_t<decltype(vocab)>;
+        // Only the geo-split vocabulary carries marker bits; all other
+        // implementations use plain, already-cumulative indices.
+        if constexpr (std::is_same_v<V, OnDiskCompressedGeoSplit>) {
+          return vocab.getCumulativeIndex(indexWithMarker);
+        } else {
+          return indexWithMarker;
+        }
+      },
+      vocab_);
+}
+
+// _____________________________________________________________________________
 auto PolymorphicVocabulary::makeDiskWriterPtr(const std::string& filename) const
     -> std::unique_ptr<WordWriterBase> {
   return std::visit(
