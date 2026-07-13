@@ -41,12 +41,13 @@
 // _____________________________________________________________________________
 MaterializedViewWriter::MaterializedViewWriter(
     std::string onDiskBase, std::string name,
-    const qlever::PlannedQuery& plannedQuery, MaterializedViewId viewId,
+    const qlever::PlannedQuery& plannedQuery,
+    const MaterializedViewsManager* manager,
     ad_utility::MemorySize memoryLimit,
     ad_utility::AllocatorWithLimit<Id> allocator)
     : onDiskBase_{std::move(onDiskBase)},
       name_{std::move(name)},
-      viewId_{viewId},
+      manager_{manager},
       qet_{plannedQuery.sharedQueryExecutionTree()},
       qec_{plannedQuery.sharedQueryExecutionContext()},
       parsedQuery_{plannedQuery.parsedQuery()},
@@ -131,6 +132,22 @@ MaterializedViewId MaterializedViewsManager::smallestFreeViewId(
 }
 
 // _____________________________________________________________________________
+MaterializedViewId MaterializedViewsManager::assignId(
+    const std::string& name) const {
+  // Assign the view a fixed ID and record it in the central views list,
+  // reusing the existing ID if a view of the same name already has one (e.g.
+  // it is being overwritten).
+  std::lock_guard lock{*viewsListMutex_};
+  auto views = readViewsList();
+  auto it = views.find(name);
+  MaterializedViewId viewId =
+      it != views.end() ? it->second : smallestFreeViewId(views);
+  views.insert_or_assign(name, viewId);
+  writeViewsList(views);
+  return viewId;
+}
+
+// _____________________________________________________________________________
 void MaterializedViewsManager::writeViewToDisk(
     std::string name, const qlever::PlannedQuery& plannedQuery,
     ad_utility::MemorySize memoryLimit,
@@ -138,22 +155,9 @@ void MaterializedViewsManager::writeViewToDisk(
   MaterializedView::throwIfInvalidName(name);
   unloadViewIfLoaded(name);
 
-  // Assign the view a fixed ID and record it in the central views list, reusing
-  // the existing ID if a view of the same name is being overwritten. Writing
-  // the list before the view avoids two concurrent writes claiming the same ID.
-  MaterializedViewId viewId;
-  {
-    std::lock_guard lock{*viewsListMutex_};
-    auto views = readViewsList();
-    auto it = views.find(name);
-    viewId = it != views.end() ? it->second : smallestFreeViewId(views);
-    views.insert_or_assign(name, viewId);
-    writeViewsList(views);
-  }
-
   MaterializedViewWriter writer{
       onDiskBase_, std::move(name),        plannedQuery,
-      viewId,      std::move(memoryLimit), std::move(allocator)};
+      this,        std::move(memoryLimit), std::move(allocator)};
   writer.computeResultAndWritePermutation();
 }
 
@@ -376,7 +380,6 @@ void MaterializedViewWriter::writeViewMetadata() const {
   const auto& varToCol = qet_->getVariableColumns();
   nlohmann::json viewInfo = {
       {"version", MATERIALIZED_VIEWS_VERSION},
-      {"id", viewId_},
       {"columns",
        (columnNames_ | ql::views::transform([&varToCol](const Variable& v) {
           return nlohmann::json{
@@ -387,12 +390,15 @@ void MaterializedViewWriter::writeViewMetadata() const {
         }) |
         ::ranges::to<std::vector<nlohmann::json>>())},
       {"query", parsedQuery_._originalString}};
+  if (viewId_.has_value()) {
+    viewInfo["id"] = viewId_.value();
+  }
   ad_utility::makeOfstream(getFilenameBase() + ".viewinfo.json")
       << viewInfo.dump() << std::endl;
 }
 
 // _____________________________________________________________________________
-void MaterializedViewWriter::computeResultAndWritePermutation() const {
+void MaterializedViewWriter::computeResultAndWritePermutation() {
   // Run query and sort the result externally (only if necessary).
   AD_LOG_INFO << "Computing query result for materialized view \"" << name_
               << "\": " << parsedQuery_._originalString.substr(0, 80) << " ..."
@@ -407,6 +413,16 @@ void MaterializedViewWriter::computeResultAndWritePermutation() const {
   AD_LOG_INFO << "Writing materialized view \"" << name_ << "\" to disk ..."
               << std::endl;
   auto spoMetaData = writePermutation(std::move(sortedBlocksSPO));
+
+  // Only now, after having written and thereby inspected the full query
+  // result, do we know whether this view needs a fixed ID (e.g. once
+  // materialized views support storing local-vocabulary entries, in a
+  // follow-up PR, this will be the case iff any occurred in the result). No
+  // such case exists yet, so no view currently needs one.
+  constexpr bool needsId = false;
+  if (needsId) {
+    viewId_ = manager_->assignId(name_);
+  }
   writeViewMetadata();
 
   AD_LOG_INFO << "Statistics for view \"" << name_
