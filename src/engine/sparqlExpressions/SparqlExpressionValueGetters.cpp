@@ -38,6 +38,7 @@ NumericValue NumericValueGetter::operator()(
     case Datatype::EncodedVal:
     case Datatype::VocabIndex:
     case Datatype::LocalVocabIndex:
+    case Datatype::ViewVocabIndex:
     case Datatype::TextRecordIndex:
     case Datatype::WordVocabIndex:
     case Datatype::Date:
@@ -60,6 +61,7 @@ NumericOrDateValue NumericOrDateValueGetter::operator()(
       return static_cast<int64_t>(id.getBool());
     case Datatype::Undefined:
     case Datatype::EncodedVal:
+    case Datatype::ViewVocabIndex:
     case Datatype::VocabIndex:
     case Datatype::LocalVocabIndex:
     case Datatype::TextRecordIndex:
@@ -91,6 +93,10 @@ auto EffectiveBooleanValueGetter::operator()(
     case Datatype::BlankNodeIndex:
       return Undef;
     case Datatype::EncodedVal:
+    // TODO<ullingerc> A `ViewVocabIndex` could in principle be the empty
+    // literal; resolving it to check would require the view's vocabulary. Like
+    // `EncodedVal`, we assume non-empty for now.
+    case Datatype::ViewVocabIndex:
       // This assumes that we never use this for empty IRIs.
       return True;
     case Datatype::VocabIndex: {
@@ -231,6 +237,7 @@ Id IsSomethingValueGetter<isSomethingFunction, prefix>::operator()(
       return Id::makeFromBool(std::invoke(isSomethingFunction,
                                           context->_qec.getIndex().getVocab(),
                                           id.getVocabIndex()));
+    case Datatype::ViewVocabIndex:
     case Datatype::LocalVocabIndex: {
       auto word = ql::exportIds::idToStringAndType<false>(
           context->_qec.getIndex(), id, context->_localVocab);
@@ -298,6 +305,7 @@ IntDoubleStr ToNumericValueGetter::operator()(
       return id.getGeoPoint().toStringRepresentation();
     case Datatype::VocabIndex:
     case Datatype::LocalVocabIndex:
+    case Datatype::ViewVocabIndex:
     case Datatype::TextRecordIndex:
     case Datatype::WordVocabIndex:
     case Datatype::Date:
@@ -341,6 +349,7 @@ OptIri DatatypeValueGetter::operator()(ValueId id,
       return Iri::fromIrirefWithoutBrackets(dateType);
     }
     case EncodedVal:
+    case ViewVocabIndex:
     case LocalVocabIndex:
     case VocabIndex:
       return (*this)(ql::exportIds::getLiteralOrIriFromVocabIndex(
@@ -430,6 +439,7 @@ std::optional<ad_utility::GeoPointOrWkt> GeoPointOrWktValueGetter::operator()(
   switch (id.getDatatype()) {
     case GeoPoint:
       return id.getGeoPoint();
+    case ViewVocabIndex:
     case VocabIndex:
     case LocalVocabIndex: {
       auto lit = ql::exportIds::getLiteralOrIriFromVocabIndex(
@@ -470,6 +480,7 @@ CPP_template(typename T, typename ValueGetter)(
   using enum Datatype;
   switch (id.getDatatype()) {
     case LocalVocabIndex:
+    case ViewVocabIndex:
     case EncodedVal:
     case VocabIndex:
       return valueGetter(
@@ -515,6 +526,7 @@ std::optional<std::string> LanguageTagValueGetter::operator()(
       return {""};
     case Undefined:
     case EncodedVal:
+    case ViewVocabIndex:
     case VocabIndex:
     case LocalVocabIndex:
     case TextRecordIndex:
@@ -581,6 +593,7 @@ CPP_template_out_def(typename RequestedInfo)(
   using enum Datatype;
   switch (id.getDatatype()) {
     case EncodedVal:
+    case ViewVocabIndex:
     case LocalVocabIndex:
     case VocabIndex: {
       auto precomputed = getPrecomputedGeometryInfo(id, context);

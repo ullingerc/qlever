@@ -212,6 +212,13 @@ TEST(Vocabulary, SplitVocabularyCustomWithTwoVocabs) {
   ASSERT_FALSE(sv.getGeoInfo(1ULL << 59).has_value());
   ASSERT_FALSE(sv.getGeoInfo((1ULL << 59) | 1).has_value());
 
+  // Cumulative index: vocab 0 has 2 words, so indices in vocab 1 are offset
+  // by 2. Words within vocab 0 keep their unmarked index.
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(0, 0)), 0);
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(1, 0)), 1);
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(0, 1)), 2);
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(1, 1)), 3);
+
   sv.close();
 }
 
@@ -274,6 +281,14 @@ TEST(Vocabulary, SplitVocabularyCustomWithThreeVocabs) {
   ASSERT_EQ(sv[2ULL << 58], "\"xyz\"^^<blabliblu>");
   ASSERT_EQ(sv[(2ULL << 58) | 1], "\"zzz\"^^<blabliblu>");
   ASSERT_EQ(sv[1ULL << 58], "\"xyz\"^^<http://example.com>");
+
+  // Cumulative index over three vocabs. Sizes: vocab0 = 3, vocab1 = 1,
+  // vocab2 = 2. Indices in later vocabs are offset by the sizes of all
+  // preceding vocabs.
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(2, 0)), 2);
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(0, 1)), 3);
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(0, 2)), 4);
+  ASSERT_EQ(sv.getCumulativeIndex(sv.addMarker(1, 2)), 5);
 }
 
 // _____________________________________________________________________________

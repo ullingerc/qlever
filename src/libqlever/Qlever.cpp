@@ -62,6 +62,7 @@ Qlever::Qlever(const EngineConfig& config)
   }
 
   materializedViewsManager.setOnDiskBase(config.baseName_);
+  materializedViewsManager.setIndex(index);
 
   // Estimate the cost of sorting operations (needed for query planning).
   sortPerformanceEstimator_.computeEstimatesExpensively(

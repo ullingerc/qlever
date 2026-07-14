@@ -498,6 +498,65 @@ TEST_F(MaterializedViewsTest, InvalidInputToWriter) {
 }
 
 // _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, LocalVocabViewWriter) {
+  MaterializedViewsManager manager{testIndexBase_};
+  // A query whose result is fully materialized (forced via `ORDER BY`) and
+  // contains a local-vocabulary entry (from `BIND`). This exercises the writer
+  // path that builds a dedicated view vocabulary and assigns the view an ID.
+  manager.writeViewToDisk(
+      "localVocabView",
+      qlv().parseAndPlanQuery(
+          "SELECT ?s ?g { ?s ?p ?o . BIND(\"someLocalVocabString\" AS ?g) } "
+          "ORDER BY ?g"));
+  auto view = manager.getView("localVocabView");
+  // The view was assigned a fixed ID (only views with a dedicated vocabulary
+  // get one) and at least one vocabulary file was written to disk.
+  EXPECT_TRUE(view->id().has_value());
+  const std::string vocabPrefix =
+      absl::StrCat(testIndexBase_, ".view.localVocabView.vocabulary");
+  bool vocabFileExists = false;
+  for (const auto& entry : std::filesystem::directory_iterator{
+           std::filesystem::path{testIndexBase_}.parent_path().empty()
+               ? std::filesystem::path{"."}
+               : std::filesystem::path{testIndexBase_}.parent_path()}) {
+    if (ql::starts_with(
+            entry.path().filename().string(),
+            std::filesystem::path{vocabPrefix}.filename().string())) {
+      vocabFileExists = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(vocabFileExists);
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, LocalVocabViewRoundTrip) {
+  // Write a view whose (materialized, via `ORDER BY`) result contains a
+  // local-vocabulary word, then read that column back and check that the string
+  // round-trips through the dedicated view vocabulary (write side: step that
+  // builds the vocabulary; read side: resolution via the registered hooks).
+  qlv().writeMaterializedView(
+      "lvView",
+      "SELECT ?s ?g { ?s ?p ?o . BIND(\"someLocalVocabString\" AS ?g) } "
+      "ORDER BY ?g");
+  auto res = qlv().query(
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> "
+      "SELECT ?g { ?s view:lvView-g ?g } LIMIT 1",
+      ad_utility::MediaType::tsv);
+  EXPECT_THAT(res, ::testing::HasSubstr("someLocalVocabString"));
+
+  // Ordering a mix of a view-vocabulary word and a main-vocabulary word also
+  // works (exercises the comparison hooks): the local word sorts after the IRIs
+  // from the index (which start with '<').
+  auto ordered = qlv().query(
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> "
+      "SELECT ?g { { ?s view:lvView-g ?g } UNION { BIND(<a> AS ?g) } } "
+      "ORDER BY ?g LIMIT 2",
+      ad_utility::MediaType::tsv);
+  EXPECT_THAT(ordered, ::testing::HasSubstr("someLocalVocabString"));
+}
+
+// _____________________________________________________________________________
 TEST_F(MaterializedViewsTest, ManualConfigurations) {
   MaterializedViewsManager manager{testIndexBase_};
   auto plan = qlv().parseAndPlanQuery(simpleWriteQuery_);

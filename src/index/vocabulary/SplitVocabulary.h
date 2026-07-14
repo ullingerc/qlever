@@ -177,6 +177,21 @@ class SplitVocabulary {
     return total;
   }
 
+  // Map a marked index onto `[0, size())`: the sum of the sizes of all
+  // underlying vocabularies before the marker's, plus the unmarked index
+  // within it (as if all underlying vocabularies were concatenated in marker
+  // order).
+  [[nodiscard]] uint64_t getCumulativeIndex(uint64_t indexWithMarker) const {
+    auto marker = getMarker(indexWithMarker);
+    uint64_t cumulative = getVocabIndex(indexWithMarker);
+    for (uint8_t i = 0; i < marker; ++i) {
+      cumulative += std::visit(
+          [](const auto& v) { return static_cast<uint64_t>(v.size()); },
+          underlying_[i]);
+    }
+    return cumulative;
+  }
+
   // Perform a search for upper or lower bound on the underlying vocabulary
   // given by the marker parameter. By default this is the "main" vocabulary
   // (first).

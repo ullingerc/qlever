@@ -123,6 +123,18 @@ class Vocabulary {
   //! Get the number of words in the vocabulary.
   [[nodiscard]] size_t size() const { return vocabulary_.size(); }
 
+  // Map a (possibly marker-carrying) `IndexType` value onto the range
+  // `[0, size())` in storage order (see
+  // `PolymorphicVocabulary::getCumulativeIndex`). Templated so that it is only
+  // instantiated when actually called: it is only available for underlying
+  // vocabularies that support it (e.g. the `PolymorphicVocabulary` used by the
+  // main index, but not the text vocabulary).
+  template <typename = void>
+  [[nodiscard]] uint64_t getCumulativeIndex(uint64_t indexWithMarker) const {
+    return vocabulary_.getUnderlyingVocabulary().getCumulativeIndex(
+        indexWithMarker);
+  }
+
   // Get an Id from the vocabulary for some full word (not prefix of a word).
   // Return a boolean value that signals if the word was found. If the word was
   // not found, the lower bound for the word is stored in idx, otherwise the

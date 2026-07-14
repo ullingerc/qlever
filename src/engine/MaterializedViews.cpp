@@ -26,6 +26,12 @@
 #include "engine/idTable/CompressedExternalIdTable.h"
 #include "index/DeltaTriples.h"
 #include "index/ExternalSortFunctors.h"
+#include "index/IdTableUtils.h"
+#include "index/Index.h"
+#include "index/IndexImpl.h"
+#include "index/LocalVocabEntry.h"
+#include "index/Vocabulary.h"
+#include "index/vocabulary/VocabularyType.h"
 #include "libqlever/Qlever.h"
 #include "parser/MaterializedViewQuery.h"
 #include "parser/ParsedQuery.h"
@@ -42,8 +48,7 @@
 MaterializedViewWriter::MaterializedViewWriter(
     std::string onDiskBase, std::string name,
     const qlever::PlannedQuery& plannedQuery,
-    const MaterializedViewsManager* manager,
-    ad_utility::MemorySize memoryLimit,
+    const MaterializedViewsManager* manager, ad_utility::MemorySize memoryLimit,
     ad_utility::AllocatorWithLimit<Id> allocator)
     : onDiskBase_{std::move(onDiskBase)},
       name_{std::move(name)},
@@ -173,6 +178,19 @@ std::string MaterializedViewWriter::getFilenameBase() const {
 }
 
 // _____________________________________________________________________________
+ad_utility::VocabularyType MaterializedView::viewVocabularyType() {
+  return ad_utility::VocabularyType{
+      ad_utility::VocabularyType::Enum::OnDiskCompressed};
+}
+
+// _____________________________________________________________________________
+std::string MaterializedView::resolveViewVocabString(
+    uint64_t indexInVocab) const {
+  AD_CONTRACT_CHECK(viewVocab_.has_value());
+  return std::string{viewVocab_.value()[VocabIndex::make(indexInVocab)]};
+}
+
+// _____________________________________________________________________________
 MaterializedViewWriter::ColumnNamesAndPermutation
 MaterializedViewWriter::getIdTableColumnNamesAndPermutation() const {
   AD_CONTRACT_CHECK(
@@ -208,8 +226,7 @@ MaterializedViewWriter::getIdTableColumnNamesAndPermutation() const {
 }
 
 // _____________________________________________________________________________
-void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
-    IdTable& block) const {
+void MaterializedViewWriter::permuteIdTable(IdTable& block) const {
   // The `IdTable` may have a different column ordering from the
   // `SELECT` statement, thus we must permute this to the column
   // ordering we want to have in our materialized view. In
@@ -226,10 +243,18 @@ void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
       block.at(row, col) = ValueId::makeUndefined();
     }
   }
+}
+
+// _____________________________________________________________________________
+void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
+    IdTable& block) const {
+  permuteIdTable(block);
 
   // Check that there are no values of type `LocalVocabIndex` in the selected
-  // columns of the `IdTable` as materialized views do not support them as of
-  // now.
+  // columns of the `IdTable`. This is only reached on the streaming (lazy
+  // result) path, which cannot build a per-view vocabulary; a
+  // fully-materialized result with local-vocabulary entries is instead handled
+  // by `getBlocksWithViewVocabulary`.
   bool hasLocalVocab =
       ql::ranges::any_of(block.getColumns(), [](const auto& col) {
         return ql::ranges::any_of(col, [](ValueId id) {
@@ -239,10 +264,11 @@ void MaterializedViewWriter::permuteIdTableAndCheckNoLocalVocabEntries(
   if (hasLocalVocab) {
     throw std::runtime_error{
         "The query to write a materialized view returned a string not "
-        "contained in the index (local vocabulary entry). This could be "
-        "the result of a string-related function in your query or the "
-        "presence of SPARQL UPDATEs in this instance of Qlever. Both are "
-        "currently not supported in materialized views."};
+        "contained in the index (local vocabulary entry) in a streaming "
+        "result. This could be the result of a string-related function in "
+        "your query or the presence of SPARQL UPDATEs in this instance of "
+        "Qlever. Materialized views can store such local-vocabulary entries, "
+        "but only when the query result is fully materialized (not streamed)."};
   }
 }
 
@@ -398,6 +424,121 @@ void MaterializedViewWriter::writeViewMetadata() const {
 }
 
 // _____________________________________________________________________________
+MaterializedViewWriter::RangeOfIdTables
+MaterializedViewWriter::getBlocksWithViewVocabulary(
+    std::shared_ptr<const Result> result) {
+  AD_LOG_INFO << "Query result for materialized view \"" << name_
+              << "\" contains local-vocabulary entries; building a dedicated "
+                 "view vocabulary"
+              << std::endl;
+  IdTable table = result->cloneIdTable();
+  permuteIdTable(table);
+
+  // Sort by the leading columns (which the SPO permutation is keyed on, see
+  // `writePermutation`) using the full, local-vocabulary-aware comparison.
+  std::vector<ColumnIndex> sortColumns;
+  for (ColumnIndex i = 0;
+       i < std::min<size_t>(ADDITIONAL_COLUMN_GRAPH_ID + 1, numCols()); ++i) {
+    sortColumns.push_back(i);
+  }
+  IdTableUtils::sort(table, sortColumns);
+
+  buildViewVocabularyAndReplace(table);
+
+  std::vector<IdTableStatic<0>> singleIdTable;
+  singleIdTable.push_back(std::move(table));
+  return RangeOfIdTables{std::move(singleIdTable)};
+}
+
+// _____________________________________________________________________________
+void MaterializedViewWriter::buildViewVocabularyAndReplace(IdTable& table) {
+  const auto& mainVocab = qec_->getIndex().getImpl().getVocab();
+
+  // First pass: classify each distinct local-vocabulary entry. An entry whose
+  // word is already representable as a main-index `Id` (a `VocabIndex` for a
+  // word in the main vocabulary, or an `EncodedVal` for an encodable IRI) is
+  // mapped to that `Id` directly; all others need an entry in the view's
+  // dedicated vocabulary. `positionInVocab` already performs this distinction:
+  // it returns a half-open range `[lower, upper)` that is non-empty iff the
+  // word is representable in the main index.
+  ad_utility::HashMap<const LocalVocabEntry*, Id> replacement;
+  ad_utility::HashSet<const LocalVocabEntry*> seen;
+  // New words, with the (marker-carrying) main-vocabulary position they would
+  // occupy, used for the sorting helper below.
+  std::vector<std::pair<const LocalVocabEntry*, uint64_t>> newEntries;
+  for (size_t col = 0; col < table.numColumns(); ++col) {
+    for (size_t row = 0; row < table.numRows(); ++row) {
+      Id id = table.at(row, col);
+      if (id.getDatatype() != Datatype::LocalVocabIndex) {
+        continue;
+      }
+      const LocalVocabEntry* entry = id.getLocalVocabIndex();
+      if (!seen.insert(entry).second) {
+        continue;
+      }
+      auto pos = entry->positionInVocab();
+      Id lower = Id::fromBits(pos.lowerBound_.get());
+      Id upper = Id::fromBits(pos.upperBound_.get());
+      if (lower != upper) {
+        replacement.emplace(entry, lower);
+      } else {
+        newEntries.emplace_back(entry, lower.getVocabIndex().get());
+      }
+    }
+  }
+
+  // Second pass: if there are new words, build the view's dedicated vocabulary
+  // (which requires the view to have a fixed ID) and map each new word to a
+  // `ViewVocabIndex`.
+  if (!newEntries.empty()) {
+    viewId_ = manager_->assignId(name_);
+
+    ad_utility::HashSet<std::string> newWords;
+    for (const auto& [entry, pos] : newEntries) {
+      newWords.insert(entry->toStringRepresentation());
+    }
+    RdfsVocabulary viewVocab;
+    viewVocab.resetToType(MaterializedView::viewVocabularyType());
+    viewVocab.createFromSet(
+        newWords, absl::StrCat(getFilenameBase(),
+                               MaterializedView::viewVocabularySuffix_));
+
+    const uint64_t mainVocabSize = mainVocab.size();
+    for (const auto& [entry, mainVocabPos] : newEntries) {
+      VocabIndex viewVocabIndex;
+      bool found =
+          viewVocab.getId(entry->toStringRepresentation(), &viewVocabIndex);
+      AD_CORRECTNESS_CHECK(found);
+      // The sorting helper is the part (out of `numViewSortHelperParts`) of the
+      // main vocabulary in which the word would be located.
+      uint64_t cumulative = mainVocab.getCumulativeIndex(mainVocabPos);
+      uint64_t sortHelper =
+          mainVocabSize == 0
+              ? 0
+              : std::min<uint64_t>(cumulative *
+                                       ValueId::numViewSortHelperParts /
+                                       mainVocabSize,
+                                   ValueId::numViewSortHelperParts - 1);
+      replacement.emplace(
+          entry, ValueId::makeFromViewVocabIndex(viewId_.value(), sortHelper,
+                                                 viewVocabIndex.get()));
+    }
+  }
+
+  // Third pass: replace all local-vocabulary ids in place. Each replacement id
+  // sorts at the same position as the entry it replaces, so the table stays
+  // sorted.
+  for (size_t col = 0; col < table.numColumns(); ++col) {
+    for (size_t row = 0; row < table.numRows(); ++row) {
+      Id id = table.at(row, col);
+      if (id.getDatatype() == Datatype::LocalVocabIndex) {
+        table.at(row, col) = replacement.at(id.getLocalVocabIndex());
+      }
+    }
+  }
+}
+
+// _____________________________________________________________________________
 void MaterializedViewWriter::computeResultAndWritePermutation() {
   // Run query and sort the result externally (only if necessary).
   AD_LOG_INFO << "Computing query result for materialized view \"" << name_
@@ -405,24 +546,28 @@ void MaterializedViewWriter::computeResultAndWritePermutation() {
               << std::endl;
   auto result = qet_->getResult(true);
 
+  // A fully-materialized result that contains local-vocabulary entries is
+  // handled by a dedicated in-memory path that builds a per-view vocabulary
+  // (the external sorter cannot carry `LocalVocabIndex` values, which are
+  // pointers). All other results use the streaming path with the external
+  // sorter (which throws if a streamed result contains local-vocabulary
+  // entries). The sorter is only used by the latter, but is kept in this scope
+  // so that it outlives the range it produces.
   Sorter spoSorter{getFilenameBase() + ".spo-sorter.dat", numCols(),
                    memoryLimit_, allocator_};
-  RangeOfIdTables sortedBlocksSPO = getSortedBlocks(spoSorter, result);
+  RangeOfIdTables sortedBlocksSPO =
+      result->isFullyMaterialized() && !result->localVocab().empty()
+          ? getBlocksWithViewVocabulary(result)
+          : getSortedBlocks(spoSorter, result);
 
   // Write compressed relation to disk.
   AD_LOG_INFO << "Writing materialized view \"" << name_ << "\" to disk ..."
               << std::endl;
   auto spoMetaData = writePermutation(std::move(sortedBlocksSPO));
 
-  // Only now, after having written and thereby inspected the full query
-  // result, do we know whether this view needs a fixed ID (e.g. once
-  // materialized views support storing local-vocabulary entries, in a
-  // follow-up PR, this will be the case iff any occurred in the result). No
-  // such case exists yet, so no view currently needs one.
-  constexpr bool needsId = false;
-  if (needsId) {
-    viewId_ = manager_->assignId(name_);
-  }
+  // The view ID (if any) was assigned by `buildViewVocabularyAndReplace` while
+  // building the dedicated view vocabulary. Persist the metadata (including the
+  // ID, if set) now.
   writeViewMetadata();
 
   AD_LOG_INFO << "Statistics for view \"" << name_
@@ -486,6 +631,16 @@ MaterializedView::MaterializedView(std::string onDiskBase, std::string name)
           MATERIALIZED_VIEW_MAX_ID, ".")};
     }
     viewId_ = id;
+
+    // A view has a fixed ID iff it has a dedicated vocabulary (see
+    // `MaterializedViewWriter::buildViewVocabularyAndReplace`, which is the
+    // only place that assigns an ID). So a view with an ID always has
+    // vocabulary files on disk, written by `MaterializedViewWriter`; load them.
+    auto vocabFilename =
+        absl::StrCat(filename, MaterializedView::viewVocabularySuffix_);
+    viewVocab_.emplace();
+    viewVocab_->resetToType(MaterializedView::viewVocabularyType());
+    viewVocab_->readFromFile(vocabFilename);
   }
 
   // Make variable to column map.
@@ -564,6 +719,14 @@ void MaterializedViewsManager::loadView(const std::string& name) const {
   auto view = std::make_shared<MaterializedView>(onDiskBase_, name);
   view->connectPermutationBackReference();
   lock->views_.insert({name, view});
+  // If the view has a dedicated vocabulary, index it by its ID (so that a
+  // `ViewVocabIndex` can be resolved) and register this manager as the
+  // process-wide comparison/resolution hooks for `ViewVocabIndex` values.
+  if (view->hasVocabulary()) {
+    AD_CORRECTNESS_CHECK(view->id().has_value());
+    lock->viewsById_.insert_or_assign(view->id().value(), view);
+    setViewVocabComparisonHooks(this);
+  }
   // If we would analyze the view at the time of writing and (de)serialize an
   // analysis result here, we could not extend query analysis without rewriting
   // all views. Therefore query analysis is performed when loading views.
@@ -580,7 +743,11 @@ void MaterializedViewsManager::unloadViewIfLoaded(
   if (!lock->views_.contains(name)) {
     return;
   }
-  lock->queryPatternCache_.removeView(lock->views_.at(name));
+  const auto& view = lock->views_.at(name);
+  lock->queryPatternCache_.removeView(view);
+  if (view->id().has_value()) {
+    lock->viewsById_.erase(view->id().value());
+  }
   lock->views_.erase(name);
 }
 
@@ -754,6 +921,83 @@ void MaterializedViewsManager::setOnDiskBase(const std::string& onDiskBase) {
       onDiskBase_ == "" && loadedViews_.rlock()->views_.empty(),
       "Changing the on disk basename is not allowed.");
   onDiskBase_ = onDiskBase;
+}
+
+// _____________________________________________________________________________
+MaterializedViewsManager::~MaterializedViewsManager() {
+  // Clear the process-wide hooks, but (atomically) only if they still point to
+  // this instance, so we do not clobber another manager that registered itself
+  // in the meantime.
+  clearViewVocabComparisonHooksIfCurrent(this);
+}
+
+// _____________________________________________________________________________
+void MaterializedViewsManager::setIndex(const Index& index) {
+  index_ = &index.getImpl();
+}
+
+// _____________________________________________________________________________
+std::string MaterializedViewsManager::viewVocabString(
+    ValueId viewVocabIndexId) const {
+  auto viewId = viewVocabIndexId.getViewVocabId();
+  auto lock = loadedViews_.rlock();
+  auto it = lock->viewsById_.find(viewId);
+  AD_CONTRACT_CHECK(it != lock->viewsById_.end(),
+                    "Tried to resolve a `ViewVocabIndex` of a materialized "
+                    "view that is not loaded.");
+  return it->second->resolveViewVocabString(
+      viewVocabIndexId.getViewVocabIndexInVocab());
+}
+
+// _____________________________________________________________________________
+uint64_t MaterializedViewsManager::mainVocabBucket(ValueId mainVocabId) const {
+  // NOTE: The sort helper stored in a `ViewVocabIndex` (computed by the writer)
+  // and this bucket must be computed against the same main vocabulary: two
+  // differing buckets decide the order without a string comparison, so a stale
+  // bucket (from a changed main vocabulary) could misorder. This is safe
+  // because a materialized view is tied to the index generation it was written
+  // against - its stored `VocabIndex` values would likewise be invalid if the
+  // main vocabulary changed, so a view is never read against a different one.
+  AD_CORRECTNESS_CHECK(index_ != nullptr);
+  const auto& vocab = index_->getVocab();
+  uint64_t size = vocab.size();
+  if (size == 0) {
+    return 0;
+  }
+  uint64_t cumulative =
+      vocab.getCumulativeIndex(mainVocabId.getVocabIndex().get());
+  return std::min<uint64_t>(cumulative * ValueId::numViewSortHelperParts / size,
+                            ValueId::numViewSortHelperParts - 1);
+}
+
+// _____________________________________________________________________________
+ql::strong_ordering MaterializedViewsManager::compareByString(ValueId a,
+                                                              ValueId b) const {
+  AD_CORRECTNESS_CHECK(index_ != nullptr);
+  // Resolve any of the relevant datatypes to its string value.
+  auto stringOf = [this](ValueId id) -> std::string {
+    switch (id.getDatatype()) {
+      case Datatype::ViewVocabIndex:
+        return viewVocabString(id);
+      case Datatype::VocabIndex:
+        return std::string{index_->getVocab()[id.getVocabIndex()]};
+      case Datatype::LocalVocabIndex:
+        return id.getLocalVocabIndex()->toStringRepresentation();
+      case Datatype::EncodedVal:
+        return index_->encodedIriManager().toString(id);
+      default:
+        AD_FAIL();
+    }
+  };
+  int cmp = index_->getVocab().getCaseComparator().compare(
+      stringOf(a), stringOf(b), LocaleManager::Level::TOTAL);
+  if (cmp < 0) {
+    return ql::strong_ordering::less;
+  }
+  if (cmp > 0) {
+    return ql::strong_ordering::greater;
+  }
+  return ql::strong_ordering::equal;
 }
 
 // _____________________________________________________________________________
