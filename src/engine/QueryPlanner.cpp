@@ -2257,21 +2257,25 @@ std::vector<SubtreePlan> QueryPlanner::createJoinCandidates(
     return candidates;
   }
 
-  // If both sides are spatial joins that are still missing children, return
-  // immediately to prevent a regular join on the variables, which would lead to
-  // the spatial join never having children.
-  if (checkSpatialJoin(a, b) == std::pair<bool, bool>{true, true}) {
-    return candidates;
-  }
-
   // if one of the inputs is the spatial join and the other input is compatible
   // with the SpatialJoin, add it as a child to the spatialJoin. As unbound
   // SpatialJoin operations are incompatible with normal join operations, we
   // return immediately instead of creating a normal join below as well.
   // Note, that this if statement should be evaluated first, such that no other
   // join options get considered, when one of the candidates is a SpatialJoin.
-  if (auto opt = createSpatialJoin(a, b, jcs)) {
-    candidates.push_back(std::move(opt.value()));
+  //
+  // This has to happen unconditionally (not just when `createSpatialJoin`
+  // actually succeeds) whenever either side still is an incomplete
+  // `SpatialJoin`: falling through to a regular `Join`/`MultiColumnJoin`
+  // below would use that unconstructed operation as a normal operand, which
+  // either leaves it permanently unconstructed or lets it silently swallow a
+  // child that violates its invariants, either way corrupting the plan.
+  auto [aIsIncompleteSpatialJoin, bIsIncompleteSpatialJoin] =
+      checkSpatialJoin(a, b);
+  if (aIsIncompleteSpatialJoin || bIsIncompleteSpatialJoin) {
+    if (auto opt = createSpatialJoin(a, b, jcs)) {
+      candidates.push_back(std::move(opt.value()));
+    }
     return candidates;
   }
 
@@ -2392,6 +2396,19 @@ auto QueryPlanner::createSpatialJoin(const SubtreePlan& a, const SubtreePlan& b,
   ColumnIndex ind = aIs ? jcs[0][1] : jcs[0][0];
   const Variable& var =
       otherSubtreePlan._qet->getVariableAndInfoByColumnIndex(ind).first;
+
+  // The side of the `SpatialJoin` that is not bound by `var` must remain free
+  // for the other child. If `otherSubtreePlan` already contains that
+  // variable too (e.g. because it results from a join that coincidentally
+  // combines both sides of the spatial relation), adding it as a child here
+  // would create an invalid `SpatialJoin` whose two children both define the
+  // same variable, which is caught only much later (and much less clearly)
+  // when its result is actually accessed. Reject the candidate instead.
+  auto [leftVar, rightVar] = spatialJoin->getSpatialJoinVariables();
+  const Variable& otherVar = var == leftVar ? rightVar : leftVar;
+  if (otherSubtreePlan._qet->isVariableCovered(otherVar)) {
+    return std::nullopt;
+  }
 
   auto newSpatialJoin = spatialJoin->addChild(otherSubtreePlan._qet, var);
 

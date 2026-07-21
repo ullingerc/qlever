@@ -1532,6 +1532,53 @@ TEST(QueryPlanner, SpatialJoinFromGeofRelationFilter) {
 }
 
 // _____________________________________________________________________________
+// Regression test related to https://github.com/ad-freiburg/qlever/issues/3105
+// ("InlinedVector::at(size_type) failed bounds check"), which is caused by a
+// geo relation filter (substituted by the planner with a `SpatialJoin`)
+// interacting badly with an `OPTIONAL` and a transitive property path that
+// join the filter's two variables together via a third variable. This is a
+// minimal reproduction of the same underlying planner defect: the two
+// variables of the geo filter (`?y` and `?b`) also end up joined via `?a`,
+// and `?b` is additionally joined with `?z`. Before the fix, the planner
+// could either (a) silently fall through to a `MultiColumnJoin`/`Join` using
+// the still-childless substitute `SpatialJoin` as a normal operand, or (b)
+// bind a child to the `SpatialJoin` that itself already contains the other
+// side's variable. Both produce a structurally invalid `SpatialJoin` whose
+// declared columns don't match its actual (or nonexistent) result, which
+// previously only surfaced as an internal assertion failure (or, per the
+// issue, an out-of-bounds column access) once the plan was executed.
+//
+// Note: For this ambiguous query shape, the query planner may legitimately
+// (and non-deterministically, depending on cost-estimate tie-breaking) also
+// choose a plan that never substitutes the filter with a `SpatialJoin` at
+// all, in which case evaluating `geof:sfWithin` as a regular FILTER always
+// fails with an unrelated, pre-existing "not implemented" error. We only
+// assert that the specific corruption from this defect does not occur.
+TEST(QueryPlanner, SpatialJoinFromGeofRelationFilterWithConflictingJoin) {
+  auto qec = ad_utility::testing::getQec(
+      "PREFIX geo: <http://www.opengis.net/ont/geosparql#> "
+      "<a1> <p1> \"POINT(0.5 0.5)\"^^geo:wktLiteral . "
+      "<a1> <p2> \"POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))\"^^geo:wktLiteral . "
+      "<z1> <p3> \"POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))\"^^geo:wktLiteral .");
+  std::string query =
+      "PREFIX geo: <http://www.opengis.net/ont/geosparql#> "
+      "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+      "SELECT * WHERE {"
+      "?a <p1> ?y . "
+      "?a <p2> ?b . "
+      "?z <p3> ?b . "
+      "FILTER(geof:sfWithin(?y, ?b)) }";
+  auto qet = h::parseAndPlan(query, qec);
+  try {
+    qet.getResult();
+  } catch (const std::exception& e) {
+    EXPECT_THAT(e.what(), ::testing::Not(::testing::AnyOf(
+                              ::testing::HasSubstr("must not be defined in"),
+                              ::testing::HasSubstr("needs two children"))));
+  }
+}
+
+// _____________________________________________________________________________
 TEST(QueryPlanner, SpatialJoinLegacyPredicateSupport) {
   auto scan = h::IndexScanFromStrings;
   using V = Variable;
