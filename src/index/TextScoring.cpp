@@ -34,7 +34,8 @@ static void logWordNotFound(const std::string& word,
 void ScoreData::calculateScoreData(const std::string& docsFileName,
                                    bool addWordsFromLiterals,
                                    const Index::TextVocab& textVocab,
-                                   const Index::Vocab& vocab) {
+                                   const Index::Vocab& vocab,
+                                   TextRecordIndex firstLiteralContextId) {
   // Skip calculation if scoring mode is set to count
   if (scoringMetric_ == TextScoringMetric::EXPLICIT) {
     return;
@@ -65,19 +66,29 @@ void ScoreData::calculateScoreData(const std::string& docsFileName,
         << wordsNotFoundFromDocuments << std::endl;
   }
   size_t wordsNotFoundFromLiterals = 0;
+  // Literals get their own dedicated context/document ids, starting at
+  // `firstLiteralContextId`. This must be the exact same starting point that
+  // `TextIndexBuilder::getFirstLiteralContextId` computes for these very same
+  // literals (continuing right after the wordsfile's own contexts, or 0 if
+  // there is none), and we must use it the same way (use the current id for a
+  // literal, then increment for the next one). Otherwise, a literal's score
+  // ends up filed under the wrong document below: continuing from wherever
+  // the docsfile round above happened to leave `docId` is only correct by
+  // coincidence, e.g. when the docsfile's last id happens to equal the
+  // wordsfile's last context id.
+  docId = DocumentIndex::make(firstLiteralContextId.get());
   for (VocabIndex index = VocabIndex::make(0); index.get() < vocab.size();
        index = index.incremented()) {
     auto text = vocab[index];
     if (!vocab.isLiteral(index)) {
       continue;
     }
-    // Reset parameters for loop
-    docId = docId.incremented();
     std::string_view textView = text;
 
     // Parse words in literal
     addDocumentOrLiteralToScoreDataInvertedIndex(textView, docId, textVocab,
                                                  wordsNotFoundFromLiterals);
+    docId = docId.incremented();
   }
   AD_CORRECTNESS_CHECK(wordsNotFoundFromLiterals == 0, "There were",
                        wordsNotFoundFromLiterals,

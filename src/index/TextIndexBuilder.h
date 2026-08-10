@@ -35,19 +35,34 @@ class TextIndexBuilder : public IndexImpl {
 
  private:
   size_t processWordsForVocabulary(const std::string& contextFile,
-                                   bool addWordsFromLiterals);
+                                   bool addWordsFromLiterals,
+                                   TextRecordIndex firstLiteralContextId);
 
   void processWordsForInvertedLists(const std::string& contextFile,
-                                    bool addWordsFromLiterals, TextVec& vec);
+                                    bool addWordsFromLiterals, TextVec& vec,
+                                    TextRecordIndex firstLiteralContextId);
 
   // Generator that returns all words in the given context file (if not empty)
-  // and then all words in all literals (if second argument is true).
+  // and then all words in all literals (if second argument is true). Literals
+  // are assigned context ids starting at `firstLiteralContextId` (see
+  // `getFirstLiteralContextId`).
   //
   // TODO: So far, this is limited to the internal vocabulary (still in the
   // testing phase, once it works, it should be easy to include the IRIs and
   // literals from the external vocabulary as well).
   cppcoro::generator<WordsFileLine> wordsInTextRecords(
-      std::string contextFile, bool addWordsFromLiterals) const;
+      std::string contextFile, bool addWordsFromLiterals,
+      TextRecordIndex firstLiteralContextId) const;
+
+  // Determine the context id to be assigned to the first literal (if any)
+  // considered as a text record: continuing right after the last context id
+  // used by the given wordsfile (`contextFile`), or 0 if `contextFile` is
+  // empty. `ScoreData::calculateScoreData` needs this same value (passed in
+  // separately, since it does not have access to `wordsInTextRecords`) to
+  // assign matching context/document ids to the very same literals; see the
+  // comment in `TextScoring.cpp` for what goes wrong otherwise.
+  TextRecordIndex getFirstLiteralContextId(
+      const std::string& contextFile) const;
 
   void processEntityCaseDuringInvertedListProcessing(
       const WordsFileLine& line,

@@ -60,28 +60,57 @@ void TextIndexBuilder::buildTextIndexFile(
   scoreData_ = {vocab_.getLocaleManager(), textScoringMetric_,
                 bAndKParamForTextScoring_};
 
+  // Determine the context/document id to assign to the first literal (if
+  // any). `wordsInTextRecords` and `ScoreData::calculateScoreData` both
+  // assign one context/document id per literal and must agree on this
+  // starting point, or they end up assigning mismatched ids to the very same
+  // literals (see `getFirstLiteralContextId` and the comment in
+  // `TextScoring.cpp` for details).
+  TextRecordIndex firstLiteralContextId =
+      addWordsFromLiterals ? getFirstLiteralContextId(wordsFile)
+                           : TextRecordIndex::make(0);
+
   // Build the text vocabulary (first scan over the text records).
-  processWordsForVocabulary(wordsFile, addWordsFromLiterals);
+  processWordsForVocabulary(wordsFile, addWordsFromLiterals,
+                            firstLiteralContextId);
   // Calculate the score data for the words
   scoreData_.calculateScoreData(docsFile, addWordsFromLiterals, textVocab_,
-                                vocab_);
+                                vocab_, firstLiteralContextId);
   // Build the half-inverted lists (second scan over the text records).
   AD_LOG_INFO << "Building the half-inverted index lists ..." << std::endl;
   calculateBlockBoundaries();
   TextVec vec{indexFilename + ".text-vec-sorter.tmp",
               memoryLimitIndexBuilding() / 3, allocator_};
-  processWordsForInvertedLists(wordsFile, addWordsFromLiterals, vec);
+  processWordsForInvertedLists(wordsFile, addWordsFromLiterals, vec,
+                               firstLiteralContextId);
   createTextIndex(indexFilename, vec);
   openTextFileHandle();
 }
 
 // _____________________________________________________________________________
+TextRecordIndex TextIndexBuilder::getFirstLiteralContextId(
+    const std::string& contextFile) const {
+  TextRecordIndex contextId = TextRecordIndex::make(0);
+  if (!contextFile.empty()) {
+    WordsFileParser p(contextFile, textVocab_.getLocaleManager());
+    for (auto& line : p) {
+      contextId = line.contextId_;
+    }
+    if (contextId > TextRecordIndex::make(0)) {
+      contextId = contextId.incremented();
+    }
+  }
+  return contextId;
+}
+
+// _____________________________________________________________________________
 size_t TextIndexBuilder::processWordsForVocabulary(
-    const std::string& contextFile, bool addWordsFromLiterals) {
+    const std::string& contextFile, bool addWordsFromLiterals,
+    TextRecordIndex firstLiteralContextId) {
   size_t numLines = 0;
   ad_utility::HashSet<std::string> distinctWords;
-  for (const auto& line :
-       wordsInTextRecords(contextFile, addWordsFromLiterals)) {
+  for (const auto& line : wordsInTextRecords(contextFile, addWordsFromLiterals,
+                                             firstLiteralContextId)) {
     ++numLines;
     if (!line.isEntity_) {
       distinctWords.insert(line.word_);
@@ -94,7 +123,8 @@ size_t TextIndexBuilder::processWordsForVocabulary(
 
 // _____________________________________________________________________________
 void TextIndexBuilder::processWordsForInvertedLists(
-    const std::string& contextFile, bool addWordsFromLiterals, TextVec& vec) {
+    const std::string& contextFile, bool addWordsFromLiterals, TextVec& vec,
+    TextRecordIndex firstLiteralContextId) {
   AD_LOG_TRACE << "BEGIN IndexImpl::passContextFileIntoVector" << std::endl;
   ad_utility::HashMap<WordIndex, Score> wordsInContext;
   ad_utility::HashMap<Id, Score> entitiesInContext;
@@ -106,8 +136,8 @@ void TextIndexBuilder::processWordsForInvertedLists(
   size_t entityNotFoundErrorMsgCount = 0;
   size_t nofLiterals = 0;
 
-  for (const auto& line :
-       wordsInTextRecords(contextFile, addWordsFromLiterals)) {
+  for (const auto& line : wordsInTextRecords(contextFile, addWordsFromLiterals,
+                                             firstLiteralContextId)) {
     if (line.contextId_ != currentContext) {
       ++nofContexts;
       addContextToVector(vec, currentContext, wordsInContext,
@@ -148,25 +178,21 @@ void TextIndexBuilder::processWordsForInvertedLists(
 
 // _____________________________________________________________________________
 cppcoro::generator<WordsFileLine> TextIndexBuilder::wordsInTextRecords(
-    std::string contextFile, bool addWordsFromLiterals) const {
+    std::string contextFile, bool addWordsFromLiterals,
+    TextRecordIndex firstLiteralContextId) const {
   auto localeManager = textVocab_.getLocaleManager();
   // ROUND 1: If context file aka wordsfile is not empty, read words from there.
-  // Remember the last context id for the (optional) second round.
-  TextRecordIndex contextId = TextRecordIndex::make(0);
   if (!contextFile.empty()) {
     WordsFileParser p(contextFile, localeManager);
-    ad_utility::HashSet<std::string> items;
     for (auto& line : p) {
-      contextId = line.contextId_;
       co_yield line;
-    }
-    if (contextId > TextRecordIndex::make(0)) {
-      contextId = contextId.incremented();
     }
   }
   // ROUND 2: Optionally, consider each literal from the internal vocabulary as
-  // a text record.
+  // a text record, starting at `firstLiteralContextId` (see
+  // `getFirstLiteralContextId`).
   if (addWordsFromLiterals) {
+    TextRecordIndex contextId = firstLiteralContextId;
     for (VocabIndex index = VocabIndex::make(0); index.get() < vocab_.size();
          index = index.incremented()) {
       auto text = vocab_[index];

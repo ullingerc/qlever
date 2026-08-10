@@ -452,6 +452,33 @@ TEST(IndexTest, emptyTextIndex) {
   }
 }
 
+// Regression test for an off-by-one between the context ids that
+// `TextIndexBuilder` assigns to literals considered as text records and the
+// document ids that `ScoreData` independently assigned to them for non
+// `EXPLICIT` scoring metrics (TF-IDF/BM25). Without a wordsfile/docsfile
+// round preceding the literals, `TextIndexBuilder` starts assigning context
+// ids at 0, but `ScoreData` always incremented its `docId` before assigning
+// it to the first literal, landing on 1 instead. This shifted the score data
+// of every literal but the first onto the wrong document, silently returning
+// a score of 0 (or another literal's score) for words that only occur in
+// literals other than the very first one (in vocabulary sort order).
+TEST(IndexTest, textIndexFromLiteralsScoringWithoutWordsfile) {
+  ad_utility::testing::TestIndexConfig config{
+      "<a> <b> \"hello world\" . <a> <b> \"foo bar baz\" ."};
+  config.createTextIndex = true;
+  config.scoringMetric = qlever::TextScoringMetric::TFIDF;
+  auto* qec = ad_utility::testing::getQec(std::move(config));
+
+  // `"foo bar baz"` sorts before `"hello world"` in the vocabulary, so it is
+  // the first literal, unaffected by the off-by-one (see comment above).
+  // `"hello world"` is the second literal, whose score was silently 0 with
+  // the bug because its document got mixed up with the first literal's.
+  IdTable helloResult =
+      qec->getIndex().getWordPostingsForTerm("hello", qec->getAllocator());
+  ASSERT_EQ(helloResult.size(), 1u);
+  EXPECT_GT(helloResult.at(0, 2).getDouble(), 0.0);
+}
+
 // Returns true iff `arg` (the first argument of `EXPECT_THAT` below) holds a
 // `PossiblyExternalizedTripleComponent` that matches `content` and the bool
 // `isExternal`.

@@ -35,11 +35,15 @@ class ScoreData {
   float getScore(WordIndex wordIndex, TextRecordIndex contextId);
 
   // Parses docsFile and if true literals to fill the InvertedIndex and the
-  // extra values needed to calculate scores
+  // extra values needed to calculate scores. `firstLiteralContextId` is the
+  // context/document id to assign to the first literal (if any); see
+  // `TextIndexBuilder::getFirstLiteralContextId` for how it must be computed
+  // and why both classes must agree on this value.
   void calculateScoreData(const std::string& docsFileName,
                           bool addWordsFromLiterals,
                           const Index::TextVocab& textVocab,
-                          const Index::Vocab& vocab);
+                          const Index::Vocab& vocab,
+                          TextRecordIndex firstLiteralContextId);
 
  private:
   TextScoringMetric scoringMetric_ = TextScoringMetric::EXPLICIT;
