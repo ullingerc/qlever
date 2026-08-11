@@ -2029,6 +2029,31 @@ TEST_F(MaterializedViewsTest, FilterNotRewritten) {
 }
 
 // _____________________________________________________________________________
+// Confirms that cache-key based rewriting, unlike pattern-based rewriting, is
+// unaffected by a trailing `VALUES` clause: it requires an exact match of the
+// whole view query (the clause included), so an unrestricted query is never
+// incorrectly served from the restricted view.
+TEST_F(MaterializedViewsTest, PostQueryValuesCacheKeyRewriteOnly) {
+  const std::string writeQuery =
+      "SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> ?p2 } "
+      "VALUES (?p1) { (\"xyz\") }";
+  qlv().writeMaterializedView("postValuesCacheView", writeQuery);
+  qlv().loadMaterializedView("postValuesCacheView");
+
+  // The exact same (restricted) query is matched via its cache key.
+  qpExpect(qlv(), writeQuery,
+           viewScan("postValuesCacheView", "?s", "?p1", "?p2"));
+
+  // The unrestricted query must not be served from the restricted view, so it
+  // still falls back to a plain join.
+  qpExpect(qlv(), "SELECT * { ?s <p1> ?p1 . ?s <p3> ?p2 }",
+           h::Join(h::IndexScanFromStrings("?s", "<p1>", "?p1"),
+                   h::IndexScanFromStrings("?s", "<p3>", "?p2")));
+
+  qlv().unloadMaterializedView("postValuesCacheView");
+}
+
+// _____________________________________________________________________________
 TEST_F(MaterializedViewsTest, GroupByOptimizations) {
   // Test that the optimizations for `GROUP BY` do not return wrong results when
   // grouping on materialized views. Regression test for #2918.
