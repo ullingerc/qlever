@@ -1977,80 +1977,79 @@ TEST_F(MaterializedViewsTest, JoinBetweenLazyScansWithPlaceholderVars) {
 }
 
 // _____________________________________________________________________________
-// Regression test: pattern-based (star) rewriting discards everything about a
-// view's query except the shape of its triples. A trailing `VALUES` clause
-// restricts the view's rows beyond that shape, so a view defined with one must
-// not be registered for star/chain rewriting: otherwise an unrestricted user
-// query would be silently answered from the restricted view, returning
-// incomplete results.
-TEST_F(MaterializedViewsTest, PostQueryValuesNotRewritten) {
-  auto plan = qlv().parseAndPlanQuery(
-      "SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> ?p2 } "
-      "VALUES (?p1) { (\"xyz\") }");
-  MaterializedViewsManager manager{testIndexBase_};
-  manager.writeViewToDisk("postValuesView", plan);
+// Regression test for the fix that rejects pattern-based (star) rewriting for
+// views whose query contains a `FILTER` or a trailing `VALUES` clause, plus
+// confirmation that cache-key based rewriting is unaffected by the same
+// construct. Merged into a single test (rather than one `TEST_F` per case) to
+// amortize the cost of building the fixture's index across all three checks.
+TEST_F(MaterializedViewsTest, FilterAndPostQueryValuesNotPatternRewritten) {
   auto qec = getQec();
-  auto view = manager.getView("postValuesView", qec.get());
   materializedViewsQueryAnalysis::QueryPatternCache qpc;
-  qpc.analyzeView(view, qec.get());
-
   auto rewritePlan =
       qlv().parseAndPlanQuery("SELECT * { ?s <p1> ?p1 . ?s <p3> ?p2 }");
   const auto& graphPattern = rewritePlan.parsedQuery()._rootGraphPattern;
   ASSERT_EQ(graphPattern._graphPatterns.size(), 1u);
-  EXPECT_TRUE(qpc.makeJoinReplacementIndexScans(
-                     qec.get(), graphPattern._graphPatterns.at(0).getBasic())
-                  .empty());
-  manager.unloadViewIfLoaded("postValuesView");
-}
+  const auto& basicPattern = graphPattern._graphPatterns.at(0).getBasic();
 
-// _____________________________________________________________________________
-// Same as above, but for a `FILTER` instead of a trailing `VALUES` clause:
-// both are discarded by pattern-based rewriting in the same way and so must be
-// rejected in the same way.
-TEST_F(MaterializedViewsTest, FilterNotRewritten) {
-  auto plan = qlv().parseAndPlanQuery(
-      "SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> ?p2 FILTER(?p1 = \"abc\") }");
-  MaterializedViewsManager manager{testIndexBase_};
-  manager.writeViewToDisk("filterView", plan);
-  auto qec = getQec();
-  auto view = manager.getView("filterView", qec.get());
-  materializedViewsQueryAnalysis::QueryPatternCache qpc;
-  qpc.analyzeView(view, qec.get());
+  {
+    // Pattern-based (star) rewriting discards everything about a view's query
+    // except the shape of its triples. A trailing `VALUES` clause restricts
+    // the view's rows beyond that shape, so a view defined with one must not
+    // be registered for star/chain rewriting: otherwise an unrestricted user
+    // query would be silently answered from the restricted view, returning
+    // incomplete results.
+    MaterializedViewsManager manager{testIndexBase_};
+    manager.writeViewToDisk(
+        "postValuesView",
+        qlv().parseAndPlanQuery("SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> "
+                                "?p2 } VALUES (?p1) { (\"xyz\") }"));
+    auto view = manager.getView("postValuesView", qec.get());
+    qpc.analyzeView(view, qec.get());
+    EXPECT_TRUE(
+        qpc.makeJoinReplacementIndexScans(qec.get(), basicPattern).empty());
+    manager.unloadViewIfLoaded("postValuesView");
+  }
 
-  auto rewritePlan =
-      qlv().parseAndPlanQuery("SELECT * { ?s <p1> ?p1 . ?s <p3> ?p2 }");
-  const auto& graphPattern = rewritePlan.parsedQuery()._rootGraphPattern;
-  ASSERT_EQ(graphPattern._graphPatterns.size(), 1u);
-  EXPECT_TRUE(qpc.makeJoinReplacementIndexScans(
-                     qec.get(), graphPattern._graphPatterns.at(0).getBasic())
-                  .empty());
-  manager.unloadViewIfLoaded("filterView");
-}
+  {
+    // Same as above, but for a `FILTER` instead of a trailing `VALUES`
+    // clause: both are discarded by pattern-based rewriting in the same way
+    // and so must be rejected in the same way.
+    MaterializedViewsManager manager{testIndexBase_};
+    manager.writeViewToDisk(
+        "filterView",
+        qlv().parseAndPlanQuery("SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> "
+                                "?p2 FILTER(?p1 = \"abc\") }"));
+    auto view = manager.getView("filterView", qec.get());
+    qpc.analyzeView(view, qec.get());
+    EXPECT_TRUE(
+        qpc.makeJoinReplacementIndexScans(qec.get(), basicPattern).empty());
+    manager.unloadViewIfLoaded("filterView");
+  }
 
-// _____________________________________________________________________________
-// Confirms that cache-key based rewriting, unlike pattern-based rewriting, is
-// unaffected by a trailing `VALUES` clause: it requires an exact match of the
-// whole view query (the clause included), so an unrestricted query is never
-// incorrectly served from the restricted view.
-TEST_F(MaterializedViewsTest, PostQueryValuesCacheKeyRewriteOnly) {
-  const std::string writeQuery =
-      "SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> ?p2 } "
-      "VALUES (?p1) { (\"xyz\") }";
-  qlv().writeMaterializedView("postValuesCacheView", writeQuery);
-  qlv().loadMaterializedView("postValuesCacheView");
+  {
+    // Confirms that cache-key based rewriting, unlike pattern-based
+    // rewriting, is unaffected by a trailing `VALUES` clause: it requires an
+    // exact match of the whole view query (the clause included), so an
+    // unrestricted query is never incorrectly served from the restricted
+    // view.
+    const std::string writeQuery =
+        "SELECT ?s ?p1 ?p2 { ?s <p1> ?p1 . ?s <p3> ?p2 } "
+        "VALUES (?p1) { (\"xyz\") }";
+    qlv().writeMaterializedView("postValuesCacheView", writeQuery);
+    qlv().loadMaterializedView("postValuesCacheView");
 
-  // The exact same (restricted) query is matched via its cache key.
-  qpExpect(qlv(), writeQuery,
-           viewScan("postValuesCacheView", "?s", "?p1", "?p2"));
+    // The exact same (restricted) query is matched via its cache key.
+    qpExpect(qlv(), writeQuery,
+             viewScan("postValuesCacheView", "?s", "?p1", "?p2"));
 
-  // The unrestricted query must not be served from the restricted view, so it
-  // still falls back to a plain join.
-  qpExpect(qlv(), "SELECT * { ?s <p1> ?p1 . ?s <p3> ?p2 }",
-           h::Join(h::IndexScanFromStrings("?s", "<p1>", "?p1"),
-                   h::IndexScanFromStrings("?s", "<p3>", "?p2")));
+    // The unrestricted query must not be served from the restricted view, so
+    // it still falls back to a plain join.
+    qpExpect(qlv(), "SELECT * { ?s <p1> ?p1 . ?s <p3> ?p2 }",
+             h::Join(h::IndexScanFromStrings("?s", "<p1>", "?p1"),
+                     h::IndexScanFromStrings("?s", "<p3>", "?p2")));
 
-  qlv().unloadMaterializedView("postValuesCacheView");
+    qlv().unloadMaterializedView("postValuesCacheView");
+  }
 }
 
 // _____________________________________________________________________________
