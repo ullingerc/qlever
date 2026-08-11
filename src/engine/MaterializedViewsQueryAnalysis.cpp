@@ -384,6 +384,26 @@ bool QueryPatternCache::analyzeView(ViewPtr view, QueryExecutionContext* qec) {
   bool cacheKeyAdded = insert(full);
   cacheKeyAdded = insert(withoutInvariant) || cacheKeyAdded;
 
+  // Pattern-based (star/chain) rewriting matches a user query against the
+  // shape of the view's triples alone and disregards everything else about
+  // the view's query. A `FILTER` or a trailing `VALUES` clause restricts the
+  // view's rows beyond what that shape expresses, so registering the view for
+  // pattern-based rewriting despite one of them being present would make an
+  // unrestricted query silently match the (in fact restricted) view and
+  // return incomplete results. Cache-key based rewriting is unaffected, since
+  // it requires the user query to match the view's query as a whole,
+  // `FILTER`s and trailing `VALUES` included.
+  if (!parsed->_rootGraphPattern._filters.empty() ||
+      (parsed->postQueryValuesClause_.has_value() &&
+       !parsed->postQueryValuesClause_.value()
+            ._inlineValues._variables.empty())) {
+    explainIgnore(
+        "The view's query contains a FILTER or a trailing VALUES clause, "
+        "which would be ignored by pattern-based (star/chain) rewriting and "
+        "could thus lead to incorrect results");
+    return cacheKeyAdded;
+  }
+
   auto graphPatternsFiltered = graphPatternInvariantFilter(parsed.value());
   if (graphPatternsFiltered.size() != 1) {
     explainIgnore(
