@@ -1558,6 +1558,16 @@ QueryPlanner::runDynamicProgrammingOnConnectedComponent(
   dpTab.push_back(std::move(connectedComponent));
   size_t numSeeds = findUniqueNodeIds(dpTab.back(), false);
 
+  // Round `k == 1` (single-triple replacements, i.e. `replacementPlans[0]`) is
+  // never visited by the loop below, since it starts at `k == 2`: unlike all
+  // later rounds, `dpTab[0]` is seeded directly from `connectedComponent`
+  // above rather than built up by merging smaller rounds, so it needs its own
+  // extension here. Every other round's `replacementPlans[k - 1]` is added
+  // inside the loop.
+  if (!replacementPlans.empty()) {
+    ql::ranges::move(replacementPlans[0], std::back_inserter(dpTab.back()));
+  }
+
   for (size_t k = 2; k <= numSeeds; ++k) {
     AD_LOG_TRACE << "Producing plans that unite " << k << " triples."
                  << std::endl;
@@ -1578,14 +1588,19 @@ QueryPlanner::runDynamicProgrammingOnConnectedComponent(
       auto newPlans = merge(dpTab[i - 1], dpTab[k - i - 1], tg);
       extendDpRow(newPlans);
     }
-    // As we only passed in connected components, we expect the result to always
-    // be nonempty.
-    AD_CORRECTNESS_CHECK(!dpRow.empty());
     // If we have replacement plans for this round, we add them now, s.t. the
-    // next level can make use of them.
+    // next level can make use of them. This must happen *before* the
+    // non-empty check below: two nodes can be part of the same connected
+    // component purely because a replacement plan bridges them (see
+    // `createGeneralUnfixedReplacementPlans`) without sharing any query
+    // variable directly, in which case `merge` alone finds nothing for this
+    // round and only the replacement plan populates `dpRow`.
     if (replacementPlans.size() > k - 1) {
       extendDpRow(replacementPlans[k - 1]);
     }
+    // As we only passed in connected components, we expect the result to always
+    // be nonempty.
+    AD_CORRECTNESS_CHECK(!dpRow.empty());
     checkCancellation();
   }
   auto& result = dpTab.back();
@@ -1793,6 +1808,51 @@ std::vector<std::vector<SubtreePlan>> QueryPlanner::fillDpTab(
 
   auto componentIndices = QueryGraph::computeConnectedComponents(
       initialPlans, filtersAndOptSubstitutes);
+
+  // `computeConnectedComponents` above only looks at variables actually
+  // shared between seed plans. A replacement plan (e.g. from
+  // `createGeneralUnfixedReplacementPlans`) can cover several triples whose
+  // *only* connection is a constant that replacement's underlying view match
+  // "unfixed" internally (no query variable ties them together directly), in
+  // which case those triples end up in separate components above and the
+  // replacement -- applied per-component further down -- would never get a
+  // chance to be used. Merge any such components here.
+  if (!replacementPlans.empty()) {
+    size_t numComponents = 0;
+    for (auto c : componentIndices) {
+      numComponents = std::max(numComponents, c + 1);
+    }
+    std::vector<size_t> parent(numComponents);
+    for (size_t i = 0; i < numComponents; ++i) {
+      parent[i] = i;
+    }
+    auto find = [&parent](size_t x) {
+      while (parent[x] != x) {
+        x = parent[x];
+      }
+      return x;
+    };
+    for (const auto& bucket : replacementPlans) {
+      for (const auto& plan : bucket) {
+        std::optional<size_t> firstComponent;
+        for (size_t i = 0; i < initialPlans.size(); ++i) {
+          if ((initialPlans[i]._idsOfIncludedNodes &
+               plan._idsOfIncludedNodes) == 0) {
+            continue;
+          }
+          size_t component = find(componentIndices[i]);
+          if (!firstComponent.has_value()) {
+            firstComponent = component;
+          } else if (*firstComponent != component) {
+            parent[component] = *firstComponent;
+          }
+        }
+      }
+    }
+    for (auto& c : componentIndices) {
+      c = find(c);
+    }
+  }
 
   ad_utility::HashMap<size_t, std::vector<SubtreePlan>> components;
   for (size_t i = 0; i < componentIndices.size(); ++i) {
@@ -2612,6 +2672,148 @@ auto QueryPlanner::createJoinWithTransitivePath(
   mergeSubtreePlanIds(plan, a, b);
   return plan;
 #endif
+}
+
+namespace {
+// Recursively search `op` and its descendants for an `IndexScan` backed by a
+// materialized view whose *subject* is exactly `variable`. Used by
+// `QueryPlanner::createGeneralUnfixedReplacementPlans` to find out whether (and
+// where) a scratch, all-variable replanning attempt got matched to a view.
+const IndexScan* findMaterializedViewScanForVariable(const Operation* op,
+                                                     const Variable& variable) {
+  if (const auto* scan = dynamic_cast<const IndexScan*>(op)) {
+    if (scan->permutation().materializedView() != nullptr &&
+        scan->subject().isVariable() &&
+        scan->subject().getVariable() == variable) {
+      return scan;
+    }
+  }
+  for (const auto* child : op->getChildren()) {
+    if (const auto* found = findMaterializedViewScanForVariable(
+            child->getRootOperation().get(), variable)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+}  // namespace
+
+// _____________________________________________________________________________
+auto QueryPlanner::createGeneralUnfixedReplacementPlans(
+    const parsedQuery::BasicGraphPattern& triples) -> ReplacementPlans {
+  ReplacementPlans plans;
+
+  if (_qec->disableMaterializedViewRewriting() ||
+      !_qec->materializedViewsManager().hasLoadedViews()) {
+    return plans;
+  }
+
+  // Collect the distinct fixed IRI/literal values that appear as the subject
+  // or object of some triple whose predicate is used by some loaded view.
+  // Only triples with a simple (single, fixed) IRI predicate are considered:
+  // this is exactly the set of predicates `hasPredicateInAnyView` knows about,
+  // since property paths and variable predicates are never part of a
+  // materialized view's own defining query either (see `analyzeView`).
+  ad_utility::HashMap<std::string, TripleComponent> candidates;
+  for (const auto& triple : triples._triples) {
+    auto predicate = triple.getSimplePredicate();
+    if (!predicate.has_value() ||
+        !_qec->materializedViewsManager().hasPredicateInAnyView(
+            predicate.value())) {
+      continue;
+    }
+    for (const TripleComponent& term : {triple.s_, triple.o_}) {
+      if (!term.isVariable() && (term.isIri() || term.isLiteral())) {
+        candidates.try_emplace(term.toString(), term);
+      }
+    }
+  }
+
+  for (const auto& [key, constant] : candidates) {
+    // Substitute one fresh variable for every occurrence of `constant` at a
+    // subject/object position, and privately re-run the same DP-based
+    // planning machinery used for the real query on this scratch copy.
+    Variable freshVar = generateUniqueVarName();
+    parsedQuery::BasicGraphPattern trial = triples;
+    std::vector<size_t> coveredTriples;
+    for (size_t i = 0; i < trial._triples.size(); ++i) {
+      auto& t = trial._triples[i];
+      bool touched = false;
+      if (!t.s_.isVariable() && t.s_ == constant) {
+        t.s_ = freshVar;
+        touched = true;
+      }
+      if (!t.o_.isVariable() && t.o_ == constant) {
+        t.o_ = freshVar;
+        touched = true;
+      }
+      if (touched) {
+        coveredTriples.push_back(i);
+      }
+    }
+
+    auto tg = createTripleGraph(&trial);
+    TextLimitMap noTextLimits;
+    auto trialResult =
+        fillDpTab(tg, {}, noTextLimits, {}, ReplacementPlans{}).back();
+
+    const IndexScan* matchedScan = nullptr;
+    for (const auto& plan : trialResult) {
+      matchedScan = findMaterializedViewScanForVariable(
+          plan._qet->getRootOperation().get(), freshVar);
+      if (matchedScan != nullptr) {
+        break;
+      }
+    }
+    if (matchedScan == nullptr) {
+      continue;
+    }
+
+    // Confirmed: build the real replacement directly, reusing the matched
+    // scan's own `varToCol` and re-deriving the matched-column-to-view-column
+    // mapping from its subject/predicate/object/additional-column layout
+    // (fixed by convention, see `MaterializedView::makeIndexScan`), then
+    // insert the real fixed value for column 0 -- no `Filter`/`VALUES` needed
+    // in the committed plan at all. This carries the predicate/object/
+    // additional columns along unchanged, exactly like the plain cache-key
+    // path already does; column 0 is the only column that can ever be fixed
+    // alone, so it is the only one that needs special handling here.
+    const auto& varToCol = matchedScan->getExternallyVisibleVariableColumns();
+    // A scan slot may hold a `Variable` that is only an internal placeholder
+    // for a column that was never requested (e.g. `MaterializedView::
+    // dummyObject()`), in which case it does not appear in `varToCol` at all
+    // (it was stripped from `varsToKeep`) -- `isVariable()` alone can't tell
+    // the difference, so look it up and skip if absent.
+    MaterializedView::ColumnMapping colMap;
+    auto addIfPresent = [&](const TripleComponent& slot, size_t viewCol) {
+      if (!slot.isVariable()) {
+        return;
+      }
+      auto it = varToCol.find(slot.getVariable());
+      if (it != varToCol.end()) {
+        colMap.insert({it->second.columnIndex_, viewCol});
+      }
+    };
+    addIfPresent(matchedScan->subject(), 0);
+    addIfPresent(matchedScan->predicate(), 1);
+    addIfPresent(matchedScan->object(), 2);
+    for (size_t i = 0; i < matchedScan->additionalVariables().size(); ++i) {
+      addIfPresent(TripleComponent{matchedScan->additionalVariables().at(i)},
+                   matchedScan->additionalColumns().at(i));
+    }
+
+    auto view = matchedScan->permutation().materializedView();
+    auto finalScan = view->makeIndexScan(_qec, varToCol, colMap, constant);
+    SubtreePlan plan = makeSubtreePlan(std::move(finalScan));
+    for (auto idx : coveredTriples) {
+      plan._idsOfIncludedNodes |= (1ULL << idx);
+    }
+    for (size_t i = plans.size(); i < coveredTriples.size(); ++i) {
+      plans.push_back({});
+    }
+    plans.at(coveredTriples.size() - 1).push_back(std::move(plan));
+  }
+  return plans;
 }
 
 // _____________________________________________________________________________
@@ -3449,6 +3651,24 @@ void QueryPlanner::GraphPatternPlanner::visitSubquery(
 void QueryPlanner::GraphPatternPlanner::optimizeCommutatively() {
   auto replacementPlans =
       planner_.createMaterializedViewJoinReplacements(candidateTriples_);
+
+  // Offers additional replacement plans for fixed-value triples that
+  // `createMaterializedViewJoinReplacements` above did not (or could not)
+  // already handle -- see the declaration for details. Buckets may overlap
+  // with those above (e.g. both offering an alternative for the same pair of
+  // triples); the DP algorithm already handles multiple alternatives for the
+  // same coverage correctly.
+  auto unfixedPlans =
+      planner_.createGeneralUnfixedReplacementPlans(candidateTriples_);
+  if (replacementPlans.size() < unfixedPlans.size()) {
+    replacementPlans.resize(unfixedPlans.size());
+  }
+  for (size_t i = 0; i < unfixedPlans.size(); ++i) {
+    for (auto& plan : unfixedPlans[i]) {
+      replacementPlans[i].push_back(std::move(plan));
+    }
+  }
+
   auto tg = planner_.createTripleGraph(&candidateTriples_);
   auto lastRow =
       planner_

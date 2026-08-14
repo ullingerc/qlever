@@ -264,9 +264,19 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
       const parsedQuery::MaterializedViewQuery& viewQuery) const;
 
   using ColumnMapping = ad_utility::HashMap<size_t, size_t>;
-  std::shared_ptr<IndexScan> makeIndexScan(QueryExecutionContext* qec,
-                                           const VariableToColumnMap& varToCol,
-                                           const ColumnMapping& colMap) const;
+  // If `fixedFirstColumnValue` is set, column 0 (always the scan's subject
+  // slot) is bound to that value instead of to the variable `varToCol` and
+  // `colMap` would otherwise place there, and that variable is excluded from
+  // the scan's result columns. Used by
+  // `QueryPlanner::createGeneralUnfixedReplacementPlans` to bake a fixed value
+  // directly into an otherwise cache-key-matched, all-variable scan, so that
+  // its cost/size estimate reflects the fixed value instead of a full scan of
+  // the view.
+  std::shared_ptr<IndexScan> makeIndexScan(
+      QueryExecutionContext* qec, const VariableToColumnMap& varToCol,
+      const ColumnMapping& colMap,
+      std::optional<TripleComponent> fixedFirstColumnValue =
+          std::nullopt) const;
 
   // Compute the cache key corresponding to the query of this materialized view.
   // Requires a `QueryExecutionContext` to access the index, and the
@@ -452,6 +462,11 @@ class MaterializedViewsManager {
   std::shared_ptr<IndexScan> makeIndexScan(
       QueryExecutionContext* qec, const std::string& cacheKey,
       const VariableToColumnMap& varToCol) const;
+
+  // Cheap check whether `predicateIri` is used by any currently loaded
+  // materialized view. See `QueryPatternCache::hasPredicateInAnyView` for
+  // details and the intended use case.
+  bool hasPredicateInAnyView(std::string_view predicateIri) const;
 
   // Write a `MaterializedView` given a valid `name` (consisting only of
   // alphanumerics and hyphens) and a `plannedQuery` to be executed. The query's

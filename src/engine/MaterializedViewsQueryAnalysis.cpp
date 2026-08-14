@@ -417,18 +417,18 @@ bool QueryPatternCache::analyzeView(ViewPtr view, QueryExecutionContext* qec) {
     patternFound = analyzeJoinStar(view, triples);
   }
 
-  // Remember predicates that appear in certain views, only if any pattern is
-  // detected.
-  if (patternFound) {
-    for (const auto& triple : triples) {
-      auto predicate = triple.getSimplePredicate();
-      if (predicate.has_value()) {
-        auto& vec = predicateInView_[predicate.value()];
-        // Sort-preserving insert into the vector s.t. we can later merge
-        // multiple vectors of views.
-        auto it = std::lower_bound(vec.begin(), vec.end(), view);
-        vec.insert(it, view);
-      }
+  // Remember predicates that appear in this view, regardless of whether a
+  // star/chain pattern was found: `hasPredicateInAnyView` (used by
+  // `QueryPlanner::unfixMaterializedViewColumns` for cache-key based rewriting)
+  // needs this for every view, not only star/chain-shaped ones.
+  for (const auto& triple : triples) {
+    auto predicate = triple.getSimplePredicate();
+    if (predicate.has_value()) {
+      auto& vec = predicateInView_[predicate.value()];
+      // Sort-preserving insert into the vector s.t. we can later merge
+      // multiple vectors of views.
+      auto it = std::lower_bound(vec.begin(), vec.end(), view);
+      vec.insert(it, view);
     }
   }
 

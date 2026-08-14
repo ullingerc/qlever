@@ -457,6 +457,40 @@ class QueryPlanner {
   ReplacementPlans createMaterializedViewJoinReplacements(
       const parsedQuery::BasicGraphPattern& triples) const;
 
+  // For every distinct fixed IRI/literal that appears as the subject or
+  // object of some triple in `triples` whose predicate is used by some
+  // currently loaded materialized view: substitute a single fresh variable
+  // for every occurrence of that value within `triples`, and privately re-run
+  // the same DP-based planning machinery (`createTripleGraph` + `fillDpTab`)
+  // on that scratch copy to see whether it ends up backed by a materialized
+  // view. Because `QueryExecutionTree::readFromMaterializedView` (unmodified)
+  // already opportunistically checks the cache key of every subtree
+  // constructed during that search, this detects a match for *any* view
+  // shape the all-variable case would already detect -- chains, stars, or
+  // anything else -- not just star/chain patterns, since the scratch copy is,
+  // from the planner's point of view, indistinguishable from a genuinely
+  // all-variable `BasicGraphPattern`.
+  //
+  // Only on such a confirmed match (found by walking the scratch plan's
+  // operation tree for a materialized-view-backed `IndexScan` whose *subject*
+  // is exactly the fresh variable -- which, by the fixed column-to-scan-slot
+  // convention in `MaterializedView::makeIndexScan`, is only ever true if the
+  // matched view column is column 0, so this also enforces "only column 0 may
+  // be fixed alone" for free) is a replacement actually built: directly, by
+  // reusing the matched scan's own predicate/object/additional-column
+  // variables and inserting the real fixed value for column 0, with no
+  // `Filter` or `VALUES` needed in the committed plan at all. This never
+  // touches or removes the original, still-fixed triples, so a predicate that
+  // merely happens to be shared with some unrelated (or non-matching) view can
+  // never make a query worse, only sometimes better.
+  //
+  // ponytail: runs one full nested planning pass per distinct candidate value,
+  // so a `BasicGraphPattern` with many distinct fixed values sharing
+  // view-covered predicates pays for that many extra (small) DP searches;
+  // fine for typical query sizes, revisit if profiling says otherwise.
+  ReplacementPlans createGeneralUnfixedReplacementPlans(
+      const parsedQuery::BasicGraphPattern& triples);
+
   vector<SubtreePlan> getOrderByRow(
       const ParsedQuery& pq,
       const std::vector<std::vector<SubtreePlan>>& dpTab) const;

@@ -763,11 +763,13 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
 // _____________________________________________________________________________
 std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
     QueryExecutionContext* qec, const VariableToColumnMap& varToCol,
-    const ColumnMapping& colMap) const {
+    const ColumnMapping& colMap,
+    std::optional<TripleComponent> fixedFirstColumnValue) const {
   TripleComponent s{dummySubject()};
   TripleComponent p{dummyPredicate()};
   TripleComponent o{dummyObject()};
   AdditionalScanColumns additionalCols;
+  std::optional<Variable> firstColumnVar;
   for (const auto& [v, i] : varToCol) {
     // This is only correct if the `QueryExecutionTree` uses the cache key and
     // `VariableToColumnMap` of the new `IndexScan`.
@@ -777,7 +779,9 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
                          "materialized view.");
     auto col = it->second;
     if (col == 0) {
-      s = v;
+      firstColumnVar = v;
+      s = fixedFirstColumnValue.has_value() ? fixedFirstColumnValue.value()
+                                            : TripleComponent{v};
     } else if (col == 1) {
       p = v;
     } else if (col == 2) {
@@ -791,6 +795,9 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
                                 std::move(additionalCols)};
   auto v = varToCol | ql::ranges::views::keys;
   ad_utility::HashSet<Variable> varsToKeep{v.begin(), v.end()};
+  if (fixedFirstColumnValue.has_value() && firstColumnVar.has_value()) {
+    varsToKeep.erase(firstColumnVar.value());
+  }
   return std::make_shared<IndexScan>(
       qec, permutation_, LocatedTriplesSharedState{locatedTriplesState_},
       std::move(scanTriple), IndexScan::Graphs::All(), std::nullopt,
@@ -845,6 +852,13 @@ std::shared_ptr<IndexScan> MaterializedViewsManager::makeIndexScan(
     return nullptr;
   }
   return info->view_->makeIndexScan(qec, varToCol, info->colMapping_);
+}
+
+// _____________________________________________________________________________
+bool MaterializedViewsManager::hasPredicateInAnyView(
+    std::string_view predicateIri) const {
+  return loadedViews_.rlock()->queryPatternCache_.hasPredicateInAnyView(
+      predicateIri);
 }
 
 // _____________________________________________________________________________

@@ -122,6 +122,19 @@ class QueryPatternCache {
 
   ByCacheKeyInfoPtr lookupByCacheKey(const std::string& cacheKey) const;
 
+  // Cheap check used by `QueryPlanner::unfixMaterializedViewColumns` to decide
+  // whether a fixed subject/object value in a triple is worth temporarily
+  // replacing with a variable (compensated by an equality `Filter`), so that
+  // cache-key based view detection (which only matches all-variable patterns)
+  // gets a chance to recognize the pattern. This is deliberately permissive:
+  // it does not check the position or arity of the fixed value, only whether
+  // the triple's predicate occurs in some loaded view's defining query at all.
+  // A false positive only costs one unnecessary `Filter` on top of an
+  // otherwise avoidable variable scan.
+  bool hasPredicateInAnyView(std::string_view predicateIri) const {
+    return predicateInView_.contains(predicateIri);
+  }
+
  private:
   // Helper for `analyzeView`, that checks for a simple chain. It returns `true`
   // iff a simple chain `a->b` is present.
