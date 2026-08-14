@@ -196,14 +196,15 @@ inline sj::SweeperCfg makeSweeperCfg(const LibSpatialJoinConfig& libSJConfig,
   cfg.withinDist = withinDist;
   auto joinTypeVal = libSJConfig.joinType_;
   cfg.writeRelCb = [&results, &resultDists, joinTypeVal](
-                       size_t t, const char* a, size_t, const char* b, size_t,
-                       const char* pred, size_t) {
+                       size_t t, const char* a, size_t aLen, const char* b,
+                       size_t bLen, const char* pred, size_t) {
+    auto rowA = static_cast<int>(SpatialJoinAlgorithms::decodeRowId(a, aLen));
+    auto rowB = static_cast<int>(SpatialJoinAlgorithms::decodeRowId(b, bLen));
     if (joinTypeVal == WITHIN_DIST) {
-      results[t].push_back({WITHIN_DIST, std::atoi(a), std::atoi(b)});
+      results[t].push_back({WITHIN_DIST, rowA, rowB});
       resultDists[t].push_back(atof(pred));
     } else {
-      results[t].push_back(
-          {static_cast<SpatialJoinType>(pred[0]), std::atoi(a), std::atoi(b)});
+      results[t].push_back({static_cast<SpatialJoinType>(pred[0]), rowA, rowB});
     }
   };
   return cfg;

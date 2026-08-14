@@ -62,8 +62,12 @@ void WKTParser::processQueue(size_t t) {
         // If we have not filtered out this geometry, read and parse the full
         // string.
         job.wkt = _index.indexToString(job.valueId.getVocabIndex());
-        parseLine(job.wkt.data(), job.wkt.size(), job.line, t, w, job.side,
-                  false);
+        // Pass the row index as a compact binary id (instead of its decimal
+        // string representation) to avoid the cost of formatting/parsing it
+        // as text; `writeRelCb` in `SpatialJoinAlgorithms.cpp` decodes it
+        // back using the inverse of `sj::intInString`.
+        parseLine(job.wkt.data(), job.wkt.size(), sj::intInString(job.line), t,
+                  w, job.side);
         parseCounter++;
       } else if (dt == Datatype::GeoPoint) {
         const auto& p = job.valueId.getGeoPoint();
@@ -83,7 +87,7 @@ void WKTParser::processQueue(size_t t) {
             static_cast<int32_t>(mercPoint.getX() * PREC),
             static_cast<int32_t>(mercPoint.getY() * PREC)};
         _bboxes[t] = ::util::geo::extendBox(
-            _sweeper->add(addPoint, std::to_string(job.line), job.side, w),
+            _sweeper->add(addPoint, sj::intInString(job.line), job.side, w),
             _bboxes[t]);
         parseCounter++;
       } else if (dt == Datatype::LocalVocabIndex) {
@@ -92,8 +96,8 @@ void WKTParser::processQueue(size_t t) {
         const auto& literalOrIri = *job.valueId.getLocalVocabIndex();
         if (literalOrIri.isLiteral()) {
           job.wkt = asStringViewUnsafe(literalOrIri.getLiteral().getContent());
-          parseLine(job.wkt.data(), job.wkt.size(), job.line, t, w, job.side,
-                    false);
+          parseLine(job.wkt.data(), job.wkt.size(), sj::intInString(job.line),
+                    t, w, job.side);
           parseCounter++;
         }
       }

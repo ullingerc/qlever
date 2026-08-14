@@ -44,6 +44,15 @@ using namespace BoostGeometryNamespace;
 using namespace geometryConverters;
 
 // ____________________________________________________________________________
+size_t SpatialJoinAlgorithms::decodeRowId(const char* bytes, size_t numBytes) {
+  size_t id = 0;
+  for (size_t i = 0; i < numBytes; ++i) {
+    id = (id << 8) | static_cast<unsigned char>(bytes[i]);
+  }
+  return id;
+}
+
+// ____________________________________________________________________________
 SpatialJoinAlgorithms::SpatialJoinAlgorithms(
     QueryExecutionContext* qec, PreparedSpatialJoinParams params,
     SpatialJoinConfiguration config, std::optional<SpatialJoin*> spatialJoin)
@@ -508,13 +517,14 @@ Result SpatialJoinAlgorithms::LibspatialjoinAlgorithm() {
       NUM_THREADS, qec_->getAllocator().amountMemoryLeft());
   sweeperCfg.withinDist = withinDist;
   sweeperCfg.writeRelCb = [&results, &resultDists, joinTypeVal](
-                              size_t t, const char* a, size_t, const char* b,
-                              size_t, const char* pred, size_t) {
+                              size_t t, const char* a, size_t aLen,
+                              const char* b, size_t bLen, const char* pred,
+                              size_t) {
     if (joinTypeVal == SpatialJoinType::WITHIN_DIST) {
-      results[t].push_back({std::atoi(a), std::atoi(b)});
+      results[t].push_back({decodeRowId(a, aLen), decodeRowId(b, bLen)});
       resultDists[t].push_back(atof(pred));
     } else if (pred[0] == static_cast<char>(joinTypeVal)) {
-      results[t].push_back({std::atoi(a), std::atoi(b)});
+      results[t].push_back({decodeRowId(a, aLen), decodeRowId(b, bLen)});
     }
   };
   sweeperCfg.sweepCancellationCb = [this]() { throwIfCancelled(); };

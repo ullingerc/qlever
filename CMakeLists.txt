@@ -306,8 +306,13 @@ FetchContent_Declare(
 ################################
 FetchContent_Declare(
         spatialjoin
-        GIT_REPOSITORY https://github.com/ad-freiburg/spatialjoin
-        GIT_TAG d1170ee08f0b932c73ca53af75338eacb3e043f6
+        # TODO<ullingec>: point back to ad-freiburg/spatialjoin once
+        # https://github.com/ullingerc/spatialjoin/pull/new/qlever-binary-ids
+        # (adds a `parseLine` overload that accepts a pre-built geometry id,
+        # used to pass binary-packed row ids instead of decimal strings) is
+        # merged upstream.
+        GIT_REPOSITORY https://github.com/ullingerc/spatialjoin
+        GIT_TAG 8f41f4373e15527fa763a54bdef5a228c78ea1bd
         SYSTEM
         EXCLUDE_FROM_ALL
 )

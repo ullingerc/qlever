@@ -224,6 +224,14 @@ class SpatialJoinAlgorithms {
   // `LibspatialjoinAlgorithm`.
   static size_t getNumThreads();
 
+  // Decode a row id previously encoded via `sj::intInString` (a big-endian
+  // encoding of a `size_t`, with leading zero bytes dropped) back into a
+  // `size_t`. This is the inverse of the encoding step in
+  // `SpatialJoinParser.cpp` and avoids the cost of a decimal string
+  // round-trip (`std::to_string`/`std::atoi`) for every result row. Also used
+  // by tests that set up their own `writeRelCb`.
+  static size_t decodeRowId(const char* bytes, size_t numBytes);
+
   // Helper function which returns a GeoPoint if the element of the given table
   // represents a GeoPoint
   static std::optional<GeoPoint> getPoint(const IdTableView<0>* restable,
