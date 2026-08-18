@@ -77,6 +77,20 @@ TEST(QueryRewriteUtilTest, GetGeoDistanceFilter) {
   auto [dExpr6, dExp6] = makeMetricDist();
   auto expr6 = ltSprql(std::move(dExpr6), ValueId::makeFromGeoPoint({1, 1}));
   checkGeoDistanceFilter(getGeoDistanceFilter(*expr6), std::nullopt, 10);
+
+  // `?dist <= 10` is recognized as a distance filter if `?dist` is a key of
+  // `boundDistanceVars` (this covers `BIND(geof:metricDistance(?a, ?b) AS
+  // ?dist) FILTER(?dist <= 10)`, where the `GeoDistanceCall` was already
+  // extracted from the `BIND`'s expression by `collectGeoDistanceBinds`).
+  auto dExp7 = makeMetricDist().second.value();
+  auto expr7 = leSprql(getExpr(V{"?dist"}), D(10));
+  ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall> boundVars{
+      {V{"?dist"}, dExp7}};
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr7, boundVars), dExp7, 10,
+                         V{"?dist"});
+
+  // Without the map entry for `?dist`, the same filter is not recognized.
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr7), std::nullopt, 10);
 }
 
 //______________________________________________________________________________

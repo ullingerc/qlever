@@ -338,7 +338,12 @@ void SpatialJoinAlgorithms::addResultTableEntry(
   }
 
   if (config_.distanceVariable_.has_value()) {
-    result->at(resrow, rescol) = distance;
+    // `distance` is always computed in kilometers; convert to the unit the
+    // caller asked for (e.g. when the rewrite came from `geof:metricDistance`
+    // or a `geof:distance` call with an explicit unit argument).
+    result->at(resrow, rescol) =
+        Id::makeFromDouble(ad_utility::detail::kilometerToUnit(
+            distance.getDouble(), config_.distanceUnit_));
     // rescol isn't used after that in this function, but future updates,
     // which add additional columns, would need to remember to increase
     // rescol at this place otherwise. If they forget to do this, the

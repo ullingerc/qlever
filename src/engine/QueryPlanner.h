@@ -12,6 +12,7 @@
 
 #include "engine/CheckUsePatternTrick.h"
 #include "engine/QueryExecutionTree.h"
+#include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "parser/GraphPattern.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/ParsedQuery.h"
@@ -320,8 +321,24 @@ class QueryPlanner {
   // Function for optimization query rewrites: The function returns pairs of
   // filters with the corresponding substitute subtree plan. This is currently
   // used to translate GeoSPARQL filters to spatial join operations.
+  // `boundDistanceVars` is forwarded to `rewriteFilterToSpatialJoinConfig` and
+  // allows recognizing `FILTER(?dist <= constant)` as a distance filter if
+  // `?dist` was `BIND`ed to a `geof:distance`/`metricDistance` call elsewhere
+  // in the same group graph pattern; see `collectGeoDistanceBinds`.
   virtual FiltersAndOptionalSubstitutes seedFilterSubstitutes(
-      const std::vector<SparqlFilter>& filters);
+      const std::vector<SparqlFilter>& filters,
+      const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+          boundDistanceVars = {});
+
+  // Scan `graphPatterns` for `BIND(geof:distance(...) AS ?var)` (or
+  // `metricDistance`) clauses and return a map from `?var` to the parsed
+  // call. Used to seed `boundDistanceVars` above so that a later
+  // `FILTER(?var <= constant)` can be rewritten to a `SpatialJoin` exactly
+  // like `FILTER(geof:distance(...) <= constant)`, with the (then redundant)
+  // `BIND` elided in `GraphPatternPlanner::visitBind`.
+  static ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>
+  collectGeoDistanceBinds(
+      const std::vector<parsedQuery::GraphPatternOperation>& graphPatterns);
 
   // TODO<RobinTF> Extract to dedicated module, this has little to do with
   // actual query planning.
@@ -583,7 +600,9 @@ class QueryPlanner {
   vector<vector<SubtreePlan>> fillDpTab(
       const TripleGraph& graph, std::vector<SparqlFilter> fs,
       TextLimitMap& textLimits, const vector<vector<SubtreePlan>>& children,
-      ReplacementPlans replacementPlans);
+      ReplacementPlans replacementPlans,
+      const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+          boundDistanceVars = {});
 
   // Internal subroutine of `fillDpTab` that  only works on a single connected
   // component of the input. Throws if the subtrees in the `connectedComponent`
@@ -651,6 +670,14 @@ class QueryPlanner {
     // create no single binding for a variable "by accident".
     ad_utility::HashSet<Variable> boundVariables_{};
 
+    // Target variables of `BIND(geof:distance(...) AS ?var)` clauses in
+    // `rootPattern_`, mapped to the parsed call. Lets `seedFilterSubstitutes`
+    // recognize `FILTER(?var <= constant)` as a distance filter, and
+    // `visitBind` skip the now-redundant `BIND` once its target variable was
+    // exported by the resulting `SpatialJoin` substitute instead.
+    ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>
+        boundDistanceVars_;
+
     // We remember the potential filter substitutions so we can avoid
     // unnecessarily recomputing them.
     FiltersAndOptionalSubstitutes filtersAndSubst_;
@@ -661,8 +688,10 @@ class QueryPlanner {
         : planner_{planner},
           rootPattern_{rootPattern},
           qec_{planner._qec},
-          filtersAndSubst_{
-              planner.seedFilterSubstitutes(rootPattern->_filters)} {}
+          boundDistanceVars_{QueryPlanner::collectGeoDistanceBinds(
+              rootPattern->_graphPatterns)},
+          filtersAndSubst_{planner.seedFilterSubstitutes(rootPattern->_filters,
+                                                         boundDistanceVars_)} {}
 
     // This function is called for each of the graph patterns that are contained
     // in the `rootPattern_`. It dispatches to the various `visit...`functions

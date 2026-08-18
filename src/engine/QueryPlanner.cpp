@@ -1421,13 +1421,24 @@ void QueryPlanner::applyFiltersIfPossible(
 
       const bool allowSubstitutes = mode == FilterMode::KeepUnfiltered ||
                                     mode == FilterMode::ReplaceUnfiltered;
+      // Whether `plan` could plausibly be joined with the substitute: checked
+      // via the substitute's own (join) variables rather than the filter
+      // expression's variables, since for a filter substituted via a
+      // `BIND`-bound distance variable (see `collectGeoDistanceBinds`), the
+      // filter's only variable is the `BIND` target (e.g. `?dist`), which is
+      // not one of the substitute's join variables at all.
+      auto substituteIsRelevantForPlan =
+          [&plan](const SubtreePlan& substitute) {
+            const auto& substituteVars = substitute._qet->getVariableColumns();
+            return substituteVars.empty() ||
+                   ql::ranges::any_of(
+                       substituteVars | ql::views::keys,
+                       [&plan](const auto& variable) {
+                         return plan._qet->isVariableCovered(variable);
+                       });
+          };
       if (allowSubstitutes && filterAndSubst.hasSubstitute() &&
-          (filterAndSubst.filter_.expression_.containedVariables().empty() ||
-           ql::ranges::any_of(
-               filterAndSubst.filter_.expression_.containedVariables(),
-               [&plan](const auto& variable) {
-                 return plan._qet->isVariableCovered(*variable);
-               }))) {
+          substituteIsRelevantForPlan(filterAndSubst.substitute_.value())) {
         // Apply filter substitution
         auto jcs = getJoinColumns(filterAndSubst.substitute_.value(), plan);
         auto substPlans =
@@ -1759,8 +1770,29 @@ std::vector<SubtreePlan> QueryPlanner::runGreedyPlanningOnConnectedComponent(
 }
 
 // _____________________________________________________________________________
+ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>
+QueryPlanner::collectGeoDistanceBinds(
+    const std::vector<parsedQuery::GraphPatternOperation>& graphPatterns) {
+  ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall> result;
+  for (const auto& op : graphPatterns) {
+    const auto* bind = std::get_if<parsedQuery::Bind>(&op);
+    if (bind == nullptr) {
+      continue;
+    }
+    auto call = sparqlExpression::getGeoDistanceExpressionParameters(
+        *bind->_expression.getPimpl());
+    if (call.has_value()) {
+      result.emplace(bind->_target, std::move(call).value());
+    }
+  }
+  return result;
+}
+
+// _____________________________________________________________________________
 QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
-    const std::vector<SparqlFilter>& filters) {
+    const std::vector<SparqlFilter>& filters,
+    const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+        boundDistanceVars) {
   FiltersAndOptionalSubstitutes plans;
   plans.reserve(filters.size());
 
@@ -1768,7 +1800,8 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
        ::ranges::views::enumerate(filters)) {
     // Check if the filter expression is suitable for spatial join optimization
     auto sjResult = rewriteFilterToSpatialJoinConfig(
-        filterExpression, _qec, [this] { return generateUniqueVarName(); });
+        filterExpression, _qec, [this] { return generateUniqueVarName(); },
+        boundDistanceVars);
     if (!sjResult.has_value()) {
       plans.push_back({filterExpression, std::nullopt});
     } else {
@@ -1793,14 +1826,17 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
 std::vector<std::vector<SubtreePlan>> QueryPlanner::fillDpTab(
     const QueryPlanner::TripleGraph& tg, vector<SparqlFilter> filters,
     TextLimitMap& textLimits, const vector<vector<SubtreePlan>>& children,
-    ReplacementPlans replacementPlans) {
+    ReplacementPlans replacementPlans,
+    const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+        boundDistanceVars) {
   auto [initialPlans, additionalFilters] =
       seedWithScansAndText(tg, children, textLimits);
   ql::ranges::move(additionalFilters, std::back_inserter(filters));
 
   // If we have FILTER statements that can also be answered by a special join,
   // add the respective query plans as filter substitutes.
-  auto filtersAndOptSubstitutes = seedFilterSubstitutes(filters);
+  auto filtersAndOptSubstitutes =
+      seedFilterSubstitutes(filters, boundDistanceVars);
 
   if (filters.size() > 64) {
     AD_THROW("At most 64 filters allowed at the moment.");
@@ -2866,10 +2902,16 @@ void QueryPlanner::QueryGraph::setupGraph(
                   ._qet->getRootOperation()
                   ->getExternallyVisibleVariableColumns();
 
-          for (auto var : filter.expression_.containedVariables()) {
-            if (varToNode.contains(*var)) {
-              varsToBeConnected.push_back(var);
-              AD_CORRECTNESS_CHECK(substituteVariables.contains(*var));
+          // Use the substitute's own (join) variables, rather than the
+          // filter expression's variables, to determine which seed nodes
+          // this substitute connects: for an ordinary geo filter these
+          // coincide, but for a filter substituted via a `BIND`-bound
+          // distance variable (see `collectGeoDistanceBinds`), the filter's
+          // only variable is the `BIND` target (e.g. `?dist`), which is not
+          // one of the substitute's join variables at all.
+          for (const auto& var : substituteVariables | ql::views::keys) {
+            if (varToNode.contains(var)) {
+              varsToBeConnected.push_back(&var);
             }
           }
 
@@ -3226,6 +3268,24 @@ void QueryPlanner::GraphPatternPlanner::visitBind(const parsedQuery::Bind& v) {
   auto lastRow = std::move(candidatePlans_.at(0));
   candidatePlans_.at(0).clear();
   for (const auto& a : lastRow) {
+    if (a._qet->getVariableColumns().contains(v._target)) {
+      // `v._target` is already bound in this candidate's subtree -- this
+      // happens exactly when a `SpatialJoin` filter substitute (see
+      // `seedFilterSubstitutes`/`collectGeoDistanceBinds`) already exports
+      // the distance under this variable name, making the original `BIND`
+      // redundant. Nothing else can bind `v._target` here: it is not in
+      // `boundVariables_` (checked above), which every other way of binding
+      // a variable in this loop updates.
+      auto plan = a;
+      // Like the materialized-view push-down below, this plan is not rooted
+      // at a `Bind`, but is still allowed to carry forward
+      // `_idsOfIncludedFilters` bits (from the filter the `SpatialJoin`
+      // substitute consumed) as a seed for later planning; see the check in
+      // `seedWithScansAndText`.
+      plan.containsBindSubstitute_ = true;
+      candidatePlans_.back().push_back(std::move(plan));
+      continue;
+    }
     if (getRuntimeParameter<
             &RuntimeParameters::enableMaterializedViewQueryRewrite_>()) {
       // Consider pushing down the `BIND` into the subtree.
@@ -3473,11 +3533,11 @@ void QueryPlanner::GraphPatternPlanner::optimizeCommutatively() {
   auto replacementPlans =
       planner_.createMaterializedViewJoinReplacements(candidateTriples_);
   auto tg = planner_.createTripleGraph(&candidateTriples_);
-  auto lastRow =
-      planner_
-          .fillDpTab(tg, rootPattern_->_filters, rootPattern_->textLimits_,
-                     candidatePlans_, std::move(replacementPlans))
-          .back();
+  auto lastRow = planner_
+                     .fillDpTab(tg, rootPattern_->_filters,
+                                rootPattern_->textLimits_, candidatePlans_,
+                                std::move(replacementPlans), boundDistanceVars_)
+                     .back();
   candidateTriples_._triples.clear();
   candidatePlans_.clear();
   candidatePlans_.push_back(std::move(lastRow));

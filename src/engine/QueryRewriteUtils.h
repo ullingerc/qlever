@@ -9,7 +9,9 @@
 #include <memory>
 
 #include "engine/SpatialJoinConfig.h"
+#include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "parser/data/SparqlFilter.h"
+#include "util/HashMap.h"
 
 class QueryExecutionContext;
 class QueryExecutionTree;
@@ -32,9 +34,15 @@ struct SpatialJoinRewriteResult {
 // Generate a spatial join configuration for a given filter, if this filter is
 // suitable for such an optimization. `generateUniqueVarName` is used to
 // obtain a fresh internal variable for each side of the filter that is a
-// fixed value rather than a variable.
+// fixed value rather than a variable. `boundDistanceVars` maps the target
+// variable of a `BIND(geof:distance(...) AS ?dist)` (or `metricDistance`) to
+// its parsed call, so that `FILTER(?dist <= constant)` can be recognized as
+// the same pattern as a filter that spells out the distance call directly;
+// see `QueryPlanner::collectGeoDistanceBinds`.
 std::optional<SpatialJoinRewriteResult> rewriteFilterToSpatialJoinConfig(
     const SparqlFilter& filter, QueryExecutionContext* qec,
-    const std::function<Variable()>& generateUniqueVarName);
+    const std::function<Variable()>& generateUniqueVarName,
+    const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+        boundDistanceVars = {});
 
 #endif  // QLEVER_SRC_ENGINE_QUERYREWRITEUTILS_H

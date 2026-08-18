@@ -585,7 +585,10 @@ class QueryPlannerWithMockFilterSubstitute : public QueryPlanner {
   using QueryPlanner::QueryPlanner;
 
   FiltersAndOptionalSubstitutes seedFilterSubstitutes(
-      const std::vector<SparqlFilter>& filters) override {
+      const std::vector<SparqlFilter>& filters,
+      [[maybe_unused]] const ad_utility::HashMap<
+          Variable, sparqlExpression::GeoDistanceCall>& boundDistanceVars = {})
+      override {
     FiltersAndOptionalSubstitutes plans;
     plans.reserve(filters.size());
 

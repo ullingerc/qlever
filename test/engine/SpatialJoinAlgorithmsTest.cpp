@@ -1849,6 +1849,7 @@ TEST(SpatialJoin, LibspatialJoinDe9imFilter) {
         Variable{"?area1"},
         Variable{"?area2"},
         std::nullopt,
+        std::nullopt,
         PayloadVariables::all(),
         SpatialJoinAlgorithm::LIBSPATIALJOIN,
         SpatialJoinType::DE9IM};
@@ -1874,6 +1875,64 @@ TEST(SpatialJoin, LibspatialJoinDe9imFilter) {
   // for an area with itself), so this filter matches nothing.
   auto noMatchRes = runWithFilter("0FFFFFFF2");
   EXPECT_EQ(noMatchRes.idTableView().numRows(), 0);
+}
+
+// _____________________________________________________________________________
+TEST(SpatialJoin, DistanceVariableRespectsUnit) {
+  std::string kg;
+  addArea(kg, "1", "\"Uni Freiburg TF Area\"", areaUniFreiburg);
+  addArea(kg, "2", "\"Minster Freiburg Area\"", areaMuenster);
+
+  ad_utility::testing::TestIndexConfig idxConfig{kg};
+  idxConfig.blocksizePermutations = 16_MB;
+  idxConfig.parserBufferSize = 10_kB;
+  auto qec = ad_utility::testing::getQec(std::move(idxConfig));
+
+  // Compute the exported distance column for a `libspatialjoin`
+  // `WITHIN_DIST` spatial join (the same task/algorithm the query rewrite in
+  // `QueryRewriteUtils.cpp` uses for `geof:distance`/`metricDistance`
+  // filters) with `distanceVariable_` set, once with `distanceUnit_` left at
+  // its default (kilometers) and once converted to miles, and return the
+  // first row's distance.
+  auto runWithUnit = [&](std::optional<UnitOfMeasurement> unit) -> double {
+    auto leftChild =
+        buildIndexScan(qec, {"?obj1", std::string{"<asWKT>"}, "?area1"});
+    auto rightChild =
+        buildIndexScan(qec, {"?obj2", std::string{"<asWKT>"}, "?area2"});
+    SpatialJoinConfiguration config{
+        LibSpatialJoinConfig{SpatialJoinType::WITHIN_DIST, 1e9, std::nullopt},
+        Variable{"?area1"},
+        Variable{"?area2"},
+        Variable{"?dist"},
+        unit,
+        PayloadVariables::all(),
+        SpatialJoinAlgorithm::LIBSPATIALJOIN,
+        SpatialJoinType::WITHIN_DIST};
+    auto spatialJoinOperation = ad_utility::makeExecutionTree<SpatialJoin>(
+        qec, config, leftChild, rightChild);
+    auto spatialJoin = std::dynamic_pointer_cast<SpatialJoin>(
+        spatialJoinOperation->getRootOperation());
+    auto result = spatialJoin->computeResult(false);
+    EXPECT_GT(result.idTableView().numRows(), 0u);
+    // The result also contains the (zero-distance) self-pairs of each area
+    // with itself; take the maximum, which is the actual cross-area
+    // distance.
+    double maxDist = 0;
+    auto distCol = spatialJoin->getResultWidth() - 1;
+    for (size_t row = 0; row < result.idTableView().numRows(); ++row) {
+      maxDist =
+          std::max(maxDist, result.idTableView().at(row, distCol).getDouble());
+    }
+    return maxDist;
+  };
+
+  double distKm = runWithUnit(std::nullopt);
+  double distMiles = runWithUnit(UnitOfMeasurement::MILES);
+  EXPECT_GT(distKm, 0);
+  EXPECT_NEAR(
+      distMiles,
+      ad_utility::detail::kilometerToUnit(distKm, UnitOfMeasurement::MILES),
+      1e-6);
 }
 
 // _____________________________________________________________________________

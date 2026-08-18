@@ -9,6 +9,7 @@
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 #include "global/ValueIdComparators.h"
+#include "util/HashMap.h"
 
 namespace sparqlExpression::relational {
 
@@ -123,14 +124,31 @@ using GreaterEqualExpression =
 
 using InExpression = relational::InExpression;
 
+// Result of `getGeoDistanceFilter`: the extracted geo call (including its
+// unit), the maximum distance in meters, and -- only if the distance value
+// was not written out directly in the filter but instead came from a
+// `BIND(geof:distance(...) AS ?dist)` elsewhere in the same group graph
+// pattern -- the variable the distance should additionally be exported to.
+struct GeoDistanceFilterResult {
+  GeoDistanceCall call_;
+  double maxDistMeters_;
+  std::optional<Variable> distanceVariable_ = std::nullopt;
+};
+
 // This function is a helper for the query planner. It allows unpacking a
 // `SparqlExpression` of any of these forms
 // * `geof:distance(?variable1, ?variable2) <= constant`
 // * `geof:distance(?variable1, ?variable2, unit-constant) <= constant`
 // * `geof:metricDistance(?variable1, ?variable2) <= constant`
-// for rewriting filters to spatial joins.
-std::optional<std::pair<sparqlExpression::GeoFunctionCall, double>>
-getGeoDistanceFilter(const SparqlExpression& expr);
+// for rewriting filters to spatial joins. Additionally, if the left-hand
+// side is a bare variable that is a key of `boundDistanceVars`, the
+// corresponding `GeoDistanceCall` is used instead (this covers the
+// `BIND(geof:distance(...) AS ?dist) FILTER(?dist <= constant)` pattern; see
+// `distanceVariable_` above).
+std::optional<GeoDistanceFilterResult> getGeoDistanceFilter(
+    const SparqlExpression& expr,
+    const ad_utility::HashMap<Variable, GeoDistanceCall>& boundDistanceVars =
+        {});
 
 }  // namespace sparqlExpression
 
