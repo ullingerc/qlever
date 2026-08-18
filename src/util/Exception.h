@@ -72,7 +72,7 @@ class Exception : public std::exception {
       : location_{location} {
     std::stringstream str;
     // TODO<GCC13> Use `std::format`.
-    str << message << ". In file \"" << location_.file_name() << " \" at line "
+    str << message << ". In file \"" << location_.file_name() << "\" at line "
         << location_.line();
     message_ = std::move(str).str();
   }
@@ -178,9 +178,10 @@ std::string concatMessages(Args&&... messages) {
 // For  details on the usage see the documentation of `AD_CONTRACT_CHECK` above
 // as well as the examples in `ExceptionTest.cpp`
 namespace ad_utility::detail {
+template <typename... AdditionalMessages>
 inline void adCorrectnessCheckImpl(bool condition, std::string_view message,
                                    ad_utility::source_location location,
-                                   auto&&... additionalMessages) {
+                                   AdditionalMessages&&... additionalMessages) {
   AD_CHECK_IMPL(condition, message, location, additionalMessages...);
 }
 }  // namespace ad_utility::detail

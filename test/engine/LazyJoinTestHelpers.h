@@ -13,6 +13,7 @@
 #include "../util/AllocatorTestHelpers.h"
 #include "../util/IndexTestHelpers.h"
 #include "../util/TripleComponentTestHelpers.h"
+#include "index/TripleComponentConversions.h"
 #include "parser/TripleComponent.h"
 
 namespace ad_utility::testing {
@@ -23,16 +24,9 @@ class LazyJoinTestHelper {
  protected:
   QueryExecutionContext* qec_ = nullptr;
 
-  // Get the EncodedIriManager singleton.
-  static const EncodedIriManager& encodedIriManager() {
-    static EncodedIriManager manager;
-    return manager;
-  }
-
   // Convert a TripleComponent to a ValueId.
   Id toValueId(const TripleComponent& tc) const {
-    return tc.toValueId(qec_->getIndex().getVocab(), encodedIriManager())
-        .value();
+    return ::toValueId(tc, qec_->getIndex()).value();
   }
 
   // Create an id table with a single column from a vector of TripleComponents.

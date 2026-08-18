@@ -10,8 +10,8 @@
 #include <boost/optional.hpp>
 
 #include "engine/ExplicitIdTableOperation.h"
-#include "engine/LocalVocab.h"
 #include "engine/SpatialJoinCachedIndex.h"
+#include "index/LocalVocab.h"
 #include "util/Cache.h"
 #include "util/Serializer/Serializer.h"
 #include "util/Synchronized.h"
@@ -30,19 +30,24 @@ class NamedResultCache {
   // geometry index `cachedGeoIndex_` can be precomputed on a column of the
   // result table for spatial joins with a constant (right) child.
   struct Value {
-    std::shared_ptr<const IdTable> result_;
+    // The result can either be an owning `shared_ptr<const IdTable>` or a
+    // non-owning `IdTableView<0>`. The latter is used when the value was
+    // deserialized as a zero-copy view directly into an externally-owned
+    // buffer (e.g. a memory-mapped or in-memory blob); the caller is then
+    // responsible for keeping that buffer alive for at least as long as this
+    // `Value` (and any `ExplicitIdTableOperation`/`Result` derived from it).
+    ExplicitIdTableOperation::IdTableOrView result_;
     VariableToColumnMap varToColMap_;
     std::vector<ColumnIndex> resultSortedOn_;
     LocalVocab localVocab_;
     std::string cacheKey_;
     std::optional<SpatialJoinCachedIndex> cachedGeoIndex_;
 
-    // The following two members (`Allocator` and `BlankNodeManager`) are only
+    // The following two members (`Allocator` and `LocalVocabContext`) are only
     // used when reading a `Value` from a serializer.
     using Allocator = ad_utility::AllocatorWithLimit<Id>;
     std::optional<Allocator> allocatorForSerialization_{std::nullopt};
-    boost::optional<ad_utility::BlankNodeManager&>
-        blankNodeManagerForSerialization_{boost::none};
+    const LocalVocabContext* contextForSerialization_{nullptr};
   };
 
   // The size of a cached result, which currently is just a dummy value of 1,
@@ -111,8 +116,8 @@ class NamedResultCache {
       requires ad_utility::serialization::ReadSerializer<
           Serializer>) void readFromSerializer(Serializer& serializer,
                                                Value::Allocator allocator,
-                                               ad_utility::BlankNodeManager&
-                                                   blankNodeManager);
+                                               const LocalVocabContext&
+                                                   context);
 };
 
 #endif  // QLEVER_SRC_ENGINE_NAMEDRESULTCACHE_H

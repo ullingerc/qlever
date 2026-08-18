@@ -46,6 +46,11 @@ class NaryExpressionStronglyTyped : public SparqlExpression {
   [[nodiscard]] std::string getCacheKey(
       const VariableToColumnMap& varColMap) const override;
 
+  // Deterministic iff all children are deterministic.
+  [[nodiscard]] bool isDeterministic() const override {
+    return areChildrenDeterministic();
+  }
+
  private:
   // _________________________________________________________________________
   ql::span<SparqlExpression::Ptr> childrenImpl() override;
@@ -81,10 +86,14 @@ class NaryExpressionStronglyTyped : public SparqlExpression {
                                             AD_FWD(operands)...);
 
       // Compute the result.
-      using ResultType = ql::ranges::range_value_t<decltype(resultGenerator)>;
+      using ResultType = PromoteToLocalVocabEntry<
+          ql::ranges::range_value_t<decltype(resultGenerator)>>;
       VectorWithMemoryLimit<ResultType> result{context->_allocator};
       result.reserve(targetSize);
-      ql::ranges::move(resultGenerator, std::back_inserter(result));
+      for (auto&& element : resultGenerator) {
+        result.push_back(promoteToLocalVocabEntry(
+            std::move(element), context->getLocalVocabContext()));
+      }
 
       if constexpr (resultIsConstant) {
         AD_CORRECTNESS_CHECK(result.size() == 1);
@@ -209,6 +218,11 @@ class NaryExpressionTypeErasedImpl : public SparqlExpression {
     return key;
   }
 
+  // Deterministic iff all children are deterministic.
+  [[nodiscard]] bool isDeterministic() const override {
+    return areChildrenDeterministic();
+  }
+
  private:
   // _________________________________________________________________________
   ql::span<SparqlExpression::Ptr> childrenImpl() override { return children_; }
@@ -230,22 +244,25 @@ class NaryExpressionTypeErasedImpl : public SparqlExpression {
     // respective child result.
     auto zipper = std::apply(
         [&](const auto&... getters) {
-          return ::ranges::views::zip(ad_utility::OwningView{
-              getters(std::move(operands), context, targetSize)}...);
+          return ::ranges::views::zip(
+              getters(std::move(operands), context, targetSize)...);
         },
         getters_);
 
     // Apply the `function_` on a tuple of arguments (the `zipper` above has
     // tuples as value and reference type).
     auto onTuple = [&](auto&& tuple) {
-      return std::apply(
-          [this](auto&&... args) { return function_(AD_FWD(args)...); },
-          AD_FWD(tuple));
+      return promoteToLocalVocabEntry(
+          std::apply(
+              [this](auto&&... args) { return function_(AD_FWD(args)...); },
+              AD_FWD(tuple)),
+          context->getLocalVocabContext());
     };
     auto resultGenerator =
         ql::views::transform(ql::ranges::ref_view(zipper), onTuple);
     // Compute the result.
-    VectorWithMemoryLimit<std::decay_t<Ret>> result{context->_allocator};
+    VectorWithMemoryLimit<PromoteToLocalVocabEntry<std::decay_t<Ret>>> result{
+        context->_allocator};
     result.reserve(targetSize);
     ql::ranges::move(resultGenerator, std::back_inserter(result));
 
@@ -273,7 +290,11 @@ struct TypeErasedNaryHelper;
 
 template <typename Func, typename... VGs>
 struct TypeErasedNaryHelper<Func, std::tuple<VGs...>> {
-  using Res = std::invoke_result_t<Func, typename VGs::Value...>;
+  // `std::decay_t` ensures a value type, not a reference. Without this,
+  // expressions that use `ql:identity` as their functor, because the
+  // `ValueGetter`s do all the work would lead to dangling stack references.
+  // The strongly-typed path handles the same issue in `applyFunction`.
+  using Res = std::decay_t<std::invoke_result_t<Func, typename VGs::Value...>>;
   using BaseType = NaryExpressionTypeErasedImpl<Res, typename VGs::Value...>;
   static auto makeGetters() {
     return typename BaseType::Getters{TypeErasedValueGetter<VGs>{}...};
@@ -300,7 +321,7 @@ class NaryExpressionTypeErased<
   using Helper =
       TypeErasedNaryHelper<Function,
                            ValueGetterPack<N, std::tuple<ValueGetters...>>>;
-  using Base = Helper::BaseType;
+  using Base = typename Helper::BaseType;
   using Children = std::array<SparqlExpression::Ptr, N>;
 
  public:
@@ -333,7 +354,7 @@ using NaryExpression = NaryExpressionStronglyTyped<Args...>;
   class Name : public NaryExpression<detail::Operation<N, X, __VA_ARGS__>> { \
     using Base = NaryExpression<Operation<N, X, __VA_ARGS__>>;               \
     using Base::Base;                                                        \
-  };
+  }
 
 // Takes a `Function` that returns a numeric value (integral or floating point)
 // and converts it to a function, that takes the same arguments and returns the

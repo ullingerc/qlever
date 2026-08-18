@@ -44,7 +44,7 @@ StripColumns::StripColumns(QueryExecutionContext* ctx,
     : Operation{ctx},
       child_{std::move(child)},
       subset_{std::move(subset)},
-      varToCol_{std::move(varToCol)} {};
+      varToCol_{std::move(varToCol)} {}
 
 // _____________________________________________________________________________
 std::vector<QueryExecutionTree*> StripColumns::getChildren() {
@@ -90,7 +90,7 @@ std::optional<std::shared_ptr<QueryExecutionTree>>
 StripColumns::makeTreeWithBindColumn(const parsedQuery::Bind& bind) const {
   // Push `bind` down to the child. If successful, create a new `StripColumns`
   // that also keeps the bound target variable.
-  auto newChild = child_->getRootOperation()->makeTreeWithBindColumn(bind);
+  auto newChild = QueryExecutionTree::makeTreeWithBindColumn(child_, bind);
   if (!newChild) {
     return std::nullopt;
   }
@@ -132,7 +132,7 @@ Result StripColumns::computeResult(bool requestLaziness) {
     // implement moving the tables from materialized results that are too big
     // for the cache or having a `shared_ptr<IdTable+SubsetView>` type in the
     // result.
-    auto table = res->idTable().asColumnSubsetView(subset_).clone();
+    auto table = res->idTableView().asColumnSubsetView(subset_).clone();
     return {std::move(table), resultSortedOn(), res->getSharedLocalVocab()};
   } else {
     return {Result::LazyResult{ad_utility::CachingTransformInputRange(

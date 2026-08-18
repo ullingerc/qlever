@@ -50,12 +50,15 @@ float NeutralOptional::getMultiplicity(size_t col) {
 bool NeutralOptional::knownEmptyResult() { return false; }
 
 // _____________________________________________________________________________
-bool NeutralOptional::supportsLimitOffset() const { return true; }
+LimitOffsetHandling NeutralOptional::handlesLimitOffset() const {
+  return LimitOffsetHandling::FULL;
+}
 
 // _____________________________________________________________________________
 void NeutralOptional::onLimitOffsetChanged(
-    const LimitOffsetClause& limitOffset) const {
-  tree_->applyLimit(limitOffset);
+    const LimitOffsetClause& limitOffset) {
+  tree_ = tree_->clone();
+  tree_->applyLimitOffset(limitOffset);
 }
 
 // _____________________________________________________________________________
@@ -119,13 +122,13 @@ Result NeutralOptional::computeResult(bool requestLaziness) {
   IdTable singleRowTable{getResultWidth(), allocator()};
   singleRowTable.push_back(std::vector(getResultWidth(), Id::makeUndefined()));
   if (childResult->isFullyMaterialized()) {
-    if (childResult->idTable().empty()) {
+    if (childResult->idTableView().empty()) {
       return {singleRowCroppedByLimit() ? IdTable{getResultWidth(), allocator()}
                                         : std::move(singleRowTable),
               resultSortedOn(),
               {}};
     }
-    return {childResult->idTable().clone(), childResult->sortedBy(),
+    return {childResult->cloneIdTable(), childResult->sortedBy(),
             childResult->getSharedLocalVocab()};
   }
   if (singleRowCroppedByLimit()) {
@@ -147,3 +150,11 @@ VariableToColumnMap NeutralOptional::computeVariableToColumnMap() const {
   }
   return variableColumns;
 }
+
+// Note: `NeutralOptional` does not override `makeTreeWithBindColumn`. When
+// `tree_` produces zero rows, `computeResult` fabricates a single all-`UNDEF`
+// row without evaluating any expression, so a `BIND` pushed into `tree_`
+// would silently lose its value (e.g. a constant `BIND` would become `UNDEF`)
+// instead of being evaluated on that fallback row like an un-pushed `BIND`
+// would be. There is no cheap way to tell whether `tree_` is guaranteed to be
+// non-empty, so the push down is disallowed entirely.

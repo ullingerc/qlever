@@ -26,6 +26,7 @@
 #include "engine/CountConnectedSubgraphs.h"
 #include "engine/Describe.h"
 #include "engine/Distinct.h"
+#include "engine/ExternalValues.h"
 #include "engine/Filter.h"
 #include "engine/GroupBy.h"
 #include "engine/HasPredicateScan.h"
@@ -42,6 +43,7 @@
 #include "engine/OrderBy.h"
 #include "engine/PathSearch.h"
 #include "engine/PermutationSelector.h"
+#include "engine/QueryExecutionContext.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/QueryRewriteUtils.h"
 #include "engine/Service.h"
@@ -67,6 +69,7 @@
 #include "parser/PayloadVariables.h"
 #include "parser/SparqlParserHelpers.h"
 #include "rdfTypes/Variable.h"
+#include "util/CompilerWarnings.h"
 #include "util/Exception.h"
 
 namespace p = parsedQuery;
@@ -220,12 +223,13 @@ std::vector<SubtreePlan> QueryPlanner::createExecutionTrees(ParsedQuery& pq,
 
   for (auto& plan : lastRow) {
     // For subqueries the limit has already been applied, for the root query the
-    // exporter will apply LIMIT and OFFSET if `supportsLimit()` is not natively
-    // supported by the `Operation`. Check the documentation of
-    // `ExportQueryExecutionTrees::compensateForLimitOffsetClause to see `how
-    // this is comphandled in the exporter.
-    if (plan._qet->getRootOperation()->supportsLimitOffset() && !isSubquery) {
-      plan._qet->applyLimit(pq._limitOffset);
+    // exporter will apply LIMIT and OFFSET if `handlesLimitOffset()` returns
+    // `NONE` for the `Operation`. Check the documentation of
+    // `ExportQueryExecutionTrees::compensateForLimitOffsetClause` to see how
+    // this is handled in the exporter.
+    if (plan._qet->handlesLimitOffset() != LimitOffsetHandling::NONE &&
+        !isSubquery) {
+      plan._qet->applyLimitOffset(pq._limitOffset);
     }
   }
 
@@ -337,7 +341,7 @@ std::vector<SubtreePlan> QueryPlanner::getDistinctRow(
       }
     }
     distinctPlan._qet =
-        makeExecutionTree<Distinct>(_qec, parent._qet, keepIndices);
+        QueryExecutionTree::createDistinctTree(parent._qet, keepIndices);
     added.push_back(distinctPlan);
   }
   return added;
@@ -473,7 +477,10 @@ std::vector<SubtreePlan> QueryPlanner::getOrderByRow(
         AD_CONTRACT_CHECK(!isDescending);
         sortColumns.push_back(index);
       }
-      tree = QueryExecutionTree::createSortedTree(parent._qet, sortColumns);
+      // An explicit `INTERNAL SORT BY` requests the complete sorted result, so
+      // we must not let the `Sort` propagate a `LIMIT`/`OFFSET` to its subtree.
+      tree =
+          QueryExecutionTree::createSortedTree(parent._qet, sortColumns, true);
     } else {
       AD_CONTRACT_CHECK(pq._isInternalSort == IsInternalSort::False);
       // Note: As the internal ordering is different from the semantic ordering
@@ -596,7 +603,7 @@ SparqlFilter createEqualFilter(const Variable& var1, const Variable& var2) {
   // The `filter` rule never adds blank nodes.
   AD_CORRECTNESS_CHECK(bn.numBlocksUsed() == 0u);
   return result;
-};
+}
 
 // Helper function for `handleRepeatedVariables` below. Replace a single
 // position of the `scanTriple`, denoted by the `rewritePosition` by a new
@@ -775,8 +782,8 @@ void QueryPlanner::seedFromOrdinaryTriple(
 // _____________________________________________________________________________
 auto QueryPlanner::seedWithScansAndText(
     const QueryPlanner::TripleGraph& tg,
-    const vector<vector<SubtreePlan>>& children, TextLimitMap& textLimits)
-    -> PlansAndFilters {
+    const vector<vector<SubtreePlan>>& children,
+    TextLimitMap& textLimits) -> PlansAndFilters {
   PlansAndFilters result;
   vector<SubtreePlan>& seeds = result.plans_;
   // add all child plans as seeds
@@ -839,10 +846,13 @@ auto QueryPlanner::seedWithScansAndText(
           "The query contains a predicate variable, but only the PSO "
           "and POS permutations were loaded. Rerun the server without "
           "the option --only-pso-and-pos-permutations and if "
-          "necessary also rebuild the index.");
+          "necessary also rebuild the index");
     }
 
-    // Backward compatibility with spatial search predicates
+    // Backward compatibility with spatial search predicates.
+    // GCC's `-Wdangling-reference` cannot trace through `std::visit` to see
+    // that the returned reference points into the variant, not the visitor.
+    DISABLE_DANGLING_REFERENCE_WARNINGS
     const auto& input = std::visit(
         ad_utility::OverloadCallOperator{
             [](const PropertyPath& propertyPath) -> const std::string& {
@@ -853,6 +863,7 @@ auto QueryPlanner::seedWithScansAndText(
               return var.name();
             }},
         node.triple_.p_);
+    GCC_REENABLE_WARNINGS
     if ((ql::starts_with(input, MAX_DIST_IN_METERS) ||
          ql::starts_with(input, NEAREST_NEIGHBORS)) &&
         ql::ends_with(input, '>')) {
@@ -866,7 +877,8 @@ auto QueryPlanner::seedWithScansAndText(
             "to confusing semantics. Please upgrade your query to the new "
             "syntax 'SERVICE ",
             SPATIAL_SEARCH_IRI,
-            " { ... }'. For more information, please see the QLever Wiki."));
+            " { ... }'. For more information, please see the QLever Docs "
+            "(https://docs.qlever.dev/geosparql/)."));
       }
       pushPlan(plan);
       continue;
@@ -1761,7 +1773,7 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
     }
   }
   return plans;
-};
+}
 
 // _____________________________________________________________________________
 std::vector<std::vector<SubtreePlan>> QueryPlanner::fillDpTab(
@@ -2194,7 +2206,7 @@ size_t QueryPlanner::findCheapestExecutionTree(
     }
   };
   return ql::ranges::min_element(lastRow, compare) - lastRow.begin();
-};
+}
 
 // _________________________________________________________________________________
 size_t QueryPlanner::findSmallestExecutionTree(
@@ -2434,10 +2446,9 @@ SubtreePlan cloneWithNewTree(const SubtreePlan& plan,
 }  // namespace
 
 // _____________________________________________________________________________________________________________________
-auto QueryPlanner::applyJoinDistributivelyToUnion(const SubtreePlan& a,
-                                                  const SubtreePlan& b,
-                                                  const JoinColumns& jcs) const
-    -> std::vector<SubtreePlan> {
+auto QueryPlanner::applyJoinDistributivelyToUnion(
+    const SubtreePlan& a, const SubtreePlan& b,
+    const JoinColumns& jcs) const -> std::vector<SubtreePlan> {
   AD_CORRECTNESS_CHECK(jcs.size() == 1);
   AD_CORRECTNESS_CHECK(a.type == SubtreePlan::BASIC &&
                        b.type == SubtreePlan::BASIC);
@@ -2457,6 +2468,21 @@ auto QueryPlanner::applyJoinDistributivelyToUnion(const SubtreePlan& a,
     // of memory and crash the system.
     if (!unionOperation ||
         std::dynamic_pointer_cast<Union>(other._qet->getRootOperation())) {
+      return;
+    }
+
+    // Don't distribute over a UNION if the other operand is non-deterministic
+    // (e.g. contains BIND(BNODE(...))). Cloning a non-deterministic tree would
+    // produce a copy with the same cache key but potentially different results.
+    if (!other._qet->getRootOperation()->isDeterministic()) {
+      return;
+    }
+
+    // Don't distribute over a UNION that has a LIMIT or OFFSET attached to it.
+    // Such a LIMIT/OFFSET applies to the union of both children and can neither
+    // be pushed into the individual children nor be applied to the result of
+    // the join, so the optimization is simply not applicable here.
+    if (!unionOperation->getLimitOffset().isUnconstrained()) {
       return;
     }
 
@@ -2546,10 +2572,9 @@ QueryPlanner::getJoinColumnsForTransitivePath(const JoinColumns& jcs,
 }
 
 // __________________________________________________________________________________________________________________
-auto QueryPlanner::createJoinWithTransitivePath(const SubtreePlan& a,
-                                                const SubtreePlan& b,
-                                                const JoinColumns& jcs)
-    -> std::optional<SubtreePlan> {
+auto QueryPlanner::createJoinWithTransitivePath(
+    const SubtreePlan& a, const SubtreePlan& b,
+    const JoinColumns& jcs) -> std::optional<SubtreePlan> {
 #ifdef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
   (void)a;
   (void)b;
@@ -2606,8 +2631,7 @@ auto QueryPlanner::createMaterializedViewJoinReplacements(
   // Check if the user allows query rewriting.
   // TODO<ullingerc> Do we want to forcefully disable query rewriting if delta
   // triples are present in the current index to prevent diverging results?
-  if (!getRuntimeParameter<
-          &RuntimeParameters::enableMaterializedViewQueryRewrite_>()) {
+  if (_qec->disableMaterializedViewRewriting()) {
     return plans;
   }
 
@@ -2638,10 +2662,9 @@ auto QueryPlanner::createMaterializedViewJoinReplacements(
 }
 
 // ______________________________________________________________________________________
-auto QueryPlanner::createJoinWithHasPredicateScan(const SubtreePlan& a,
-                                                  const SubtreePlan& b,
-                                                  const JoinColumns& jcs)
-    -> std::optional<SubtreePlan> {
+auto QueryPlanner::createJoinWithHasPredicateScan(
+    const SubtreePlan& a, const SubtreePlan& b,
+    const JoinColumns& jcs) -> std::optional<SubtreePlan> {
   // Check if one of the two operations is a HAS_PREDICATE_SCAN.
   // If the join column corresponds to the has-predicate scan's
   // subject column we can use a specialized join that avoids
@@ -2677,10 +2700,9 @@ auto QueryPlanner::createJoinWithHasPredicateScan(const SubtreePlan& a,
 }
 
 // _____________________________________________________________________
-auto QueryPlanner::createJoinWithPathSearch(const SubtreePlan& a,
-                                            const SubtreePlan& b,
-                                            const JoinColumns& jcs)
-    -> std::optional<SubtreePlan> {
+auto QueryPlanner::createJoinWithPathSearch(
+    const SubtreePlan& a, const SubtreePlan& b,
+    const JoinColumns& jcs) -> std::optional<SubtreePlan> {
   auto aRootOp =
       std::dynamic_pointer_cast<PathSearch>(a._qet->getRootOperation());
   auto bRootOp =
@@ -3134,6 +3156,8 @@ void QueryPlanner::GraphPatternPlanner::graphPatternOperationVisitor(Arg& arg) {
     visitSpatialSearch(arg);
   } else if constexpr (std::is_same_v<T, p::TextSearchQuery>) {
     visitTextSearch(arg);
+  } else if constexpr (std::is_same_v<T, p::ExternalValuesQuery>) {
+    visitExternalValues(arg);
   } else if constexpr (std::is_same_v<T, p::NamedCachedResult>) {
     visitNamedCachedResult(arg);
   } else if constexpr (std::is_same_v<T, p::MaterializedViewQuery>) {
@@ -3142,7 +3166,7 @@ void QueryPlanner::GraphPatternPlanner::graphPatternOperationVisitor(Arg& arg) {
     static_assert(std::is_same_v<T, p::BasicGraphPattern>);
     visitBasicGraphPattern(arg);
   }
-};
+}
 
 // _______________________________________________________________
 void QueryPlanner::GraphPatternPlanner::visitBasicGraphPattern(
@@ -3192,7 +3216,7 @@ void QueryPlanner::GraphPatternPlanner::visitBind(const parsedQuery::Bind& v) {
             &RuntimeParameters::enableMaterializedViewQueryRewrite_>()) {
       // Consider pushing down the `BIND` into the subtree.
       auto pushedDownPlan =
-          a._qet->getRootOperation()->makeTreeWithBindColumn(v);
+          QueryExecutionTree::makeTreeWithBindColumn(a._qet, v);
       if (pushedDownPlan.has_value()) {
         // We can replace this `BIND` with a plan that contains an additional
         // scan column with equivalent values, for example from a materialized
@@ -3257,10 +3281,7 @@ void QueryPlanner::GraphPatternPlanner::visitTransitivePath(
 // _______________________________________________________________
 void QueryPlanner::GraphPatternPlanner::visitPathSearch(
     parsedQuery::PathQuery& pathQuery) {
-  const auto& index = planner_._qec->getIndex();
-  const auto& vocab = index.getVocab();
-  auto config =
-      pathQuery.toPathSearchConfiguration(vocab, index.encodedIriManager());
+  auto config = pathQuery.toPathSearchConfiguration(planner_._qec->getIndex());
 
   // The path search requires a child graph pattern
   AD_CORRECTNESS_CHECK(pathQuery.childGraphPattern_.has_value());
@@ -3354,6 +3375,15 @@ void QueryPlanner::GraphPatternPlanner::visitTextSearch(
   }
 }
 
+// _______________________________________________________________
+void QueryPlanner::GraphPatternPlanner::visitExternalValues(
+    const parsedQuery::ExternalValuesQuery& externalValuesQuery) {
+  auto externalValues =
+      std::make_shared<ExternalValues>(qec_, externalValuesQuery);
+  auto candidate = makeSubtreePlan<ExternalValues>(std::move(externalValues));
+  visitGroupOptionalOrMinus(std::vector{std::move(candidate)});
+}
+
 // _____________________________________________________________________________
 void QueryPlanner::GraphPatternPlanner::visitNamedCachedResult(
     const parsedQuery::NamedCachedResult& arg) {
@@ -3418,7 +3448,7 @@ void QueryPlanner::GraphPatternPlanner::visitSubquery(
   ql::ranges::for_each(candidatesForSubquery, setSelectedVariables);
   // A subquery must also respect LIMIT and OFFSET clauses
   ql::ranges::for_each(candidatesForSubquery, [&](SubtreePlan& plan) {
-    plan._qet->applyLimit(arg.get()._limitOffset);
+    plan._qet->applyLimitOffset(arg.get()._limitOffset);
   });
   visitGroupOptionalOrMinus(std::move(candidatesForSubquery));
 }

@@ -680,6 +680,7 @@ class QueryPlanner {
     void visitPathSearch(parsedQuery::PathQuery& config);
     void visitSpatialSearch(parsedQuery::SpatialQuery& config);
     void visitTextSearch(const parsedQuery::TextSearchQuery& config);
+    void visitExternalValues(const parsedQuery::ExternalValuesQuery& config);
     void visitNamedCachedResult(const parsedQuery::NamedCachedResult& config);
     void visitMaterializedViewQuery(
         const parsedQuery::MaterializedViewQuery& viewQuery);
@@ -716,7 +717,7 @@ class QueryPlanner {
       auto v = planner_.optimize(pattern);
       auto idx = planner_.findCheapestExecutionTree(v);
       return std::move(v[idx]);
-    };
+    }
   };
 
   /**
