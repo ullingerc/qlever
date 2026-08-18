@@ -13,11 +13,15 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <string_view>
+#include <utility>
 #include <variant>
 
 #include "engine/SpatialJoinType.h"
 #include "parser/PayloadVariables.h"
 #include "rdfTypes/Variable.h"
+#include "util/EnumWithStrings.h"
+#include "util/Exception.h"
 
 // This header contains enums and configuration structs for the spatial join
 // operation. It allows including these types without also including the whole
@@ -28,7 +32,8 @@
 // https://en.wikipedia.org/wiki/DE-9IM). Stored without a null terminator.
 using De9imFilterString = std::array<char, 9>;
 
-// Parsing and validation of `De9imFilterString`s, see `parser/SpatialQuery.h`.
+// Parsing and validation of `De9imFilterString`s, see
+// `rdfTypes/GeoSparqlHelpers.h`.
 
 // A nearest neighbor search with optionally a maximum distance.
 struct NearestNeighborsConfig {
@@ -46,22 +51,84 @@ struct MaxDistanceConfig {
 // DE-9IM filter pattern only for the `DE9IM` join type.
 struct LibSpatialJoinConfig {
   SpatialJoinType joinType_;
-  std::optional<double> maxDist_ = std::nullopt;
-  std::optional<De9imFilterString> de9imFilter_ = std::nullopt;
+  std::optional<double> maxDist_;
+  std::optional<De9imFilterString> de9imFilter_;
+
+  // For join types other than `WITHIN_DIST`/`DE9IM`, where neither
+  // `maxDist_` nor `de9imFilter_` apply.
+  explicit LibSpatialJoinConfig(SpatialJoinType joinType)
+      : LibSpatialJoinConfig(joinType, std::nullopt, std::nullopt) {}
+
+  // The constructor checks that `maxDist_` and `de9imFilter_` are only set
+  // together with their respective matching `joinType_`, because these
+  // fields are not independent of each other.
+  LibSpatialJoinConfig(SpatialJoinType joinType, std::optional<double> maxDist,
+                       std::optional<De9imFilterString> de9imFilter)
+      : joinType_{joinType}, maxDist_{maxDist}, de9imFilter_{de9imFilter} {
+    AD_CORRECTNESS_CHECK(!maxDist_.has_value() ||
+                         joinType_ == SpatialJoinType::WITHIN_DIST);
+    AD_CORRECTNESS_CHECK(!de9imFilter_.has_value() ||
+                         joinType_ == SpatialJoinType::DE9IM);
+  }
 };
 
 // Configuration to restrict the results provided by the SpatialJoin
 using SpatialJoinTask = std::variant<NearestNeighborsConfig, MaxDistanceConfig,
                                      LibSpatialJoinConfig>;
 
-// Selection of a SpatialJoin algorithm
-enum class SpatialJoinAlgorithm {
+// Selection of a SpatialJoin algorithm. When adding an algorithm here, also
+// add its name to the `descriptions_` of `SpatialJoinAlgorithm` below.
+enum class SpatialJoinAlgorithmEnum {
   BASELINE,
   S2_GEOMETRY,
   BOUNDING_BOX,
   LIBSPATIALJOIN,
   S2_POINT_POLYLINE
 };
+
+// Wrapper around `SpatialJoinAlgorithmEnum` that provides conversion to and
+// from the string representation used in the SPARQL syntax (the value of the
+// `<algorithm>` parameter) and in error messages, see `SpatialQuery.cpp`.
+class SpatialJoinAlgorithm
+    : public ad_utility::EnumWithStrings<SpatialJoinAlgorithm,
+                                         SpatialJoinAlgorithmEnum> {
+ public:
+  using Enum = SpatialJoinAlgorithmEnum;
+
+  static constexpr std::array<std::pair<Enum, std::string_view>, 5>
+      descriptions_{{{Enum::BASELINE, "baseline"},
+                     {Enum::S2_GEOMETRY, "s2"},
+                     {Enum::BOUNDING_BOX, "boundingBox"},
+                     {Enum::LIBSPATIALJOIN, "libspatialjoin"},
+                     {Enum::S2_POINT_POLYLINE, "experimentalPointPolyline"}}};
+  static const SpatialJoinAlgorithm BASELINE;
+  static const SpatialJoinAlgorithm S2_GEOMETRY;
+  static const SpatialJoinAlgorithm BOUNDING_BOX;
+  static const SpatialJoinAlgorithm LIBSPATIALJOIN;
+  static const SpatialJoinAlgorithm S2_POINT_POLYLINE;
+
+  static constexpr std::string_view typeName() {
+    return "spatial join algorithm";
+  }
+
+  using EnumWithStrings::EnumWithStrings;
+};
+
+const inline SpatialJoinAlgorithm SpatialJoinAlgorithm::BASELINE{
+    Enum::BASELINE};
+const inline SpatialJoinAlgorithm SpatialJoinAlgorithm::S2_GEOMETRY{
+    Enum::S2_GEOMETRY};
+const inline SpatialJoinAlgorithm SpatialJoinAlgorithm::BOUNDING_BOX{
+    Enum::BOUNDING_BOX};
+const inline SpatialJoinAlgorithm SpatialJoinAlgorithm::LIBSPATIALJOIN{
+    Enum::LIBSPATIALJOIN};
+const inline SpatialJoinAlgorithm SpatialJoinAlgorithm::S2_POINT_POLYLINE{
+    Enum::S2_POINT_POLYLINE};
+
+// Default algorithm used where an explicit choice is not required: the
+// deprecated magic-predicate spatial search syntax (which has no way to
+// specify an algorithm) and internal/test construction of a
+// `SpatialJoinConfiguration` that doesn't care about the algorithm.
 const SpatialJoinAlgorithm SPATIAL_JOIN_DEFAULT_ALGORITHM =
     SpatialJoinAlgorithm::S2_GEOMETRY;
 

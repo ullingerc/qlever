@@ -14,6 +14,7 @@
 #include "parser/MagicServiceQuery.h"
 #include "parser/PayloadVariables.h"
 #include "parser/SpatialQuery.h"
+#include "rdfTypes/GeoSparqlHelpers.h"
 #include "util/TripleComponentTestHelpers.h"
 
 namespace h = queryPlannerTestHelpers;
@@ -42,18 +43,6 @@ TEST(QueryPlanner, SpatialJoinService) {
       "SERVICE spatialSearch: {"
       "_:config spatialSearch:algorithm spatialSearch:s2 ;"
       "spatialSearch:left ?y ;"
-      "spatialSearch:right ?b ;"
-      "spatialSearch:maxDistance 1 . "
-      "{ ?a <p> ?b } }}",
-      h::spatialJoin(1, -1, V{"?y"}, V{"?b"}, std::nullopt, emptyPayload, S2,
-                     std::nullopt, std::nullopt, scan("?x", "<p>", "?y"),
-                     scan("?a", "<p>", "?b")));
-  h::expect(
-      "PREFIX spatialSearch: <https://qlever.cs.uni-freiburg.de/spatialSearch/>"
-      "SELECT * WHERE {"
-      "?x <p> ?y."
-      "SERVICE spatialSearch: {"
-      "_:config spatialSearch:left ?y ;"
       "spatialSearch:right ?b ;"
       "spatialSearch:maxDistance 1 . "
       "{ ?a <p> ?b } }}",
@@ -596,7 +585,8 @@ TEST(QueryPlanner, SpatialJoinMissingConfig) {
                 "SELECT * WHERE {"
                 "?x <p> ?y ."
                 "SERVICE spatialSearch: {"
-                "_:config spatialSearch:right ?b ;"
+                "_:config spatialSearch:algorithm spatialSearch:s2 ;"
+                "spatialSearch:right ?b ;"
                 "spatialSearch:maxDistance 5 . "
                 " { ?a <p> ?b . }"
                 "}}",
@@ -608,7 +598,8 @@ TEST(QueryPlanner, SpatialJoinMissingConfig) {
                 "SELECT * WHERE {"
                 "?x <p> ?y ."
                 "SERVICE spatialSearch: {"
-                "_:config spatialSearch:right ?b ;"
+                "_:config spatialSearch:algorithm spatialSearch:s2 ;"
+                "spatialSearch:right ?b ;"
                 "spatialSearch:numNearestNeighbors 5 . "
                 " { ?a <p> ?b . }"
                 "}}",
@@ -620,7 +611,8 @@ TEST(QueryPlanner, SpatialJoinMissingConfig) {
                 "SELECT * WHERE {"
                 "?x <p> ?y ."
                 "SERVICE spatialSearch: {"
-                "_:config spatialSearch:left ?y ;"
+                "_:config spatialSearch:algorithm spatialSearch:s2 ;"
+                "spatialSearch:left ?y ;"
                 "spatialSearch:maxDistance 5 . "
                 " { ?a <p> ?b . }"
                 "}}",
@@ -632,7 +624,8 @@ TEST(QueryPlanner, SpatialJoinMissingConfig) {
                 "SELECT * WHERE {"
                 "?x <p> ?y ."
                 "SERVICE spatialSearch: {"
-                "_:config spatialSearch:left ?y ;"
+                "_:config spatialSearch:algorithm spatialSearch:s2 ;"
+                "spatialSearch:left ?y ;"
                 "spatialSearch:numNearestNeighbors 5 . "
                 " { ?a <p> ?b . }"
                 "}}",
@@ -644,13 +637,28 @@ TEST(QueryPlanner, SpatialJoinMissingConfig) {
                 "SELECT * WHERE {"
                 "?x <p> ?y ."
                 "SERVICE spatialSearch: {"
-                "_:config spatialSearch:left ?y ;"
+                "_:config spatialSearch:algorithm spatialSearch:s2 ;"
+                "spatialSearch:left ?y ;"
                 " spatialSearch:right ?b ."
                 " { ?a <p> ?b . }"
                 "}}",
                 ::testing::_),
       ::testing::ContainsRegex("Neither `<numNearestNeighbors>` nor "
                                "`<maxDistance>` were provided"));
+  // The `<algorithm>` parameter is mandatory and must be set explicitly.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      h::expect("PREFIX spatialSearch: "
+                "<https://qlever.cs.uni-freiburg.de/spatialSearch/>"
+                "SELECT * WHERE {"
+                "?x <p> ?y ."
+                "SERVICE spatialSearch: {"
+                "_:config spatialSearch:left ?y ;"
+                "spatialSearch:right ?b ;"
+                "spatialSearch:maxDistance 5 . "
+                " { ?a <p> ?b . }"
+                "}}",
+                ::testing::_),
+      ::testing::ContainsRegex("Missing parameter `<algorithm>`"));
 }
 
 // _____________________________________________________________________________
@@ -1065,7 +1073,7 @@ TEST(QueryPlanner, SpatialJoinS2PointPolylineAndCachedIndex) {
   using V = Variable;
   using PV = PayloadVariables;
   auto scan = h::IndexScanFromStrings;
-  using enum SpatialJoinAlgorithm;
+  using enum SpatialJoinAlgorithm::Enum;
 
   std::string kb =
       "<s> <p> \"LINESTRING(1.5 2.5, 1.55 2.5)\""
@@ -1490,6 +1498,20 @@ TEST(QueryPlanner, FilterIsNotRewritten) {
       h::Filter("geof:sfContains(\"POINT(50.0 50.0)\""
                 "^^<http://www.opengis.net/ont/geosparql#wktLiteral>, ?b)",
                 scan("?a", "<p>", "?b")));
+
+  // `geof:relate` requires a fixed string literal as its third argument: if
+  // it is a variable instead, the filter is not rewritten into a spatial
+  // join.
+  h::expect(
+      "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+      "SELECT * WHERE {"
+      "?a <p> ?b ."
+      "?x <p> ?y ."
+      "FILTER(geof:relate(?y, ?b, ?a))"
+      " }",
+      h::Filter("geof:relate(?y, ?b, ?a)",
+                h::CartesianProductJoin(scan("?x", "<p>", "?y"),
+                                        scan("?a", "<p>", "?b"))));
 }
 
 // _____________________________________________________________________________
@@ -1611,6 +1633,35 @@ TEST(QueryPlanner, SpatialJoinFromGeofRelationFilter) {
                 "SELECT * WHERE {"
                 "?a <p> ?b ."
                 "FILTER geof:sfContains(?b, ?b) . }",
+                ::testing::_),
+      ::testing::HasSubstr("Variable ?b on both sides"));
+}
+
+// _____________________________________________________________________________
+TEST(QueryPlanner, SpatialJoinFromGeofRelateFilter) {
+  auto scan = h::IndexScanFromStrings;
+  using V = Variable;
+  auto algo = SpatialJoinAlgorithm::LIBSPATIALJOIN;
+  using enum SpatialJoinType::Enum;
+
+  std::string query =
+      "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+      "SELECT * WHERE {"
+      "?a <p> ?b ."
+      "?x <p> ?y ."
+      "FILTER(geof:relate(?y, ?b, \"T*T***T**\"))  }";
+  h::expect(query,
+            h::spatialJoinFilterSubstitute(
+                -1, -1, V{"?y"}, V{"?b"}, std::nullopt, PayloadVariables::all(),
+                algo, DE9IM, parseDe9imFilterString("T*T***T**"),
+                scan("?x", "<p>", "?y"), scan("?a", "<p>", "?b")));
+
+  // Geo relate filter with the same variable twice is not allowed
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      h::expect("PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+                "SELECT * WHERE {"
+                "?a <p> ?b ."
+                "FILTER geof:relate(?b, ?b, \"T*T***T**\") . }",
                 ::testing::_),
       ::testing::HasSubstr("Variable ?b on both sides"));
 }

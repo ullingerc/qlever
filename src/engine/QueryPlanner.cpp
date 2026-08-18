@@ -341,7 +341,7 @@ std::vector<SubtreePlan> QueryPlanner::getDistinctRow(
       }
     }
     distinctPlan._qet =
-        makeExecutionTree<Distinct>(_qec, parent._qet, keepIndices);
+        QueryExecutionTree::createDistinctTree(parent._qet, keepIndices);
     added.push_back(distinctPlan);
   }
   return added;
@@ -877,7 +877,8 @@ auto QueryPlanner::seedWithScansAndText(
             "to confusing semantics. Please upgrade your query to the new "
             "syntax 'SERVICE ",
             SPATIAL_SEARCH_IRI,
-            " { ... }'. For more information, please see the QLever Wiki."));
+            " { ... }'. For more information, please see the QLever Docs "
+            "(https://docs.qlever.dev/geosparql/)."));
       }
       pushPlan(plan);
       continue;
@@ -2474,6 +2475,14 @@ auto QueryPlanner::applyJoinDistributivelyToUnion(
     // (e.g. contains BIND(BNODE(...))). Cloning a non-deterministic tree would
     // produce a copy with the same cache key but potentially different results.
     if (!other._qet->getRootOperation()->isDeterministic()) {
+      return;
+    }
+
+    // Don't distribute over a UNION that has a LIMIT or OFFSET attached to it.
+    // Such a LIMIT/OFFSET applies to the union of both children and can neither
+    // be pushed into the individual children nor be applied to the result of
+    // the join, so the optimization is simply not applicable here.
+    if (!unionOperation->getLimitOffset().isUnconstrained()) {
       return;
     }
 
