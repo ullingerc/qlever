@@ -40,6 +40,17 @@ ResolvedGeoOperand resolveGeoOperand(
 
 }  // namespace
 
+// Result of `getSpatialJoinConfigForFilter`: the `LibSpatialJoinConfig`, the
+// joined-on operands, and -- only for a distance filter whose value came from
+// a `BIND` (see `GeoDistanceFilterResult::distanceVariable_`) -- the variable
+// and unit the distance should be exported to.
+struct SpatialJoinConfigForFilter {
+  LibSpatialJoinConfig config_;
+  sparqlExpression::GeoFunctionCall call_;
+  std::optional<Variable> distanceVariable_ = std::nullopt;
+  std::optional<UnitOfMeasurement> distanceUnit_ = std::nullopt;
+};
+
 // Try the three supported filter patterns in turn and directly build the
 // resulting `LibSpatialJoinConfig` together with the joined variables. Kept
 // as a separate function (as opposed to three loose `optional`s in the
@@ -47,28 +58,32 @@ ResolvedGeoOperand resolveGeoOperand(
 // maximum distance, and DE-9IM filter pattern -- which depend on each other
 // -- can only leave this function bundled together in a single consistent
 // `LibSpatialJoinConfig`.
-static std::optional<
-    std::pair<LibSpatialJoinConfig, sparqlExpression::GeoFunctionCall>>
-getSpatialJoinConfigForFilter(
-    const sparqlExpression::SparqlExpression& filterBody) {
+static std::optional<SpatialJoinConfigForFilter> getSpatialJoinConfigForFilter(
+    const sparqlExpression::SparqlExpression& filterBody,
+    const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+        boundDistanceVars) {
   // The filter body directly is an optimizable `geof:sf...` function.
   if (auto call = getGeoFunctionExpressionParameters(filterBody)) {
-    return std::pair{LibSpatialJoinConfig{call.value().function_},
-                     std::move(call).value()};
+    LibSpatialJoinConfig config{call.value().function_};
+    return SpatialJoinConfigForFilter{std::move(config),
+                                      std::move(call).value()};
   }
   // The filter body is a `geof:relate` call with an explicit DE-9IM filter
   // pattern.
   if (auto call = getDe9imRelationExpressionParameters(filterBody)) {
     LibSpatialJoinConfig config{call.value().function_, std::nullopt,
                                 call.value().pattern_};
-    return std::pair{std::move(config), std::move(call).value()};
+    return SpatialJoinConfigForFilter{std::move(config),
+                                      std::move(call).value()};
   }
   // The filter body is a maximum distance spatial search (direct body of
-  // filter is a comparison).
-  if (auto call = getGeoDistanceFilter(filterBody)) {
-    LibSpatialJoinConfig config{call.value().first.function_,
-                                call.value().second, std::nullopt};
-    return std::pair{std::move(config), std::move(call).value().first};
+  // filter is a comparison, or a variable `BIND`ed to one).
+  if (auto call = getGeoDistanceFilter(filterBody, boundDistanceVars)) {
+    LibSpatialJoinConfig config{call.value().call_.function_,
+                                call.value().maxDistMeters_, std::nullopt};
+    return SpatialJoinConfigForFilter{
+        std::move(config), std::move(call.value().call_),
+        std::move(call.value().distanceVariable_), call.value().call_.unit_};
   }
   return std::nullopt;
 }
@@ -76,15 +91,19 @@ getSpatialJoinConfigForFilter(
 // _____________________________________________________________________________
 std::optional<SpatialJoinRewriteResult> rewriteFilterToSpatialJoinConfig(
     const SparqlFilter& filter, QueryExecutionContext* qec,
-    const std::function<Variable()>& generateUniqueVarName) {
+    const std::function<Variable()>& generateUniqueVarName,
+    const ad_utility::HashMap<Variable, sparqlExpression::GeoDistanceCall>&
+        boundDistanceVars) {
   const auto& filterBody = *filter.expression_.getPimpl();
 
   // Currently, we can only optimize GeoSPARQL filters.
-  auto configAndCall = getSpatialJoinConfigForFilter(filterBody);
-  if (!configAndCall.has_value()) {
+  auto configForFilter =
+      getSpatialJoinConfigForFilter(filterBody, boundDistanceVars);
+  if (!configForFilter.has_value()) {
     return std::nullopt;
   }
-  auto& [config, call] = configAndCall.value();
+  auto& [config, call, distanceVariable, distanceUnit] =
+      configForFilter.value();
 
   // If neither side is a variable, there is nothing to join on. Leave this
   // (rare, degenerate) case to ordinary `FILTER` evaluation.
@@ -110,7 +129,8 @@ std::optional<SpatialJoinRewriteResult> rewriteFilterToSpatialJoinConfig(
   return SpatialJoinRewriteResult{
       SpatialJoinConfiguration{
           std::move(config), std::move(left.variable_),
-          std::move(right.variable_), std::nullopt, PayloadVariables::all(),
+          std::move(right.variable_), std::move(distanceVariable),
+          std::move(distanceUnit), PayloadVariables::all(),
           SpatialJoinAlgorithm::LIBSPATIALJOIN, joinType, std::nullopt},
       std::move(left.child_), std::move(right.child_)};
 }

@@ -1699,6 +1699,61 @@ TEST(QueryPlanner, SpatialJoinFromFilterWithFixedValue) {
 }
 
 // _____________________________________________________________________________
+TEST(QueryPlanner, SpatialJoinFromBindAndFilter) {
+  auto scan = h::IndexScanFromStrings;
+  auto algo = SpatialJoinAlgorithm::LIBSPATIALJOIN;
+  using enum SpatialJoinType::Enum;
+
+  // `BIND(geof:distance(?y, ?b) AS ?dist) FILTER(?dist <= 0.5)` is recognized
+  // exactly like `FILTER(geof:distance(?y, ?b) <= 0.5)` directly, except that
+  // the distance is additionally exported to `?dist` (via `distanceVariable_`
+  // -- the 5th argument below) instead of being recomputed by a separate,
+  // now-redundant `BIND`. With two triples per side there is a cartesian
+  // product for the substitute to avoid, so it reliably wins on cost and no
+  // `AnyOf` is needed, unlike the single-triple cases above.
+  h::expect(
+      "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+      "SELECT * WHERE {"
+      "?a <p> ?b ."
+      "?x <p> ?y ."
+      "BIND(geof:distance(?y, ?b) AS ?dist)"
+      "FILTER(?dist <= 0.5)"
+      " }",
+      h::spatialJoinFilterSubstitute(
+          500, -1, Var{"?y"}, Var{"?b"}, Var{"?dist"}, PayloadVariables::all(),
+          algo, WITHIN_DIST, std::nullopt, scan("?x", "<p>", "?y"),
+          scan("?a", "<p>", "?b")));
+
+  // Same, but with `geof:metricDistance`, whose native unit is meters (no
+  // conversion factor), and a differently named target variable.
+  h::expect(
+      "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+      "SELECT * WHERE {"
+      "?a <p> ?b ."
+      "?x <p> ?y ."
+      "BIND(geof:metricDistance(?y, ?b) AS ?dist2)"
+      "FILTER(?dist2 <= 500)"
+      " }",
+      h::spatialJoinFilterSubstitute(
+          500, -1, Var{"?y"}, Var{"?b"}, Var{"?dist2"}, PayloadVariables::all(),
+          algo, WITHIN_DIST, std::nullopt, scan("?x", "<p>", "?y"),
+          scan("?a", "<p>", "?b")));
+
+  // If `?dist` is compared with `<` rather than `<=`, this is not recognized
+  // (matching the direct-filter case, which also only supports `<=`; see
+  // `getGeoDistanceFilter`), so no `SpatialJoin` substitute is used.
+  h::expect(
+      "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+      "SELECT * WHERE {"
+      "?a <p> ?b ."
+      "?x <p> ?y ."
+      "BIND(geof:distance(?y, ?b) AS ?dist)"
+      "FILTER(?dist < 0.5)"
+      " }",
+      ::testing::Not(h::RootOperation<::SpatialJoin>(::testing::_)));
+}
+
+// _____________________________________________________________________________
 TEST(QueryPlanner, SpatialJoinFromGeofRelateFilter) {
   auto scan = h::IndexScanFromStrings;
   using V = Variable;

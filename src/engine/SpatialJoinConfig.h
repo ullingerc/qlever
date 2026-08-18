@@ -22,6 +22,7 @@
 #include "rdfTypes/Variable.h"
 #include "util/EnumWithStrings.h"
 #include "util/Exception.h"
+#include "util/UnitOfMeasurement.h"
 
 // This header contains enums and configuration structs for the spatial join
 // operation. It allows including these types without also including the whole
@@ -144,6 +145,11 @@ struct SpatialJoinConfiguration {
   // If given, the distance will be added to the result and be bound to this
   // variable.
   std::optional<Variable> distanceVariable_ = std::nullopt;
+
+  // The unit in which `distanceVariable_` is reported. Only meaningful if
+  // `distanceVariable_` is set. `std::nullopt` means kilometers (the
+  // internal computation unit and the default of `geof:distance`).
+  std::optional<UnitOfMeasurement> distanceUnit_ = std::nullopt;
 
   // If given a vector of variables, the selected variables will be part of the
   // result table - the join column will automatically be part of the result.

@@ -582,8 +582,9 @@ template class RelationalExpression<Comparison::GE>;
 namespace sparqlExpression {
 
 // _____________________________________________________________________________
-std::optional<std::pair<sparqlExpression::GeoFunctionCall, double>>
-getGeoDistanceFilter(const SparqlExpression& expr) {
+std::optional<GeoDistanceFilterResult> getGeoDistanceFilter(
+    const SparqlExpression& expr,
+    const ad_utility::HashMap<Variable, GeoDistanceCall>& boundDistanceVars) {
   // TODO<ullingerc> Add support for more optimizable filters:
   // * `geof:distance() < constant`
   // * `constant > geof:distance()`
@@ -620,10 +621,25 @@ getGeoDistanceFilter(const SparqlExpression& expr) {
     return std::nullopt;
   }
 
-  // Extract variables and distance unit from function call
+  // Extract variables and distance unit from function call. If the left
+  // child is not itself a distance function call, it might be a variable
+  // that was `BIND`ed to one (`BIND(geof:distance(?a, ?b) AS ?dist)
+  // FILTER(?dist <= constant)`) -- in that case the distance additionally
+  // needs to be exported to that variable, since the `BIND` becomes
+  // redundant once the filter is rewritten to a `SpatialJoin`.
+  std::optional<Variable> distanceVariable;
   auto geoFuncCall = getGeoDistanceExpressionParameters(leftChild);
   if (!geoFuncCall.has_value()) {
-    return std::nullopt;
+    auto* varExpr = dynamic_cast<const VariableExpression*>(&leftChild);
+    if (varExpr == nullptr) {
+      return std::nullopt;
+    }
+    auto it = boundDistanceVars.find(varExpr->value());
+    if (it == boundDistanceVars.end()) {
+      return std::nullopt;
+    }
+    distanceVariable = varExpr->value();
+    geoFuncCall = it->second;
   }
 
   // Convert unit to meters
@@ -631,7 +647,8 @@ getGeoDistanceFilter(const SparqlExpression& expr) {
                        maxDistAnyUnit, geoFuncCall.value().unit_) *
                    1000;
 
-  return std::pair<GeoFunctionCall, double>{geoFuncCall.value(), maxDist};
+  return GeoDistanceFilterResult{std::move(geoFuncCall).value(), maxDist,
+                                 std::move(distanceVariable)};
 }
 
 }  // namespace sparqlExpression
