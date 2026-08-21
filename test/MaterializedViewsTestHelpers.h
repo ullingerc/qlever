@@ -290,6 +290,24 @@ inline void expectNotSuitableForRewrite(
   manager.unloadViewIfLoaded(viewName);
 };
 
+// _____________________________________________________________________________
+// The inverse of `expectNotSuitableForRewrite`: writes and loads a view from
+// `viewQuery`, then checks (like `qpExpect`) that planning `testQuery`
+// produces exactly `matcher`. `testQuery` must not be satisfiable by
+// cache-key-based rewriting alone, or this would pass without exercising the
+// pattern matcher; make it `viewQuery` plus at least one extra triple.
+template <typename ViewName, typename ViewQuery, typename TestQuery>
+inline void expectSuitableForRewrite(
+    qlever::Qlever& qlv, const ViewName& viewName, const ViewQuery& viewQuery,
+    const TestQuery& testQuery,
+    ::testing::Matcher<const QueryExecutionTree&> matcher,
+    source_location sourceLocation = AD_CURRENT_SOURCE_LOC()) {
+  auto l = generateLocationTrace(sourceLocation);
+  qlv.writeMaterializedView(viewName, std::string{viewQuery});
+  qlv.loadMaterializedView(viewName);
+  qpExpect(qlv, testQuery, matcher, sourceLocation);
+};
+
 }  // namespace materializedViewsTestHelpers
 
 #endif  // QLEVER_TEST_MATERIALIZEDVIEWSTESTHELPERS_H_
