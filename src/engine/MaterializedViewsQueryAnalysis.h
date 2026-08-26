@@ -57,8 +57,30 @@ struct StarInfo {
 struct ByCacheKeyInfo {
   ViewPtr view_;
   ad_utility::HashMap<size_t, size_t> colMapping_;
+
+  // If `true`, this entry is not a plain cache key but a cache key template:
+  // the first column of the view has to be fixed to the constant that was
+  // replaced by `FIXED_FIRST_COLUMN_PLACEHOLDER` (see below).
+  bool fixesFirstColumn_ = false;
 };
 using ByCacheKeyInfoPtr = std::shared_ptr<const ByCacheKeyInfo>;
+
+// The cache key of an `IndexScan` contains the fixed values of the scan as RDF
+// literals in double quotes (see `IndexScan::getCacheKeyImpl`). A materialized
+// view can also be used for a query that is identical to the view's query
+// except that the view's first column is fixed to some constant. To detect
+// this, all occurrences of that constant are replaced by this placeholder, both
+// in the view's cache key (at load time) and in the query's cache key (during
+// planning). The placeholder contains a character that can never occur in a
+// cache key, so it cannot be confused with actual cache key content.
+constexpr inline std::string_view FIXED_FIRST_COLUMN_PLACEHOLDER =
+    "\x01FIXED-FIRST-COLUMN\x01";
+
+// Replace all occurrences of `value` in `cacheKey` by
+// `FIXED_FIRST_COLUMN_PLACEHOLDER`. Returns `nullopt` if `value` does not occur
+// in `cacheKey` at all.
+std::optional<std::string> substituteFixedValueByPlaceholder(
+    std::string_view cacheKey, const TripleComponent& value);
 
 // Helper class that represents a possible join replacement and indicates the
 // subset of triples it handles.
@@ -85,7 +107,15 @@ class QueryPatternCache {
   // All star patterns extracted from materialized views.
   ad_utility::HashMap<ViewPtr, StarInfo> starCache_;
 
+  // Cache keys of the views' own query plans. Entries with
+  // `fixesFirstColumn_` are templates that contain
+  // `FIXED_FIRST_COLUMN_PLACEHOLDER` instead of the value the first column is
+  // fixed to.
   ad_utility::HashMap<std::string, ByCacheKeyInfoPtr> byCacheKey_;
+
+  // The number of entries of `byCacheKey_` with `fixesFirstColumn_`. Used to
+  // skip the (comparatively expensive) template matching if there are none.
+  size_t numCacheKeyTemplates_ = 0;
 
   // NOTE: When a new data structure for caching is added here, the unloading
   // should also be implemented in the `removeView` method.
@@ -121,6 +151,10 @@ class QueryPatternCache {
       parsedQuery::MaterializedViewQuery::RequestedColumns columns) const;
 
   ByCacheKeyInfoPtr lookupByCacheKey(const std::string& cacheKey) const;
+
+  // Return `true` iff at least one cache key template for a fixed first column
+  // is currently stored (see `FIXED_FIRST_COLUMN_PLACEHOLDER`).
+  bool hasCacheKeyTemplates() const { return numCacheKeyTemplates_ > 0; }
 
  private:
   // Helper for `analyzeView`, that checks for a simple chain. It returns `true`

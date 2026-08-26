@@ -10,6 +10,7 @@
 #ifndef QLEVER_SRC_ENGINE_MATERIALIZEDVIEWS_H_
 #define QLEVER_SRC_ENGINE_MATERIALIZEDVIEWS_H_
 
+#include <absl/functional/function_ref.h>
 #include <absl/strings/str_cat.h>
 #include <gtest/gtest_prod.h>
 
@@ -37,6 +38,7 @@
 class QueryExecutionContext;
 class QueryExecutionTree;
 class IndexScan;
+class Index;
 
 // For the future, materialized views save their version. If we change something
 // about the way materialized views are stored, we can break the existing ones
@@ -264,24 +266,41 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
       const parsedQuery::MaterializedViewQuery& viewQuery) const;
 
   using ColumnMapping = ad_utility::HashMap<size_t, size_t>;
-  std::shared_ptr<IndexScan> makeIndexScan(QueryExecutionContext* qec,
-                                           const VariableToColumnMap& varToCol,
-                                           const ColumnMapping& colMap) const;
 
-  // Compute the cache key corresponding to the query of this materialized view.
-  // Requires a `QueryExecutionContext` to access the index, and the
-  // materialized view must know its original query. If `qec` is `nullptr` or
-  // the view does not know its original query, both members of the returned
-  // struct are `nullopt` (currently used by tests).
+  // Construct an `IndexScan` on this view where the columns are bound to the
+  // variables of `varToCol` according to `colMap`. If `fixedFirstColumn` is
+  // set, the first column of the view is not read but fixed to this value; in
+  // that case `colMap` must not map any variable to column 0.
+  std::shared_ptr<IndexScan> makeIndexScan(
+      QueryExecutionContext* qec, const VariableToColumnMap& varToCol,
+      const ColumnMapping& colMap,
+      const std::optional<TripleComponent>& fixedFirstColumn =
+          std::nullopt) const;
+
+  // A cache key of a query that can be answered by this view, together with the
+  // mapping from the columns of that query's result to the columns of this
+  // view.
   struct CacheKeyAndColumnMapping {
     std::string cacheKey_;
     ColumnMapping columnMapping_;
+
+    // See `ByCacheKeyInfo::fixesFirstColumn_`.
+    bool fixesFirstColumn_ = false;
   };
-  struct CacheKeyWithAndWithoutInvariantPatterns {
-    std::optional<CacheKeyAndColumnMapping> full_;
-    std::optional<CacheKeyAndColumnMapping> withoutInvariants_;
-  };
-  CacheKeyWithAndWithoutInvariantPatterns computeCacheKey(
+
+  // Compute the cache keys of all queries that can be answered by this
+  // materialized view. These are:
+  // - the view's own query,
+  // - the view's own query without the graph patterns that are invariant to it
+  //   (such as `BIND`s), for matching queries that do not contain them,
+  // - and for both of them a cache key *template* in which the view's first
+  //   column is fixed to a constant (see
+  //   `computeCacheKeyTemplateWithFixedFirstColumn`).
+  // Requires a `QueryExecutionContext` to access the index, and the
+  // materialized view must know its original query. If `qec` is `nullptr` or
+  // the view does not know its original query, the result is empty (currently
+  // used by tests).
+  std::vector<CacheKeyAndColumnMapping> computeCacheKeys(
       QueryExecutionContext* qec) const;
 
   // If the materialized view contains a top-level `BIND` statement where the
@@ -294,6 +313,53 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   std::optional<size_t> lookupBindTargetColumn(
       const std::string& bindCacheKey) const;
 
+ private:
+  // Helper for `computeCacheKeys`: plan the given query and return its cache
+  // key together with the mapping from the columns of the resulting
+  // `QueryExecutionTree` to the columns of this view. Returns `nullopt` if the
+  // query cannot be planned or contains a variable that is not a column of this
+  // view.
+  std::optional<CacheKeyAndColumnMapping> planAndComputeColumnMapping(
+      QueryExecutionContext& qec, ParsedQuery parsed) const;
+
+  // Helper for `computeCacheKeys`: compute a cache key *template* for the
+  // view's query with the variable of the view's first column replaced by a
+  // constant. Such a query is answered by an `IndexScan` on this view with the
+  // first column fixed to that constant, for *any* constant. Which constant it
+  // is, however, influences the query plan and thus the cache key. We therefore
+  // plan the query with two constants that actually occur in the view's first
+  // column and replace them by `FIXED_FIRST_COLUMN_PLACEHOLDER` in the
+  // resulting cache keys. Only if both templates agree, the placeholder
+  // positions are exactly the positions that depend on the constant, and the
+  // template can safely be matched against other queries. Returns `nullopt`
+  // otherwise, in which case such queries are simply not rewritten.
+  std::optional<CacheKeyAndColumnMapping>
+  computeCacheKeyTemplateWithFixedFirstColumn(QueryExecutionContext& qec,
+                                              const ParsedQuery& parsed) const;
+
+  // Helper for `computeCacheKeyTemplateWithFixedFirstColumn`: the variable that
+  // corresponds to the first column of this view.
+  const Variable& firstColumnVariable() const;
+
+  // Helper for `computeCacheKeyTemplateWithFixedFirstColumn`: two distinct
+  // values that actually occur in the first column of this view. They are read
+  // from the permutation's block metadata, which requires no disk access.
+  // Returns `nullopt` if the view has less than two distinct values in its
+  // first column or if they cannot be converted back to a `TripleComponent`.
+  std::optional<std::array<TripleComponent, 2>> firstColumnSampleValues(
+      const Index& index) const;
+
+  // Helper for `computeCacheKeyTemplateWithFixedFirstColumn`: replace the
+  // variable of the view's first column by `value` in `parsed`. Returns
+  // `nullopt` if this is not possible, in particular if the variable does not
+  // exclusively occur in the triples of the query's top-level basic graph
+  // patterns, or if the query has clauses (such as `LIMIT` or `GROUP BY`) for
+  // which fixing the first column of the view is not equivalent to fixing it in
+  // the query.
+  std::optional<ParsedQuery> fixFirstColumn(const ParsedQuery& parsed,
+                                            const TripleComponent& value) const;
+
+ public:
   // Dummy variables for internal use.
   static const Variable& dummySubject();
   static const Variable& dummyPredicate();
@@ -449,9 +515,19 @@ class MaterializedViewsManager {
   //  Check if there is a materialized view that can be used to replace a query
   //  with the given cache key. The `VariableToColumnMap` needs to be provided
   //  to apply the view's column permutation.
+  //
+  //  If no view matches the cache key exactly, the query may still be the query
+  //  of a view with its first column fixed to a constant. The candidates for
+  //  that constant are the constants that occur in the query; for each of them
+  //  it is checked whether replacing it in the cache key yields a match (see
+  //  `materializedViewsQueryAnalysis::FIXED_FIRST_COLUMN_PLACEHOLDER`).
+  //  `getFixedValueCandidates` is only called if there is at least one such
+  //  view, so that collecting the candidates costs nothing otherwise.
   std::shared_ptr<IndexScan> makeIndexScan(
       QueryExecutionContext* qec, const std::string& cacheKey,
-      const VariableToColumnMap& varToCol) const;
+      const VariableToColumnMap& varToCol,
+      absl::FunctionRef<std::vector<TripleComponent>()> getFixedValueCandidates)
+      const;
 
   // Write a `MaterializedView` given a valid `name` (consisting only of
   // alphanumerics and hyphens) and a `plannedQuery` to be executed. The query's

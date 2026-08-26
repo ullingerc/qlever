@@ -172,3 +172,58 @@ TEST_F(MaterializedViewsCacheKeyRewriteTest, CacheKeyRewrite) {
                             {{3, V{"?o2"}}, {4, V{"?b1"}}}),
                    "?o2 + 2", V{"?b2"}));
 }
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsFixedFirstColumnTest, FixedFirstColumn) {
+  const std::string writeQuery = R"(
+    SELECT ?s ?m ?o {
+      ?s <p1> ?m .
+      ?m <p2> ?o .
+    }
+  )";
+  qlv().writeMaterializedView("chainView", writeQuery);
+  qlv().loadMaterializedView("chainView");
+  qpExpect(qlv(), writeQuery, viewScanSimple("chainView", "?s", "?m", "?o"));
+
+  // Helper that checks that the query is answered by a scan on the view with
+  // the first column fixed and that this yields the same result as without the
+  // view.
+  auto expectFixedFirstColumnScan = [this](const std::string& query,
+                                           const std::string& fixedValue,
+                                           source_location sourceLocation =
+                                               AD_CURRENT_SOURCE_LOC()) {
+    auto l = generateLocationTrace(sourceLocation);
+    qpExpect(qlv(), query, viewScanSimple("chainView", fixedValue, "?m", "?o"));
+    qlv().clearQueryResultCache();
+    auto withView = getQueryResultAsIdTable(query);
+    qlv().unloadMaterializedView("chainView");
+    qlv().clearQueryResultCache();
+    auto withoutView = getQueryResultAsIdTable(query);
+    qlv().loadMaterializedView("chainView");
+    EXPECT_EQ(withView, withoutView);
+  };
+
+  // The user query is the view query with the first column fixed. Note that
+  // neither of the two values below is one of the values the view's cache key
+  // template was computed with (those are the smallest and the largest value of
+  // the first column, `<a1>` and `<a4>`).
+  expectFixedFirstColumnScan(R"(SELECT ?m ?o { <a2> <p1> ?m . ?m <p2> ?o })",
+                             "<a2>");
+  expectFixedFirstColumnScan(R"(SELECT ?m ?o { <a3> <p1> ?m . ?m <p2> ?o })",
+                             "<a3>");
+
+  // The same for a value that does not occur in the first column at all.
+  expectFixedFirstColumnScan(R"(SELECT ?m ?o { <b1> <p1> ?m . ?m <p2> ?o })",
+                             "<b1>");
+
+  // A fixed value in a column other than the first one is not rewritten.
+  qpExpect(qlv(), R"(SELECT ?s ?m { ?s <p1> ?m . ?m <p2> <c2> })",
+           h::Join(h::IndexScanFromStrings("?s", "<p1>", "?m"),
+                   h::IndexScanFromStrings("?m", "<p2>", "<c2>")));
+
+  // A query that is not the view's query is not rewritten, even though it has a
+  // fixed first column.
+  qpExpect(qlv(), R"(SELECT ?m ?o { <a2> <p1> ?m . ?m <p4> ?o })",
+           h::Join(h::IndexScanFromStrings("<a2>", "<p1>", "?m"),
+                   h::IndexScanFromStrings("?m", "<p4>", "?o")));
+}

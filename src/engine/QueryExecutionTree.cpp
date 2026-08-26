@@ -167,6 +167,29 @@ bool QueryExecutionTree::readFromCache() {
 }
 
 // _____________________________________________________________________________
+namespace {
+// Collect the fixed (non-variable) values of all `IndexScan`s in the given
+// subtree. These are the candidates for the value that the first column of a
+// materialized view is fixed to (see
+// `MaterializedViewsManager::makeIndexScan`).
+void collectFixedScanValues(const Operation& operation,
+                            std::vector<TripleComponent>& result) {
+  if (const auto* scan = dynamic_cast<const IndexScan*>(&operation)) {
+    for (const auto* component : scan->getPermutedTriple()) {
+      if (!component->isVariable() &&
+          !ad_utility::contains(result, *component)) {
+        result.push_back(*component);
+      }
+    }
+  }
+  for (const auto* child : operation.getChildren()) {
+    AD_CORRECTNESS_CHECK(child != nullptr);
+    collectFixedScanValues(*child->getRootOperation(), result);
+  }
+}
+}  // namespace
+
+// _____________________________________________________________________________
 void QueryExecutionTree::readFromMaterializedView() {
   AD_CORRECTNESS_CHECK(qec_ != nullptr);
   if (qec_->disableMaterializedViewRewriting() || qec_->disableCaching()) {
@@ -175,7 +198,11 @@ void QueryExecutionTree::readFromMaterializedView() {
     return;
   }
   auto scan = qec_->materializedViewsManager().makeIndexScan(
-      qec_, getCacheKey(), getVariableColumns());
+      qec_, getCacheKey(), getVariableColumns(), [this]() {
+        std::vector<TripleComponent> fixedScanValues;
+        collectFixedScanValues(*rootOperation_, fixedScanValues);
+        return fixedScanValues;
+      });
   if (scan != nullptr) {
     rootOperation_ = std::static_pointer_cast<Operation>(scan);
     resultWidth_ = rootOperation_->getResultWidth();

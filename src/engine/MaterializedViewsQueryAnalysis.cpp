@@ -9,6 +9,10 @@
 
 #include "engine/MaterializedViewsQueryAnalysis.h"
 
+#include <absl/strings/match.h>
+#include <absl/strings/str_cat.h>
+#include <absl/strings/str_replace.h>
+
 #include <algorithm>
 #include <optional>
 #include <variant>
@@ -17,6 +21,7 @@
 #include "engine/IndexScan.h"
 #include "engine/MaterializedViews.h"
 #include "engine/VariableToColumnMap.h"
+#include "index/TripleComponentConversions.h"
 #include "parser/GraphPatternOperation.h"
 #include "util/Algorithm.h"
 #include "util/Exception.h"
@@ -374,34 +379,33 @@ bool QueryPatternCache::analyzeView(ViewPtr view, QueryExecutionContext* qec) {
     return false;
   }
 
-  // Save the cache key for this view: once in full for matching the entire
-  // unchanged view query, and once with invariant patterns (such as `BIND`s)
-  // removed for matching queries that do not contain all of these patterns.
-  auto [full, withoutInvariant] = view->computeCacheKey(qec);
-  auto insert = [&](auto& cacheKeyAndCol) {
-    if (!cacheKeyAndCol.has_value()) {
-      return false;
-    }
-    auto [it, inserted] = byCacheKey_.insert(
-        {std::move(cacheKeyAndCol.value().cacheKey_),
-         std::make_shared<ByCacheKeyInfo>(
-             view, std::move(cacheKeyAndCol.value().columnMapping_))});
+  // Save the cache keys for this view (see `MaterializedView::computeCacheKeys`
+  // for which ones are computed).
+  bool cacheKeyAdded = false;
+  for (auto& cacheKeyAndCol : view->computeCacheKeys(qec)) {
+    auto [it, inserted] =
+        byCacheKey_.insert({std::move(cacheKeyAndCol.cacheKey_),
+                            std::make_shared<ByCacheKeyInfo>(
+                                view, std::move(cacheKeyAndCol.columnMapping_),
+                                cacheKeyAndCol.fixesFirstColumn_)});
     // If `inserted` is `false` because the entry already belongs to `view`
-    // itself (its "full" and "without invariants" cache keys coincide, e.g.
-    // because the view has no `BIND` to strip), this is expected and not a
-    // collision worth logging.
-    if (!inserted && it->second->view_ != view) {
-      AD_LOG_INFO << "Materialized view '" << view->name()
-                  << "' has the same cache key as the already loaded view '"
-                  << it->second->view_->name()
-                  << "'. Only the latter can be matched by cache key."
-                  << std::endl;
+    // itself (two of its cache keys coincide, e.g. because the view has no
+    // `BIND` to strip), this is expected and not a collision worth logging.
+    if (!inserted) {
+      if (it->second->view_ != view) {
+        AD_LOG_INFO << "Materialized view '" << view->name()
+                    << "' has the same cache key as the already loaded view '"
+                    << it->second->view_->name()
+                    << "'. Only the latter can be matched by cache key."
+                    << std::endl;
+      }
+      continue;
     }
-    return inserted;
-  };
-  // Not `||`: both calls must always be evaluated.
-  bool cacheKeyAdded = insert(full);
-  cacheKeyAdded = insert(withoutInvariant) || cacheKeyAdded;
+    cacheKeyAdded = true;
+    if (it->second->fixesFirstColumn_) {
+      ++numCacheKeyTemplates_;
+    }
+  }
 
   if (parsed.value().isAggregatingQuery()) {
     explainIgnore(
@@ -499,9 +503,16 @@ void QueryPatternCache::removeView(ViewPtr view) {
 
   // Remove `view` from cache key hash map. We use `absl::erase_if` here as it
   // works natively with our hash map unlike `ql::erase_if`.
-  absl::erase_if(byCacheKey_, [&view](const auto& pair) {
+  absl::erase_if(byCacheKey_, [&view, this](const auto& pair) {
     AD_CORRECTNESS_CHECK(pair.second != nullptr);
-    return pair.second->view_ == view;
+    if (pair.second->view_ != view) {
+      return false;
+    }
+    if (pair.second->fixesFirstColumn_) {
+      AD_CORRECTNESS_CHECK(numCacheKeyTemplates_ > 0);
+      --numCacheKeyTemplates_;
+    }
+    return true;
   });
 }
 
@@ -534,6 +545,20 @@ BindExpressionAndTargetCol extractBindExpressions(
                 varToColMap.at(bind._target).columnIndex_});
   }
   return map;
+}
+
+// _____________________________________________________________________________
+std::optional<std::string> substituteFixedValueByPlaceholder(
+    std::string_view cacheKey, const TripleComponent& value) {
+  // See `IndexScan::getCacheKeyImpl` for the format of a fixed value in a
+  // cache key. The surrounding quotes are part of the needle to reduce the
+  // chance of accidentally replacing an unrelated substring.
+  auto needle = absl::StrCat("\"", toRdfLiteral(value), "\"");
+  if (!absl::StrContains(cacheKey, needle)) {
+    return std::nullopt;
+  }
+  return absl::StrReplaceAll(cacheKey,
+                             {{needle, FIXED_FIRST_COLUMN_PLACEHOLDER}});
 }
 
 // _____________________________________________________________________________

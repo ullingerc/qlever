@@ -3485,6 +3485,16 @@ QueryPlanner::findApplicableReplacementPlans(
   // TODO<ullingerc> This could be hash-map based if we would return the
   // indices in the create helper and pass them as part of `replacementPlans`.
 
+  // The pattern-based (chain/star) replacement plans are only used by the
+  // greedy planner. For the dynamic programming planner they are redundant:
+  // it builds a subtree for every subset of the triples anyway, and those
+  // subtrees are matched against the materialized views by cache key (see
+  // `QueryExecutionTree::readFromMaterializedView`), which also covers a fixed
+  // first column.
+  if (!useGreedyPlanning) {
+    return {{}, false};
+  }
+
   // Extract the subset of replacement plans that is applicable to the connected
   // component given by `coveredNodeIds`. If a basic graph pattern contains
   // multiple disjunctive connected components, each of them may contain sets of

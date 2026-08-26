@@ -27,12 +27,14 @@
 #include "global/FileSuffixConstants.h"
 #include "global/RuntimeParameters.h"
 #include "index/DeltaTriples.h"
+#include "index/ExportIds.h"
 #include "index/ExternalSortFunctors.h"
 #include "libqlever/Qlever.h"
 #include "parser/MaterializedViewQuery.h"
 #include "parser/ParsedQuery.h"
 #include "parser/SparqlParser.h"
 #include "parser/TripleComponent.h"
+#include "parser/VariableCounter.h"
 #include "util/AllocatorWithLimit.h"
 #include "util/Exception.h"
 #include "util/FilesystemHelpers.h"
@@ -763,8 +765,9 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
 // _____________________________________________________________________________
 std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
     QueryExecutionContext* qec, const VariableToColumnMap& varToCol,
-    const ColumnMapping& colMap) const {
-  TripleComponent s{dummySubject()};
+    const ColumnMapping& colMap,
+    const std::optional<TripleComponent>& fixedFirstColumn) const {
+  TripleComponent s{fixedFirstColumn.value_or(TripleComponent{dummySubject()})};
   TripleComponent p{dummyPredicate()};
   TripleComponent o{dummyObject()};
   AdditionalScanColumns additionalCols;
@@ -777,6 +780,10 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
                          "materialized view.");
     auto col = it->second;
     if (col == 0) {
+      AD_CORRECTNESS_CHECK(
+          !fixedFirstColumn.has_value(),
+          "The first column of a materialized view cannot be bound to a "
+          "variable and fixed to a value at the same time.");
       s = v;
     } else if (col == 1) {
       p = v;
@@ -834,17 +841,39 @@ std::shared_ptr<IndexScan> MaterializedViewsManager::makeIndexScan(
 // _____________________________________________________________________________
 std::shared_ptr<IndexScan> MaterializedViewsManager::makeIndexScan(
     QueryExecutionContext* qec, const std::string& cacheKey,
-    const VariableToColumnMap& varToCol) const {
+    const VariableToColumnMap& varToCol,
+    absl::FunctionRef<std::vector<TripleComponent>()> getFixedValueCandidates)
+    const {
   // TODO<ullingerc> Do we want to forcefully disable query rewriting if delta
   // triples are present in the current index to prevent diverging results?
   // (Same concern as in `QueryPlanner::createMaterializedViewJoinReplacements`,
   // since a cache key alone does not capture the located-triples state.)
-  auto info =
-      loadedViews_.rlock()->queryPatternCache_.lookupByCacheKey(cacheKey);
-  if (info == nullptr) {
+  auto lock = loadedViews_.rlock();
+  const auto& queryPatternCache = lock->queryPatternCache_;
+  if (auto info = queryPatternCache.lookupByCacheKey(cacheKey)) {
+    AD_CORRECTNESS_CHECK(!info->fixesFirstColumn_);
+    return info->view_->makeIndexScan(qec, varToCol, info->colMapping_);
+  }
+
+  // The query might be the query of a view with its first column fixed to one
+  // of the constants that occur in it.
+  if (!queryPatternCache.hasCacheKeyTemplates()) {
     return nullptr;
   }
-  return info->view_->makeIndexScan(qec, varToCol, info->colMapping_);
+  for (const auto& value : getFixedValueCandidates()) {
+    auto templateKey =
+        materializedViewsQueryAnalysis::substituteFixedValueByPlaceholder(
+            cacheKey, value);
+    if (!templateKey.has_value()) {
+      continue;
+    }
+    auto info = queryPatternCache.lookupByCacheKey(templateKey.value());
+    if (info != nullptr && info->fixesFirstColumn_) {
+      return info->view_->makeIndexScan(qec, varToCol, info->colMapping_,
+                                        value);
+    }
+  }
+  return nullptr;
 }
 
 // _____________________________________________________________________________
@@ -856,10 +885,204 @@ std::optional<size_t> MaterializedView::lookupBindTargetColumn(
 }
 
 // _____________________________________________________________________________
-MaterializedView::CacheKeyWithAndWithoutInvariantPatterns
-MaterializedView::computeCacheKey(QueryExecutionContext* qecOriginal) const {
+std::optional<MaterializedView::CacheKeyAndColumnMapping>
+MaterializedView::planAndComputeColumnMapping(QueryExecutionContext& qec,
+                                              ParsedQuery parsed) const {
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  QueryPlanner qp{&qec, handle};
+
+  QueryExecutionTree executionTree{&qec};
+  try {
+    executionTree = qp.createExecutionTree(parsed);
+  } catch (const MaterializedViewConfigException&) {
+    // The view's own query references another materialized view, which
+    // would deadlock on the write lock for `loadedViews_` (see the check in
+    // `MaterializedViewsManager::makeIndexScan`). Simply skip the cache-key
+    // based query pattern detection for this view instead of failing to
+    // load it; the view can still be used via its explicit name.
+    return std::nullopt;
+  }
+
+  ColumnMapping mapping;
+  const auto& viewCols = variableToColumnMap();
+  for (const auto& [var, col] : executionTree.getVariableColumns()) {
+    auto it = viewCols.find(var);
+    // Internal variables and variables that are not selected by the
+    // materialized view query are not present in the view. Therefore this
+    // cache key can't be used then.
+    if (it == viewCols.end()) {
+      return std::nullopt;
+    }
+    mapping.insert({col.columnIndex_, it->second.columnIndex_});
+  }
+  return CacheKeyAndColumnMapping{executionTree.getCacheKey(),
+                                  std::move(mapping), false};
+}
+
+// _____________________________________________________________________________
+const Variable& MaterializedView::firstColumnVariable() const {
+  auto it = ql::ranges::find_if(varToColMap_, [](const auto& varAndCol) {
+    return varAndCol.second.columnIndex_ == 0;
+  });
+  AD_CORRECTNESS_CHECK(it != varToColMap_.end(),
+                       "A materialized view must have a first column.");
+  return it->first;
+}
+
+// _____________________________________________________________________________
+std::optional<std::array<TripleComponent, 2>>
+MaterializedView::firstColumnSampleValues(const Index& index) const {
+  const auto& blocks = permutation_->metaData().blockData();
+  if (blocks.empty()) {
+    return std::nullopt;
+  }
+  // The smallest and the largest value of the first column. Reading them from
+  // the block metadata requires no disk access.
+  std::array<Id, 2> ids{blocks.front().firstTriple_.col0Id_,
+                        blocks.back().lastTriple_.col0Id_};
+  // TODO<ullingerc> Values that are encoded in the `Id` itself (numbers, dates,
+  // ...) are not supported here, because it is not guaranteed that they are
+  // converted back to exactly the `TripleComponent` a user would write in a
+  // query. This only means that views with such a first column are not
+  // rewritten, so it is safe.
+  if (ids.at(0) == ids.at(1) || ql::ranges::any_of(ids, [](Id id) {
+        return id.getDatatype() != Datatype::VocabIndex;
+      })) {
+    return std::nullopt;
+  }
+  LocalVocab emptyLocalVocab;
+  std::array<TripleComponent, 2> result;
+  for (size_t i = 0; i < 2; ++i) {
+    auto literalOrIri = ql::exportIds::idToLiteralOrIri(
+        index.getImpl(), ids.at(i), emptyLocalVocab);
+    if (!literalOrIri.has_value()) {
+      return std::nullopt;
+    }
+    result.at(i) = literalOrIri.value().isIri()
+                       ? TripleComponent{literalOrIri.value().getIri()}
+                       : TripleComponent{literalOrIri.value().getLiteral()};
+  }
+  return result;
+}
+
+// _____________________________________________________________________________
+std::optional<ParsedQuery> MaterializedView::fixFirstColumn(
+    const ParsedQuery& parsed, const TripleComponent& value) const {
+  // Fixing the first column of the view is only equivalent to fixing the
+  // corresponding variable in the view's query if the query has no clauses that
+  // operate on the result as a whole. For example the result of a query with a
+  // `LIMIT` and a fixed value is not the same as the rows with that value in
+  // the result of the query with the `LIMIT`.
+  if (!parsed.hasSelectClause() || parsed.isAggregatingQuery() ||
+      !parsed._groupByVariables.empty() || !parsed._havingClauses.empty() ||
+      !parsed._orderBy.empty() || !parsed._limitOffset.isUnconstrained() ||
+      !parsed.selectClause().getAliases().empty()) {
+    return std::nullopt;
+  }
+  const auto& variable = firstColumnVariable();
+
+  // Substitute the variable in the triples of the top-level basic graph
+  // patterns and count how often it occurs there.
+  ParsedQuery result = parsed;
+  size_t numOccurrencesInTriples = 0;
+  auto substitute = [&variable, &value,
+                     &numOccurrencesInTriples](TripleComponent& component) {
+    if (component.isVariable() && component.getVariable() == variable) {
+      component = value;
+      ++numOccurrencesInTriples;
+    }
+  };
+  for (auto& pattern : result._rootGraphPattern._graphPatterns) {
+    if (!std::holds_alternative<parsedQuery::BasicGraphPattern>(pattern)) {
+      continue;
+    }
+    for (auto& triple : pattern.getBasic()._triples) {
+      substitute(triple.s_);
+      substitute(triple.o_);
+    }
+  }
+  if (numOccurrencesInTriples == 0) {
+    return std::nullopt;
+  }
+
+  // If the variable occurs anywhere else in the query (as a predicate, in a
+  // `BIND`, in a nested pattern, ...), substituting it only in the triples
+  // above would change the meaning of the query.
+  parsedQuery::VariableCounter counter;
+  counter(parsed._rootGraphPattern);
+  if (counter.counts().at(variable) != numOccurrencesInTriples) {
+    return std::nullopt;
+  }
+
+  // The variable is not part of the result of the modified query anymore.
+  auto& selectClause = result.selectClause();
+  ql::erase(selectClause.visibleVariables_, variable);
+  if (!selectClause.isAsterisk()) {
+    auto selectedVariables = selectClause.getSelectedVariables();
+    ql::erase(selectedVariables, variable);
+    selectClause.setSelected(std::move(selectedVariables));
+  }
+  return result;
+}
+
+// _____________________________________________________________________________
+std::optional<MaterializedView::CacheKeyAndColumnMapping>
+MaterializedView::computeCacheKeyTemplateWithFixedFirstColumn(
+    QueryExecutionContext& qec, const ParsedQuery& parsed) const {
+  auto samples = firstColumnSampleValues(qec.getIndex());
+  if (!samples.has_value()) {
+    return std::nullopt;
+  }
+
+  // Plan the query with both sample values and blank out the value in the
+  // resulting cache keys.
+  std::array<std::optional<CacheKeyAndColumnMapping>, 2> planned;
+  std::array<std::optional<std::string>, 2> templates;
+  for (size_t i = 0; i < 2; ++i) {
+    const auto& value = samples.value().at(i);
+    auto fixed = fixFirstColumn(parsed, value);
+    if (!fixed.has_value()) {
+      return std::nullopt;
+    }
+    planned.at(i) = planAndComputeColumnMapping(qec, std::move(fixed).value());
+    if (!planned.at(i).has_value()) {
+      return std::nullopt;
+    }
+    templates.at(i) =
+        materializedViewsQueryAnalysis::substituteFixedValueByPlaceholder(
+            planned.at(i).value().cacheKey_, value);
+    if (!templates.at(i).has_value()) {
+      return std::nullopt;
+    }
+  }
+
+  // This is the crucial check for the soundness of the template: only if the
+  // two blanked out cache keys agree, the placeholders are exactly at the
+  // positions that depend on the value of the first column. Otherwise the
+  // template would also match queries that are not equivalent to this view,
+  // for example because the value coincidentally also occurs as a predicate.
+  auto& mapping = planned.at(0).value().columnMapping_;
+  if (templates.at(0) != templates.at(1) ||
+      mapping != planned.at(1).value().columnMapping_) {
+    return std::nullopt;
+  }
+
+  // The first column is fixed, so it must not be bound to a variable.
+  if (ql::ranges::any_of(mapping, [](const auto& fromAndTo) {
+        return fromAndTo.second == 0;
+      })) {
+    return std::nullopt;
+  }
+
+  return CacheKeyAndColumnMapping{std::move(templates.at(0)).value(),
+                                  std::move(mapping), true};
+}
+
+// _____________________________________________________________________________
+std::vector<MaterializedView::CacheKeyAndColumnMapping>
+MaterializedView::computeCacheKeys(QueryExecutionContext* qecOriginal) const {
   if (qecOriginal == nullptr || !originalQuery_.has_value()) {
-    return {std::nullopt, std::nullopt};
+    return {};
   }
   // Copy the `QueryExecutionContext` so that `disableMaterializedViewRewriting`
   // is only set for planning this view's own query below, and not for the
@@ -872,43 +1095,19 @@ MaterializedView::computeCacheKey(QueryExecutionContext* qecOriginal) const {
   // account.
   auto parsedQuery =
       SparqlParser::parseQuery(&encodedIriManager, originalQuery_.value());
-  const auto& viewCols = variableToColumnMap();
 
-  auto planAndComputeMapping =
-      [&](ParsedQuery parsed) -> std::optional<CacheKeyAndColumnMapping> {
-    auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
-    QueryPlanner qp{&qec, handle};
-
-    QueryExecutionTree executionTree{&qec};
-    try {
-      executionTree = qp.createExecutionTree(parsed);
-    } catch (const MaterializedViewConfigException&) {
-      // The view's own query references another materialized view, which
-      // would deadlock on the write lock for `loadedViews_` (see the check in
-      // `MaterializedViewsManager::makeIndexScan`). Simply skip the cache-key
-      // based query pattern detection for this view instead of failing to
-      // load it; the view can still be used via its explicit name.
-      return std::nullopt;
+  std::vector<CacheKeyAndColumnMapping> result;
+  auto addIfPresent = [&result](std::optional<CacheKeyAndColumnMapping> key) {
+    if (key.has_value()) {
+      result.push_back(std::move(key).value());
     }
-
-    ColumnMapping mapping;
-    for (const auto& [var, col] : executionTree.getVariableColumns()) {
-      auto it = viewCols.find(var);
-      // Internal variables and variables that are not selected by the
-      // materialized view query are not present in the view. Therefore this
-      // cache key can't be used then.
-      if (it == viewCols.end()) {
-        return std::nullopt;
-      }
-      mapping.insert({col.columnIndex_, it->second.columnIndex_});
-    }
-    return CacheKeyAndColumnMapping{executionTree.getCacheKey(),
-                                    std::move(mapping)};
   };
-
-  // Needs to be passed by value as `qp.createExecutionTree` modifies the parsed
-  // query.
-  auto keyWithBinds = planAndComputeMapping(parsedQuery);
+  auto addCacheKeysFor = [this, &qec,
+                          &addIfPresent](const ParsedQuery& parsed) {
+    addIfPresent(planAndComputeColumnMapping(qec, parsed));
+    addIfPresent(computeCacheKeyTemplateWithFixedFirstColumn(qec, parsed));
+  };
+  addCacheKeysFor(parsedQuery);
 
   // Remove all `BIND`s that are invariant to the query.
   graphPatternAnalysis::BasicGraphPatternsInvariantTo invariantCheck{
@@ -916,8 +1115,7 @@ MaterializedView::computeCacheKey(QueryExecutionContext* qecOriginal) const {
   ql::erase_if(parsedQuery.children(), [&invariantCheck](const auto& child) {
     return child.visit(invariantCheck);
   });
-  auto keyWithoutBinds = planAndComputeMapping(std::move(parsedQuery));
+  addCacheKeysFor(parsedQuery);
 
-  return CacheKeyWithAndWithoutInvariantPatterns{std::move(keyWithBinds),
-                                                 std::move(keyWithoutBinds)};
+  return result;
 }

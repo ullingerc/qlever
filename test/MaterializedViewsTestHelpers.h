@@ -47,6 +47,22 @@ static constexpr std::string_view cacheKeyRewriteDummyTurtle = R"(
   <s3> <p4> <http://example.com/> .
 )";
 
+// Knowledge graph for testing the cache-key based rewrite of queries in which
+// the first column of a materialized view is fixed to a constant. The subjects
+// `<a1>` to `<a4>` all have exactly one `<p1>` triple, so that the query plan
+// for a fixed subject does not depend on which of them is fixed.
+static constexpr std::string_view fixedFirstColumnDummyTurtle = R"(
+  <a1> <p1> <b1> .
+  <a2> <p1> <b2> .
+  <a3> <p1> <b3> .
+  <a4> <p1> <b4> .
+  <b1> <p2> <c1> .
+  <b2> <p2> <c2> .
+  <b3> <p2> <c3> .
+  <b4> <p2> <c4> .
+  <b2> <p4> <d2> .
+)";
+
 // _____________________________________________________________________________
 inline void makeTestIndex(const std::string& basename, const std::string& kg) {
   // Write dummy turtle file
@@ -176,6 +192,14 @@ class MaterializedViewsCacheKeyRewriteTest : public MaterializedViewsTest {
  protected:
   std::string getDummyTurtle() const override {
     return std::string{cacheKeyRewriteDummyTurtle};
+  }
+};
+
+// _____________________________________________________________________________
+class MaterializedViewsFixedFirstColumnTest : public MaterializedViewsTest {
+ protected:
+  std::string getDummyTurtle() const override {
+    return std::string{fixedFirstColumnDummyTurtle};
   }
 };
 
