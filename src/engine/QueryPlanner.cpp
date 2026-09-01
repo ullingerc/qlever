@@ -1622,6 +1622,9 @@ QueryPlanner::runDynamicProgrammingOnConnectedComponent(
     checkCancellation();
   }
   auto& result = dpTab.back();
+  // A full-cover replacement plan lands directly in the final row, so, as in
+  // the `numSeeds < 2` case above, apply enforced filter substitutes here too.
+  applyFiltersIfPossible<FilterMode::SeedSubstitutesOnly>(result, filters);
   applyFiltersIfPossible<FilterMode::ReplaceUnfilteredNoSubstitutes>(result,
                                                                      filters);
   applyTextLimitsIfPossible(result, textLimits, true);
@@ -1959,18 +1962,6 @@ std::vector<std::vector<SubtreePlan>> QueryPlanner::fillDpTab(
       result.at(0), filtersAndOptSubstitutes);
   applyTextLimitsIfPossible(result.at(0), textLimitVec, true);
   return result;
-}
-
-// _____________________________________________________________________________
-bool QueryPlanner::TripleGraph::isTextNode(size_t i) const {
-  auto it = _nodeMap.find(i);
-  if (it == _nodeMap.end()) {
-    return false;
-  }
-  const auto& triple = it->second->triple_;
-  auto predicate = triple.getSimplePredicate();
-  return predicate == CONTAINS_ENTITY_PREDICATE ||
-         predicate == CONTAINS_WORD_PREDICATE;
 }
 
 // _____________________________________________________________________________
