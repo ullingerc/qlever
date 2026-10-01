@@ -74,9 +74,10 @@ class MaterializedViewWriter {
   uint8_t numAddEmptyColumns_;
 
   using RangeOfIdTables = ad_utility::InputRangeTypeErased<IdTableStatic<0>>;
-  // SPO comparator
-  using Comparator = SortTriple<0, 1, 2>;
-  // Sorter for SPO permutation with a dynamic number of columns (template
+  // Comparator on all columns (not only SPO), such that the order of the rows
+  // in the view is unique up to duplicates.
+  using Comparator = SortAllColumns;
+  // Sorter for the view's rows with a dynamic number of columns (template
   // argument `NumStaticCols == 0`)
   using Sorter = ad_utility::CompressedExternalIdTableSorter<Comparator, 0>;
 
@@ -91,9 +92,9 @@ class MaterializedViewWriter {
                          ad_utility::AllocatorWithLimit<Id> allocator);
 
   // Called from the constructor. A view is always stored sorted by the
-  // internal order of its first three columns (SPO). An `ORDER BY`, which
-  // requests the semantic order, is therefore never consistent with the
-  // view's storage order and always rejected; an `INTERNAL SORT BY` that does
+  // internal order of all its columns. An `ORDER BY`, which requests the
+  // semantic order, is therefore never consistent with the view's storage
+  // order and always rejected; an `INTERNAL SORT BY` that does
   // not request a prefix of the view's columns would have its requested order
   // silently discarded when writing the view and is therefore also rejected.
   void throwIfOrderByInconsistentWithViewOrder() const;
@@ -152,15 +153,24 @@ class MaterializedViewWriter {
   // `CompressedRelationWriter`. Returns the permutation metadata.
   IndexMetaData writePermutation(RangeOfIdTables sortedBlocksSPO) const;
 
+  // Helper for `computeResultAndWritePermutation`: Wrap the sorted `blocks`
+  // such that, while they are consumed, `hasDuplicates` is set to `true` if any
+  // two adjacent rows (also across block boundaries) are equal. The
+  // `hasDuplicates` reference must outlive the returned range.
+  static RangeOfIdTables checkForDuplicateRows(RangeOfIdTables blocks,
+                                               bool& hasDuplicates);
+
   // Helper for `computeResultAndWritePermutation`: Writes the metadata JSON
-  // files with column names and ordering to disk.
-  void writeViewMetadata() const;
+  // files with column names and ordering to disk. `updatable` is true iff the
+  // view has no duplicate rows.
+  void writeViewMetadata(bool updatable) const;
 
   // Actually computes, permutes and if needed externally sorts the query result
   // and writes the view (SPO permutation and metadata) to disk.
   void computeResultAndWritePermutation() const;
 
   friend MaterializedViewsManager;
+  FRIEND_TEST(MaterializedViewWriter, checkForDuplicateRows);
 };
 
 // This class represents a single loaded `MaterializedView`. It can be used for
@@ -175,6 +185,9 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   std::shared_ptr<LocatedTriplesState> locatedTriplesState_;
   std::optional<std::string> originalQuery_;
   std::optional<ParsedQuery> parsedQuery_;
+  // True iff the view has no duplicate rows. Views written before this flag
+  // was introduced are not updatable.
+  bool updatable_ = false;
 
   // Lookup table for `BIND` statements from the view's query. Maps the cache
   // keys of the `BIND` expressions (based on the column indices in the view) to
@@ -214,6 +227,9 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
 
   // Get a parsed version of the original query, used for query analysis.
   const std::optional<ParsedQuery>& parsedQuery() const { return parsedQuery_; }
+
+  // Return true iff the view has no duplicate rows.
+  bool isUpdatable() const { return updatable_; }
 
   // Return the combined filename from the index' `onDiskBase` and the name of
   // the view. Note that this function does not check for validity or existence.

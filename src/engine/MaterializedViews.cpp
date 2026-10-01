@@ -38,6 +38,7 @@
 #include "util/AllocatorWithLimit.h"
 #include "util/Exception.h"
 #include "util/FilesystemHelpers.h"
+#include "util/InputRangeUtils.h"
 #include "util/MemorySize/MemorySize.h"
 #include "util/ProgressBar.h"
 #include "util/Views.h"
@@ -309,13 +310,13 @@ MaterializedViewWriter::getBlocksForUnsortedResult(
 // _____________________________________________________________________________
 MaterializedViewWriter::RangeOfIdTables MaterializedViewWriter::getSortedBlocks(
     Sorter& spoSorter, std::shared_ptr<const Result> result) const {
-  // Check if the query result is already sorted by SPO considering the target
-  // column ordering
-  constexpr size_t numSortedColumns = 3;
+  // Check if the query result is already sorted by all columns considering the
+  // target column ordering. The appended empty columns are constant and
+  // therefore don't matter.
   const auto& resultSortedBy = result->sortedBy();
-  bool isAlreadySorted =
-      ql::ranges::equal(resultSortedBy | ql::views::take(numSortedColumns),
-                        columnPermutation_ | ql::views::take(numSortedColumns));
+  bool isAlreadySorted = ql::ranges::equal(
+      resultSortedBy | ql::views::take(columnPermutation_.size()),
+      columnPermutation_);
 
   // Either call the version that only permutes the correctly sorted blocks or
   // the version that sorts them.
@@ -365,7 +366,28 @@ IndexMetaData MaterializedViewWriter::writePermutation(
 }
 
 // _____________________________________________________________________________
-void MaterializedViewWriter::writeViewMetadata() const {
+MaterializedViewWriter::RangeOfIdTables
+MaterializedViewWriter::checkForDuplicateRows(RangeOfIdTables blocks,
+                                              bool& hasDuplicates) {
+  return RangeOfIdTables{ad_utility::CachingTransformInputRange{
+      std::move(blocks),
+      [&hasDuplicates, lastRow = std::optional<IdTableStatic<0>::row_type>{}](
+          IdTableStatic<0>& block) mutable -> IdTableStatic<0> {
+        if (block.empty()) {
+          return std::move(block);
+        }
+        if (!hasDuplicates) {
+          hasDuplicates =
+              (lastRow.has_value() && block.front() == lastRow.value()) ||
+              ql::ranges::adjacent_find(block) != block.end();
+        }
+        lastRow = block.back();
+        return std::move(block);
+      }}};
+}
+
+// _____________________________________________________________________________
+void MaterializedViewWriter::writeViewMetadata(bool updatable) const {
   // Export column names to view info JSON file.
   const auto& varToCol = qet_->getVariableColumns();
   nlohmann::json viewInfo = {
@@ -379,7 +401,8 @@ void MaterializedViewWriter::writeViewMetadata() const {
                    ColumnIndexAndTypeInfo::UndefStatus::AlwaysDefined}};
         }) |
         ::ranges::to<std::vector<nlohmann::json>>())},
-      {"query", parsedQuery_._originalString}};
+      {"query", parsedQuery_._originalString},
+      {"updatable", updatable}};
   ad_utility::makeOfstream(absl::StrCat(getFilenameBase(), VIEW_INFO_SUFFIX))
       << viewInfo.dump() << std::endl;
 }
@@ -394,13 +417,15 @@ void MaterializedViewWriter::computeResultAndWritePermutation() const {
 
   Sorter spoSorter{getFilenameBase() + ".spo-sorter.dat", numCols(),
                    memoryLimit_, allocator_};
-  RangeOfIdTables sortedBlocksSPO = getSortedBlocks(spoSorter, result);
+  bool hasDuplicates = false;
+  RangeOfIdTables sortedBlocksSPO =
+      checkForDuplicateRows(getSortedBlocks(spoSorter, result), hasDuplicates);
 
   // Write compressed relation to disk.
   AD_LOG_INFO << "Writing materialized view \"" << name_ << "\" to disk ..."
               << std::endl;
   auto spoMetaData = writePermutation(std::move(sortedBlocksSPO));
-  writeViewMetadata();
+  writeViewMetadata(!hasDuplicates);
 
   AD_LOG_INFO << "Statistics for view \"" << name_
               << "\": " << spoMetaData.statistics() << std::endl;
@@ -500,6 +525,10 @@ MaterializedView::MaterializedView(std::string onDiskBase, std::string name)
     coveredBinds_ = materializedViewsQueryAnalysis::extractBindExpressions(
         parsedQuery_.value(), varToColMap_);
   }
+
+  // Views written before the `updatable` flag was introduced are not
+  // updatable.
+  updatable_ = viewInfoJson.value("updatable", false);
 
   // Read the permutation and set its type to `MATERIALIZED_VIEW`. This
   // deactivates the graph post-processing of `CompressedRelationReader`,

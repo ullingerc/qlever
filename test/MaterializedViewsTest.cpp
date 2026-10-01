@@ -439,7 +439,7 @@ TEST_F(MaterializedViewsTest, ColumnPermutation) {
     clearLog();
     const std::string presortedQuery =
         "SELECT * { SELECT ?p ?o (?s AS ?x) ?g { ?s ?p ?o . BIND(3 AS ?g) } "
-        "INTERNAL SORT BY ?p ?o ?x }";
+        "INTERNAL SORT BY ?p ?o ?x ?g }";
     manager.writeViewToDisk("testView4",
                             qlv().parseAndPlanQuery(presortedQuery));
     EXPECT_THAT(log_.str(),
@@ -2248,4 +2248,129 @@ TEST(MaterializedViewsManager, viewFilesOnDisk) {
               ::testing::UnorderedElementsAre(
                   MaterializedView::getFilenameBase(base, "viewA"),
                   MaterializedView::getFilenameBase(base, "viewB") + ".spo"));
+}
+
+// _____________________________________________________________________________
+TEST(ExternalSortFunctors, SortAllColumns) {
+  auto t = makeIdTableFromVector(
+      {{1, 2, 3, 4, 5}, {1, 2, 3, 4, 6}, {1, 2, 3, 5, 0}, {1, 2, 3, 4, 5}});
+  SortAllColumns cmp;
+  // Rows differing only in column 4 or 3.
+  EXPECT_TRUE(cmp(t[0], t[1]));
+  EXPECT_FALSE(cmp(t[1], t[0]));
+  EXPECT_TRUE(cmp(t[1], t[2]));
+  EXPECT_FALSE(cmp(t[2], t[1]));
+  // Equal rows.
+  EXPECT_FALSE(cmp(t[0], t[3]));
+  EXPECT_FALSE(cmp(t[3], t[0]));
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, SortedByAllColumns) {
+  ENFORCE_LOG_LEVEL_OR_SKIP(INFO);
+  // The rows of the view differ only in columns 3 and 4.
+  const std::string values =
+      "VALUES (?a ?b ?c ?d ?e) { (1 1 1 1 3) (1 1 1 1 2) (1 1 1 0 1) "
+      "(1 1 1 1 1) }";
+  auto expected = getQueryResultAsIdTable(absl::StrCat(
+      "SELECT * { ", values, " } INTERNAL SORT BY ?a ?b ?c ?d ?e"));
+  auto scanView = [this](std::string_view name) {
+    return getQueryResultAsIdTable(absl::StrCat(
+        "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> "
+        "SELECT * { SERVICE view:",
+        name,
+        " { _:config view:column-a ?a ; view:column-b ?b ; view:column-c ?c ; "
+        "view:column-d ?d ; view:column-e ?e . } }"));
+  };
+
+  // Unsorted query result.
+  qlv().writeMaterializedView("unsorted",
+                              absl::StrCat("SELECT * { ", values, " }"));
+  EXPECT_THAT(scanView("unsorted"), matchesIdTable(expected));
+
+  // Query result sorted only by the first three columns: This must not be
+  // considered as already sorted.
+  clearLog();
+  qlv().writeMaterializedView(
+      "sortedPrefix",
+      absl::StrCat("SELECT * { ", values, " } INTERNAL SORT BY ?a ?b ?c"));
+  EXPECT_THAT(log_.str(),
+              ::testing::HasSubstr("Sorting query result rows for "
+                                   "materialized view \"sortedPrefix\""));
+  EXPECT_THAT(scanView("sortedPrefix"), matchesIdTable(expected));
+
+  // Query result sorted by all columns: The sorting is skipped.
+  clearLog();
+  qlv().writeMaterializedView(
+      "sortedAll", absl::StrCat("SELECT * { ", values,
+                                " } INTERNAL SORT BY ?a ?b ?c ?d ?e"));
+  EXPECT_THAT(log_.str(),
+              ::testing::HasSubstr("Query result rows for materialized view "
+                                   "\"sortedAll\" are already sorted"));
+  EXPECT_THAT(scanView("sortedAll"), matchesIdTable(expected));
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, Updatable) {
+  MaterializedViewsManager manager{testIndexBase_};
+  auto isUpdatable = [&](const std::string& name, const std::string& query) {
+    manager.writeViewToDisk(name, qlv().parseAndPlanQuery(query));
+    return manager.getView(name, nullptr)->isUpdatable();
+  };
+
+  // No duplicates.
+  EXPECT_TRUE(isUpdatable("noDuplicates", "SELECT ?s ?p ?o { ?s ?p ?o }"));
+  // Duplicates created by a projection (already sorted query result).
+  EXPECT_FALSE(isUpdatable("projection", "SELECT ?s { ?s ?p ?o }"));
+  // Duplicates which are not adjacent before sorting.
+  EXPECT_FALSE(
+      isUpdatable("unsortedDuplicates",
+                  "SELECT * { VALUES (?x ?y) { (1 2) (3 4) (1 2) } }"));
+  EXPECT_TRUE(isUpdatable("unsortedNoDuplicates",
+                          "SELECT * { VALUES (?x ?y) { (1 2) (3 4) (1 3) } }"));
+
+  // Backward compatibility: A view without the `updatable` key is not
+  // updatable.
+  {
+    const std::string metadataFilename =
+        absl::StrCat(testIndexBase_, ".view.noDuplicates.viewinfo.json");
+    nlohmann::json viewInfo;
+    ad_utility::makeIfstream(metadataFilename) >> viewInfo;
+    EXPECT_TRUE(viewInfo.at("updatable").get<bool>());
+    viewInfo.erase("updatable");
+    ad_utility::makeOfstream(metadataFilename) << viewInfo.dump() << std::endl;
+    manager.unloadViewIfLoaded("noDuplicates");
+    EXPECT_FALSE(manager.getView("noDuplicates", nullptr)->isUpdatable());
+  }
+}
+
+// _____________________________________________________________________________
+TEST(MaterializedViewWriter, checkForDuplicateRows) {
+  // Run `checkForDuplicateRows` on the given blocks, check that the blocks are
+  // passed through unchanged and return whether duplicates were found.
+  auto hasDuplicates = [](const std::vector<VectorTable>& input) {
+    std::vector<IdTableStatic<0>> blocks;
+    for (const auto& block : input) {
+      blocks.push_back(makeIdTableFromVector(block));
+    }
+    bool result = false;
+    auto range = MaterializedViewWriter::checkForDuplicateRows(
+        MaterializedViewWriter::RangeOfIdTables{std::move(blocks)}, result);
+    size_t i = 0;
+    for (auto& block : range) {
+      EXPECT_THAT(IdTable{std::move(block)},
+                  matchesIdTableFromVector(input.at(i)));
+      ++i;
+    }
+    EXPECT_EQ(i, input.size());
+    return result;
+  };
+
+  EXPECT_FALSE(hasDuplicates({}));
+  EXPECT_FALSE(hasDuplicates({{{1, 2}, {3, 4}}, {{3, 5}}}));
+  // Duplicates within a block.
+  EXPECT_TRUE(hasDuplicates({{{1, 2}, {1, 2}}}));
+  // Duplicates across a block boundary, also with an empty block in between.
+  EXPECT_TRUE(hasDuplicates({{{1, 2}, {3, 4}}, {{3, 4}, {5, 6}}}));
+  EXPECT_TRUE(hasDuplicates({{{1, 2}}, {}, {{1, 2}}}));
 }
