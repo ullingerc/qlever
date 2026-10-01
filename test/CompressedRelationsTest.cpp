@@ -587,7 +587,7 @@ TEST(CompressedRelationWriter, getFirstAndLastTripleWithUpdates) {
   LocatedTriplesPerBlock locatedTriples;
   std::vector<LocatedTriple> deleteTriples;
   deleteTriples.emplace_back(
-      LocatedTriple{0, IdTriple{{V(1), V(2), V(3), V(g2)}}, false});
+      LocatedTriple{0, IdTriple{{V(1), V(2), V(3), V(g2)}}, {}, false});
   locatedTriples.setOriginalMetadata(blocks);
   locatedTriples.add(deleteTriples);
   locatedTriples.consolidateAllBlocks();
@@ -614,7 +614,7 @@ TEST(CompressedRelationWriter, getFirstAndLastTripleWithUpdates) {
   // block.
   deleteTriples.clear();
   deleteTriples.emplace_back(
-      LocatedTriple{2, IdTriple{{V(1), V(4), V(5), V(g2)}}, false});
+      LocatedTriple{2, IdTriple{{V(1), V(4), V(5), V(g2)}}, {}, false});
   locatedTriples.add(deleteTriples);
   locatedTriples.consolidateAllBlocks();
   testFirstAndLastBlock({V(1), std::nullopt, std::nullopt},
@@ -1096,6 +1096,106 @@ LocatedTriplesPerBlock makeLocatedTriplesPerBlock(
   return locatedTriples;
 }
 }  // namespace
+
+// _____________________________________________________________________________
+TEST(CompressedRelationReader, scanWithPayloadLocatedTriples) {
+  // A permutation with two payload columns (like a materialized view). Each
+  // row is `col0, col1, col2, graph, payload1, payload2`.
+  const int G = 1234059;
+  using Row = std::vector<int>;
+  std::vector<Row> rows;
+  // A large relation that spans several blocks.
+  for (int i = 0; i < 10; ++i) {
+    rows.push_back({1, i, i, G, 10 * i, 0});
+  }
+  // Small relations that share a block.
+  rows.push_back({2, 1, 1, G, 5, 5});
+  rows.push_back({2, 2, 2, G, 6, 6});
+  rows.push_back({3, 1, 1, G, 7, 7});
+
+  std::vector<RelationInput> inputs;
+  for (const auto& row : rows) {
+    if (inputs.empty() || inputs.back().col0_ != row.at(0)) {
+      inputs.push_back({row.at(0), {}});
+    }
+    inputs.back().col1And2_.emplace_back(row.begin() + 1, row.end());
+  }
+  auto [filename, cleanup] = testFilenameWithCleanup();
+  auto [blocks, metaData, reader] = writeAndOpenRelations(inputs, filename, 4);
+  ASSERT_GT(blocks.size(), 2);
+
+  std::vector<Row> inserted{
+      {1, 3, 3, G, 30, 2},  // Differs from an existing row only in payload.
+      {2, 1, 1, G, 5, 6},   // Differs from a deleted row only in payload.
+      {3, 0, 0, G, 1, 1},   // New row in a small relation.
+      {4, 0, 0, G, 9, 9}};  // Larger than all rows.
+  std::vector<Row> deleted{
+      {1, 3, 3, G, 30, 0},  // Existing row.
+      {1, 5, 5, G, 50, 1},  // Not existing (the payload differs).
+      {2, 1, 1, G, 5, 5}};  // Existing row in a small relation.
+
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  auto toIdTable = [](const std::vector<Row>& input) {
+    VectorTable table;
+    for (const auto& row : input) {
+      table.emplace_back(row.begin(), row.end());
+    }
+    return makeIdTableFromVector(table);
+  };
+  LocatedTriplesPerBlock locatedTriples;
+  locatedTriples.setNumPayloadColumns(2);
+  locatedTriples.setOriginalMetadata(blocks);
+  locatedTriples.add(LocatedTriple::locateRowsInView(toIdTable(inserted),
+                                                     blocks, true, handle));
+  locatedTriples.add(LocatedTriple::locateRowsInView(toIdTable(deleted), blocks,
+                                                     false, handle));
+  locatedTriples.consolidateAllBlocks();
+  locatedTriples.updateAugmentedMetadata();
+
+  // The expected rows after applying the updates.
+  std::vector<Row> expected;
+  ql::ranges::copy_if(rows, std::back_inserter(expected), [&](const Row& row) {
+    return !ad_utility::contains(deleted, row);
+  });
+  ql::ranges::copy(inserted, std::back_inserter(expected));
+  ql::ranges::sort(expected);
+
+  // Scan with the given `col0` (or a full scan) and `additionalColumns` and
+  // check that the result matches `expected`.
+  auto testScan = [&](std::optional<int> col0,
+                      std::vector<ColumnIndex> additionalColumns,
+                      source_location l = AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(l);
+    std::optional<Id> col0Id;
+    if (col0.has_value()) {
+      col0Id = V(col0.value());
+    }
+    CompressedRelationReader::ScanSpecAndBlocks scanSpecAndBlocks{
+        ScanSpecification{col0Id, std::nullopt, std::nullopt},
+        getBlockMetadataRangesfromVec(locatedTriples.getAugmentedMetadata())};
+    auto result = reader->scan(scanSpecAndBlocks, additionalColumns, handle,
+                               locatedTriples);
+    std::vector<ColumnIndex> columns{1, 2};
+    if (!col0.has_value()) {
+      columns.insert(columns.begin(), 0);
+    }
+    ql::ranges::copy(additionalColumns, std::back_inserter(columns));
+    std::vector<Row> expectedForScan;
+    for (const auto& row : expected) {
+      if (!col0.has_value() || row.at(0) == col0.value()) {
+        expectedForScan.push_back(ad_utility::transform(
+            columns, [&row](ColumnIndex c) { return row.at(c); }));
+      }
+    }
+    checkThatTablesAreEqual(expectedForScan, result);
+  };
+
+  testScan(std::nullopt, {3, 4, 5});
+  for (int col0 : {1, 2, 3, 4}) {
+    testScan(col0, {3, 4, 5});
+    testScan(col0, {5});
+  }
+}
 
 // _____________________________________________________________________________
 TEST(CompressedRelationReader, getDistinctCol0Ids) {

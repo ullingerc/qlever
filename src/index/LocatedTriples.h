@@ -85,8 +85,20 @@ struct LocatedTriple {
   // and `triple_[3]` is the graph.
   IdTriple<0> triple_;
 
+  // The values of the payload columns (the columns after the graph column).
+  // Empty for the permutations of the main index, which have no payload
+  // columns. Only used for materialized views, where the payload columns are
+  // real data.
+  std::vector<Id> payload_;
+
   // If `true`, the triple is inserted, otherwise it is deleted.
   bool insertOrDelete_;
+
+  // Return the index of the block to which the `permutedTriple` belongs. See
+  // the definition at the end of this file.
+  static size_t locateBlock(
+      const IdTriple<0>& permutedTriple,
+      ql::span<const CompressedBlockMetadata> blockMetadata);
 
   // Locate the given triples in the given permutation.
   static std::vector<LocatedTriple> locateTriplesInPermutation(
@@ -95,21 +107,43 @@ struct LocatedTriple {
       const qlever::KeyOrder& keyOrder, bool insertOrDelete,
       ad_utility::SharedCancellationHandle cancellationHandle);
 
+  // Locate the given `rows` in a permutation with payload columns (a
+  // materialized view). Columns 0 to 3 of `rows` are the key (in the order of
+  // the permutation) and the remaining columns are the payload.
+  static std::vector<LocatedTriple> locateRowsInView(
+      const IdTable& rows,
+      ql::span<const CompressedBlockMetadata> blockMetadata,
+      bool insertOrDelete,
+      ad_utility::SharedCancellationHandle cancellationHandle);
+
+  // NOTE: `payload_` has to come directly after `triple_`, such that the order
+  // is consistent with `LocatedTriplesProjection` within a block.
   QL_DEFINE_DEFAULTED_THREEWAY_OPERATOR_LOCAL(LocatedTriple, blockIndex_,
-                                              triple_, insertOrDelete_)
+                                              triple_, payload_,
+                                              insertOrDelete_)
 
   // This operator is only for debugging and testing. It returns a
   // human-readable representation.
   friend std::ostream& operator<<(std::ostream& os, const LocatedTriple& lt) {
-    os << "LT(" << lt.blockIndex_ << " " << lt.triple_ << " "
-       << lt.insertOrDelete_ << ")";
+    os << "LT(" << lt.blockIndex_ << " " << lt.triple_ << " ";
+    for (const auto& id : lt.payload_) {
+      os << id << " ";
+    }
+    os << lt.insertOrDelete_ << ")";
     return os;
   }
 };
 
-using SortedLocatedTriplesVector = ad_utility::SortedSequence<
-    LocatedTriple, std::less<>,
-    ad_utility::MemberProjection<&LocatedTriple::triple_>>;
+// Projection of a `LocatedTriple` to its sort key `(triple_, payload_)`.
+struct LocatedTriplesProjection {
+  auto operator()(const LocatedTriple& lt) const {
+    return std::tie(lt.triple_, lt.payload_);
+  }
+};
+
+using SortedLocatedTriplesVector =
+    ad_utility::SortedSequence<LocatedTriple, std::less<>,
+                               LocatedTriplesProjection>;
 
 using LocatedTriples = SortedLocatedTriplesVector;
 
@@ -120,6 +154,11 @@ class LocatedTriplesPerBlock {
   // For each block with a non-empty set of located triples, the located triples
   // in that block.
   ad_utility::HashMap<size_t, LocatedTriples> map_;
+
+  // The number of payload columns of the permutation (the number of columns
+  // after the graph column). The `payload_` of each added `LocatedTriple` must
+  // have exactly this size. Nonzero only for materialized views.
+  size_t numPayloadColumns_ = 0;
 
   FRIEND_TEST(LocatedTriplesTest, numTriplesInBlock);
 
@@ -181,6 +220,18 @@ class LocatedTriplesPerBlock {
   // located triple will have values for OSG and UNDEF for X and Y.
   IdTable mergeTriples(size_t blockIndex, const IdTable& block,
                        size_t numIndexColumns, bool includeGraphColumn) const;
+
+  // Like `mergeTriples`, but `block` contains all the `4 +
+  // numPayloadColumns()` columns of the permutation and is sorted
+  // lexicographically by all columns. The rows are compared including the
+  // payload, and inserted rows get their `payload_` (not UNDEF).
+  IdTable mergeFullRows(size_t blockIndex, const IdTable& block) const;
+
+  // Get and set the number of payload columns, see `numPayloadColumns_`.
+  size_t numPayloadColumns() const { return numPayloadColumns_; }
+  void setNumPayloadColumns(size_t numPayloadColumns) {
+    numPayloadColumns_ = numPayloadColumns;
+  }
 
   // Return true iff there are located triples in the block with the given
   // index.

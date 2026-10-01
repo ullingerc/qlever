@@ -21,6 +21,27 @@
 #include "util/ValueIdentity.h"
 
 // ____________________________________________________________________________
+size_t LocatedTriple::locateBlock(
+    const IdTriple<0>& permutedTriple,
+    ql::span<const CompressedBlockMetadata> blockMetadata) {
+  // A triple belongs to the first block that contains at least one triple
+  // that larger than or equal to the triple. See `LocatedTriples.h` for a
+  // discussion of the corner cases.
+  return ql::ranges::lower_bound(
+             blockMetadata, permutedTriple.toPermutedTriple(),
+             [](const auto& a, const auto& b) {
+               // All identical triples with different graphs are currently
+               // stored in the same block, so we don't need to check the
+               // graph. In particular, if this triple is equal (without
+               // graphs) to the first or last triple of a block, then this
+               // call to `lower_bound` will correctly identify this block.
+               return a.tieWithoutGraph() < b.tieWithoutGraph();
+             },
+             &CompressedBlockMetadata::lastTriple_) -
+         blockMetadata.begin();
+}
+
+// ____________________________________________________________________________
 std::vector<LocatedTriple> LocatedTriple::locateTriplesInPermutation(
     ql::span<const IdTriple<0>> triples,
     ql::span<const CompressedBlockMetadata> blockMetadata,
@@ -32,26 +53,36 @@ std::vector<LocatedTriple> LocatedTriple::locateTriplesInPermutation(
       0, triples.size(),
       [&triples, &out, &blockMetadata, &keyOrder, &insertOrDelete](size_t i) {
         auto triple = triples[i].permute(keyOrder);
-        // A triple belongs to the first block that contains at least one triple
-        // that larger than or equal to the triple. See `LocatedTriples.h` for a
-        // discussion of the corner cases.
-        size_t blockIndex =
-            ql::ranges::lower_bound(
-                blockMetadata, triple.toPermutedTriple(),
-                [](const auto& a, const auto& b) {
-                  // All identical triples with different graphs are currently
-                  // stored in the same block, so we don't need to check the
-                  // graph. In particular, if this triple is equal (without
-                  // graphs) to the first or last triple of a block, then this
-                  // call to `lower_bound` will correctly identify this block.
-                  return a.tieWithoutGraph() < b.tieWithoutGraph();
-                },
-                &CompressedBlockMetadata::lastTriple_) -
-            blockMetadata.begin();
-        out.push_back({blockIndex, triple, insertOrDelete});
+        out.push_back(
+            {locateBlock(triple, blockMetadata), triple, {}, insertOrDelete});
       },
       [&cancellationHandle]() { cancellationHandle->throwIfCancelled(); });
 
+  return out;
+}
+
+// ____________________________________________________________________________
+std::vector<LocatedTriple> LocatedTriple::locateRowsInView(
+    const IdTable& rows, ql::span<const CompressedBlockMetadata> blockMetadata,
+    bool insertOrDelete,
+    ad_utility::SharedCancellationHandle cancellationHandle) {
+  AD_CONTRACT_CHECK(rows.numColumns() >= 4);
+  std::vector<LocatedTriple> out;
+  out.reserve(rows.numRows());
+  ad_utility::chunkedForLoop<10'000>(
+      0, rows.numRows(),
+      [&rows, &out, &blockMetadata, insertOrDelete](size_t i) {
+        const auto& row = rows[i];
+        IdTriple<0> triple{std::array{row[0], row[1], row[2], row[3]}};
+        std::vector<Id> payload;
+        payload.reserve(rows.numColumns() - 4);
+        for (size_t col = 4; col < rows.numColumns(); ++col) {
+          payload.push_back(row[col]);
+        }
+        out.push_back({locateBlock(triple, blockMetadata), triple,
+                       std::move(payload), insertOrDelete});
+      },
+      [&cancellationHandle]() { cancellationHandle->throwIfCancelled(); });
   return out;
 }
 
@@ -254,6 +285,84 @@ IdTable LocatedTriplesPerBlock::mergeTriples(size_t blockIndex,
   }
 }
 
+// ____________________________________________________________________________
+IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
+                                              const IdTable& block) const {
+  // This method should only be called if there are located triples in the
+  // specified block.
+  AD_CONTRACT_CHECK(map_.contains(blockIndex));
+  AD_CONTRACT_CHECK(block.numColumns() == 4 + numPayloadColumns_);
+
+  IdTable result{block.numColumns(), block.getAllocator()};
+  result.resize(block.numRows() + numTriples(blockIndex).numAdded_);
+
+  // Three-way comparison of the full row of `lt` (key and payload) with `row`.
+  // Returns a negative value, zero, or a positive value.
+  auto compare = [this](const LocatedTriple& lt, const auto& row) {
+    auto ltKey = tieLocatedTripleValue<3, true>(lt);
+    auto rowKey = tieIdTableRow<3, true>(row);
+    if (ltKey != rowKey) {
+      return ltKey < rowKey ? -1 : 1;
+    }
+    for (size_t i = 0; i < numPayloadColumns_; ++i) {
+      if (lt.payload_[i] != row[4 + i]) {
+        return lt.payload_[i] < row[4 + i] ? -1 : 1;
+      }
+    }
+    return 0;
+  };
+
+  auto rowIt = block.begin();
+  auto sortedLocatedTriples = map_.at(blockIndex).getSortedView();
+  auto locatedTripleIt = sortedLocatedTriples.begin();
+  auto locatedTripleEnd = sortedLocatedTriples.end();
+  auto resultIt = result.begin();
+
+  // Write the full row of `locatedTriple` (key and payload) to `result` at
+  // position `resultIt` and advance `resultIt` by one.
+  auto writeLocatedTripleToResult = [this, &resultIt](const LocatedTriple& lt) {
+    for (size_t i = 0; i < 4; ++i) {
+      (*resultIt)[i] = lt.triple_.ids()[i];
+    }
+    for (size_t i = 0; i < numPayloadColumns_; ++i) {
+      (*resultIt)[4 + i] = lt.payload_[i];
+    }
+    resultIt++;
+  };
+
+  // Same three-way merge as in `mergeTriplesImpl`.
+  while (rowIt != block.end() && locatedTripleIt != locatedTripleEnd) {
+    int cmp = compare(*locatedTripleIt, *rowIt);
+    if (cmp < 0) {
+      if (locatedTripleIt->insertOrDelete_) {
+        // Insertion of a non-existent row.
+        writeLocatedTripleToResult(*locatedTripleIt);
+      }
+      locatedTripleIt++;
+    } else if (cmp == 0) {
+      if (!locatedTripleIt->insertOrDelete_) {
+        // Deletion of an existing row.
+        rowIt++;
+      }
+      locatedTripleIt++;
+    } else {
+      // The rowIt is not deleted - copy it
+      *resultIt++ = *rowIt++;
+    }
+  }
+  for (; locatedTripleIt != locatedTripleEnd; ++locatedTripleIt) {
+    if (locatedTripleIt->insertOrDelete_) {
+      writeLocatedTripleToResult(*locatedTripleIt);
+    }
+  }
+  while (rowIt != block.end()) {
+    *resultIt++ = *rowIt++;
+  }
+
+  result.resize(resultIt - result.begin());
+  return result;
+}
+
 namespace {
 // Identify the triples to vacuum for a single block by comparing the
 // `locatedTriples` with the `idTable` of the block (which has no updates
@@ -380,6 +489,7 @@ void LocatedTriplesPerBlock::add(ql::span<const LocatedTriple> locatedTriples,
                                  ad_utility::timer::TimeTracer& tracer) {
   tracer.beginTrace("adding");
   for (const auto& locatedTriple : locatedTriples) {
+    AD_CONTRACT_CHECK(locatedTriple.payload_.size() == numPayloadColumns_);
     map_[locatedTriple.blockIndex_].insert(locatedTriple);
   }
   tracer.endTrace("adding");
@@ -400,7 +510,7 @@ void LocatedTriplesPerBlock::erase(size_t blockIndex, const LocatedTriple& lt) {
 // ____________________________________________________________________________
 void LocatedTriplesPerBlock::erase(ql::span<LocatedTriple> sortedTriples) {
   AD_CORRECTNESS_CHECK(
-      ql::ranges::is_sorted(sortedTriples, {}, &LocatedTriple::triple_));
+      ql::ranges::is_sorted(sortedTriples, {}, LocatedTriplesProjection{}));
 
   for (const auto chunk :
        ::ranges::views::chunk_by(sortedTriples, [](auto& lt1, auto& lt2) {
@@ -542,7 +652,7 @@ bool LocatedTriplesPerBlock::isLocatedTriple(const IdTriple<0>& triple,
                                              bool insertOrDelete) const {
   auto blockContains = [&triple, insertOrDelete](const LocatedTriples& lt,
                                                  size_t blockIndex) {
-    LocatedTriple locatedTriple{blockIndex, triple, insertOrDelete};
+    LocatedTriple locatedTriple{blockIndex, triple, {}, insertOrDelete};
     locatedTriple.blockIndex_ = blockIndex;
     return ad_utility::contains(lt.getSortedView(), locatedTriple);
   };

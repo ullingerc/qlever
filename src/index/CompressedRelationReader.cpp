@@ -169,7 +169,7 @@ CompressedRelationReader::asyncParallelBlockGenerator(
       // contention of the file. On a fast SSD we could possibly change this,
       // but this has to be investigated.
       auto compressedBlock = reader_->readCompressedBlockFromFile(
-          blockMetadata, scanConfig_.scanColumns_);
+          blockMetadata, columnsToRead(scanConfig_, blockMetadata));
 
       lock.unlock();
       auto decompressedBlockAndMetadata =
@@ -977,6 +977,19 @@ DecompressedBlock CompressedRelationReader::decompressBlock(
 }
 
 // ____________________________________________________________________________
+CompressedRelationReader::ColumnIndices CompressedRelationReader::columnsToRead(
+    const ScanImplConfig& scanConfig, const CompressedBlockMetadata& metadata) {
+  const auto& locatedTriples = scanConfig.locatedTriples_;
+  if (locatedTriples.numPayloadColumns() > 0 &&
+      locatedTriples.containsTriples(metadata.blockIndex_)) {
+    ColumnIndices allColumns(4 + locatedTriples.numPayloadColumns());
+    std::iota(allColumns.begin(), allColumns.end(), ColumnIndex{0});
+    return allColumns;
+  }
+  return scanConfig.scanColumns_;
+}
+
+// ____________________________________________________________________________
 DecompressedBlockAndMetadata
 CompressedRelationReader::decompressAndPostprocessBlock(
     const CompressedBlock& compressedBlock, size_t numRowsToRead,
@@ -986,10 +999,21 @@ CompressedRelationReader::decompressAndPostprocessBlock(
   auto [numIndexColumns, includeGraphColumn] =
       prepareLocatedTriples(scanConfig.scanColumns_);
   bool hasUpdates = false;
-  if (scanConfig.locatedTriples_.containsTriples(metadata.blockIndex_)) {
-    decompressedBlock = scanConfig.locatedTriples_.mergeTriples(
-        metadata.blockIndex_, decompressedBlock, numIndexColumns,
-        includeGraphColumn);
+  const auto& locatedTriples = scanConfig.locatedTriples_;
+  if (locatedTriples.containsTriples(metadata.blockIndex_)) {
+    if (locatedTriples.numPayloadColumns() > 0) {
+      // The block was read with all columns (see `columnsToRead`), merge the
+      // full rows and then project to the requested columns.
+      AD_CORRECTNESS_CHECK(decompressedBlock.numColumns() ==
+                           4 + locatedTriples.numPayloadColumns());
+      decompressedBlock =
+          locatedTriples.mergeFullRows(metadata.blockIndex_, decompressedBlock);
+      decompressedBlock.setColumnSubset(scanConfig.scanColumns_);
+    } else {
+      decompressedBlock =
+          locatedTriples.mergeTriples(metadata.blockIndex_, decompressedBlock,
+                                      numIndexColumns, includeGraphColumn);
+    }
     hasUpdates = true;
   }
   bool wasPostprocessed = false;
@@ -1024,8 +1048,8 @@ CompressedRelationReader::readAndDecompressBlock(
   if (scanConfig.graphFilter_.canBlockBeSkipped(blockMetaData)) {
     return std::nullopt;
   }
-  CompressedBlock compressedColumns =
-      readCompressedBlockFromFile(blockMetaData, scanConfig.scanColumns_);
+  CompressedBlock compressedColumns = readCompressedBlockFromFile(
+      blockMetaData, columnsToRead(scanConfig, blockMetaData));
   const auto numRowsToRead = blockMetaData.numRows_;
   return decompressAndPostprocessBlock(compressedColumns, numRowsToRead,
                                        scanConfig, blockMetaData);
