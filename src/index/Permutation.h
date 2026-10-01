@@ -20,6 +20,7 @@
 #include "index/CompressedRelationReader.h"
 #include "index/IndexMetaData.h"
 #include "index/KeyOrder.h"
+#include "index/LocatedTriples.h"
 #include "parser/data/LimitOffsetClause.h"
 #include "util/CancellationHandle.h"
 #include "util/File.h"
@@ -342,6 +343,10 @@ class Permutation {
   // For materialized views unlike the regular index permutations, some columns
   // may be undefined.
   ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns_;
+
+  // For materialized views: the (empty) located triples that are used if a
+  // `LocatedTriplesState` has no updates for this view.
+  LocatedTriplesPerBlock emptyLocatedTriplesForView_;
 };
 
 #endif  // QLEVER_SRC_INDEX_PERMUTATION_H

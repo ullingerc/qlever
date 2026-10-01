@@ -21,6 +21,7 @@
 #include "index/LocalVocab.h"
 #include "index/LocatedTriples.h"
 #include "index/Permutation.h"
+#include "util/Algorithm.h"
 #include "util/LruCache.h"
 #include "util/Synchronized.h"
 #include "util/TimeTracer.h"
@@ -52,6 +53,17 @@ struct LocatedTriplesState {
   // Counts of the external triples. Only set when this is a deep copy, not for
   // references.
   std::optional<DeltaTriplesCount> counts_ = std::nullopt;
+  // The located rows of the materialized views that are registered for
+  // updates, keyed by the name of the view (see `DeltaTriples::registerView`).
+  ad_utility::HashMap<std::string, LocatedTriplesPerBlock> viewLocatedTriples_ =
+      {};
+
+  // Get the located rows of the materialized view with the given `name`, or
+  // `boost::none` if the view is not registered in this state.
+  boost::optional<const LocatedTriplesPerBlock&> getLocatedTriplesForView(
+      const std::string& name) const {
+    return ad_utility::findOptional(viewLocatedTriples_, name);
+  }
   // Get `LocatedTriplesPerBlock` objects for the given permutation.
   template <bool isInternal>
   const LocatedTriplesPerBlock& getLocatedTriplesForPermutation(
@@ -94,6 +106,7 @@ class DeltaTriples {
   FRIEND_TEST(DeltaTriplesTest, clear);
   FRIEND_TEST(DeltaTriplesTest, addTriplesToLocalVocab);
   FRIEND_TEST(DeltaTriplesTest, storeAndRestoreData);
+  FRIEND_TEST(DeltaTriplesTest, viewRows);
 
  public:
   using Triples = std::vector<IdTriple<0>>;
@@ -170,6 +183,22 @@ class DeltaTriples {
   // it can be replaced by a `HashMap<Triple, insertedOrDeleted>`.
   TriplesSets<false> triplesSetsNormal_;
   TriplesSets<true> triplesSetsInternal_;
+
+  // The state of a materialized view that is registered for updates, see
+  // `registerView`. The located rows themselves are stored in
+  // `LocatedTriplesState::viewLocatedTriples_`.
+  struct ViewState {
+    // The original block metadata of the view's permutation.
+    std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata_;
+    // The columns that may contain UNDEF values.
+    ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns_;
+    // The full rows (all columns) inserted into and deleted from the view, with
+    // the same semantics as `TriplesSets`.
+    using RowSet = ad_utility::HashSet<std::vector<Id>>;
+    RowSet rowsInserted_;
+    RowSet rowsDeleted_;
+  };
+  ad_utility::HashMap<std::string, ViewState> views_;
 
  public:
   // Construct for given index.
@@ -261,6 +290,38 @@ class DeltaTriples {
       CancellationHandle cancellationHandle, Triples triples,
       ad_utility::timer::TimeTracer& tracer =
           ad_utility::timer::DEFAULT_TIME_TRACER);
+
+  // Register the materialized view with the given `name` for updates. The
+  // view's located rows are tracked using the original block `metadata` of its
+  // permutation. Inserted and deleted rows must have `4 + numPayloadColumns`
+  // columns and may contain UNDEF only in the `possiblyUndefinedColumns`. If
+  // the view is already registered with the same `metadata`, nothing happens;
+  // otherwise the old registration (including its updates) is replaced.
+  //
+  // NOTE: The rows of views are not persisted by `writeToDisk` and not counted
+  // by `getCounts`.
+  void registerView(
+      const std::string& name,
+      std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata,
+      size_t numPayloadColumns,
+      ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns);
+
+  // Unregister the materialized view with the given `name` and drop all its
+  // updates. Does nothing if the view is not registered.
+  void unregisterView(const std::string& name);
+
+  // Insert/delete full `rows` into/from the registered materialized view with
+  // the given `name`. See `insertTriples` for the meaning of `consolidate`.
+  template <Consolidate consolidate = Consolidate::Yes>
+  void insertViewRows(CancellationHandle cancellationHandle,
+                      const std::string& name, IdTable rows,
+                      ad_utility::timer::TimeTracer& tracer =
+                          ad_utility::timer::DEFAULT_TIME_TRACER);
+  template <Consolidate consolidate = Consolidate::Yes>
+  void deleteViewRows(CancellationHandle cancellationHandle,
+                      const std::string& name, IdTable rows,
+                      ad_utility::timer::TimeTracer& tracer =
+                          ad_utility::timer::DEFAULT_TIME_TRACER);
 
   // If the `filename` is set, then `writeToDisk()` will write these
   // `DeltaTriples` to `filename.value()`. If `filename` is `nullopt`, then
@@ -374,6 +435,13 @@ class DeltaTriples {
                          ad_utility::timer::TimeTracer& tracer =
                              ad_utility::timer::DEFAULT_TIME_TRACER);
 
+  // Like `modifyTriplesImpl`, but for the full `rows` of the registered
+  // materialized view with the given `name`.
+  template <bool insertOrDelete>
+  void modifyViewRowsImpl(CancellationHandle cancellationHandle,
+                          const std::string& name, IdTable rows,
+                          ad_utility::timer::TimeTracer& tracer);
+
   // Rewrite each triple in `triples` such that all local vocab entries and all
   // local blank nodes are managed by the `localVocab_` of this class.
   //
@@ -384,6 +452,12 @@ class DeltaTriples {
   // NOTE: Words that already have a non-local `Id` are not stored in the
   // `localVocab_` at all, see `LocalVocab::getIdAndAddIfNotContained`.
   void rewriteLocalVocabEntriesAndBlankNodes(Triples& triples);
+  // The same for all `Id`s of the given `rows`.
+  void rewriteLocalVocabEntriesAndBlankNodes(IdTable& rows);
+  // Common implementation of the two functions above. `forEachId(convertId)`
+  // has to call `convertId(Id&)` for each `Id` to be rewritten.
+  template <typename ForEachId>
+  void rewriteLocalVocabEntriesAndBlankNodesImpl(const ForEachId& forEachId);
   FRIEND_TEST(DeltaTriplesTest, rewriteLocalVocabEntriesAndBlankNodes);
   FRIEND_TEST(DeltaTriplesTest, rewriteRemovesLocalVocabEntriesInVocab);
 

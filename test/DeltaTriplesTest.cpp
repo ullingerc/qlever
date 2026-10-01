@@ -15,6 +15,7 @@
 #include "./DeltaTriplesTestHelpers.h"
 #include "./ValueIdTestHelpers.h"
 #include "./util/GTestHelpers.h"
+#include "./util/IdTableHelpers.h"
 #include "./util/IndexTestHelpers.h"
 #include "./util/ParsedQueryTestHelpers.h"
 #include "./util/RuntimeParametersTestHelpers.h"
@@ -1366,3 +1367,154 @@ TEST_F(DeltaTriplesTest, addFromSnapshotDiffReanchorsLocalVocabEntries) {
   EXPECT_EQ(*carried, fresh);
 }
 #endif
+
+// _____________________________________________________________________________
+TEST_F(DeltaTriplesTest, viewRows) {
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  DeltaTriples deltaTriples(testQec->getIndex());
+  const auto& index = testQec->getIndex().getImpl();
+
+  // Use the block metadata of the SPO permutation as the metadata of a fake
+  // view with six columns (two payload columns), where only the last column
+  // may be UNDEF.
+  auto metadata =
+      index.getPermutation(Permutation::SPO).metaData().blockDataShared();
+  deltaTriples.registerView("v", metadata, 2, {5});
+
+  // Rows `<s> <p> <o> <g> payload1 payload2` with the IDs of `<a> <upp> <A>`.
+  LocalVocab localVocabOutside;
+  auto [s, p, o, g] =
+      makeIdTriples(index, localVocabOutside, {"<a> <upp> <A>"})[0].ids();
+  auto I = ad_utility::testing::IntId;
+  auto U = Id::makeUndefined();
+  using Row = std::vector<Id>;
+  auto makeRows = [](const std::vector<Row>& rows) {
+    VectorTable table;
+    for (const auto& row : rows) {
+      table.emplace_back(row.begin(), row.end());
+    }
+    return makeIdTableFromVector(table);
+  };
+  Row r1{s, p, o, g, I(1), I(2)};
+  Row r2{s, p, o, g, I(1), U};
+  Row r3{o, p, s, g, I(3), I(4)};
+
+  // Get all located rows of the view in the given state as pairs of the full
+  // row and the `insertOrDelete_` flag.
+  auto locatedRows = [&metadata](const LocatedTriplesState& state) {
+    std::vector<std::pair<Row, bool>> result;
+    auto lt = state.getLocatedTriplesForView("v");
+    if (!lt.has_value()) {
+      return result;
+    }
+    for (size_t i = 0; i <= metadata->size(); ++i) {
+      if (auto updates = lt->getUpdatesIfPresent(i)) {
+        for (const auto& locatedTriple : updates->getSortedView()) {
+          Row row{locatedTriple.triple_.ids().begin(),
+                  locatedTriple.triple_.ids().end()};
+          ql::ranges::copy(locatedTriple.payload_, std::back_inserter(row));
+          result.emplace_back(std::move(row), locatedTriple.insertOrDelete_);
+        }
+      }
+    }
+    return result;
+  };
+  auto current = [&]() {
+    return locatedRows(*deltaTriples.getLocatedTriplesSharedStateReference());
+  };
+  using ::testing::Pair;
+  using ::testing::UnorderedElementsAre;
+  auto version = [&deltaTriples]() {
+    return deltaTriples.getLocatedTriplesSharedStateReference()->index_;
+  };
+
+  // Insert rows (with a duplicate in the input).
+  auto v0 = version();
+  deltaTriples.insertViewRows(handle, "v", makeRows({r1, r2, r1}));
+  EXPECT_THAT(current(), UnorderedElementsAre(Pair(r1, true), Pair(r2, true)));
+  EXPECT_EQ(deltaTriples.views_.at("v").rowsInserted_.size(), 2);
+  EXPECT_GT(version(), v0);
+
+  // Inserting again is idempotent.
+  deltaTriples.insertViewRows(handle, "v", makeRows({r1}));
+  EXPECT_THAT(current(), UnorderedElementsAre(Pair(r1, true), Pair(r2, true)));
+
+  // Deleting an inserted row cancels the insertion, deleting a row that was
+  // not inserted is a deletion.
+  deltaTriples.deleteViewRows(handle, "v", makeRows({r1, r3}));
+  EXPECT_THAT(current(), UnorderedElementsAre(Pair(r1, false), Pair(r2, true),
+                                              Pair(r3, false)));
+  EXPECT_EQ(deltaTriples.views_.at("v").rowsInserted_.size(), 1);
+  EXPECT_EQ(deltaTriples.views_.at("v").rowsDeleted_.size(), 2);
+
+  // The rows of views are not counted, but they are part of a snapshot.
+  EXPECT_EQ(deltaTriples.getCounts(), (DeltaTriplesCount{0, 0}));
+  auto snapshot = deltaTriples.getLocatedTriplesSharedStateCopy();
+  EXPECT_THAT(
+      locatedRows(*snapshot),
+      UnorderedElementsAre(Pair(r1, false), Pair(r2, true), Pair(r3, false)));
+
+  // Local vocab entries are rewritten to the local vocab of the
+  // `DeltaTriples`.
+  auto word = Id::makeFromLocalVocabIndex(
+      localVocabOutside.getIndexAndAddIfNotContained(
+          LocalVocabEntry::fromIriref("<notInVocab>",
+                                      index.getLocalVocabContext())));
+  deltaTriples.insertViewRows(handle, "v", makeRows({{s, p, o, g, word, U}}));
+  auto rowsAfterInsert = current();
+  auto rewritten = ql::ranges::find_if(rowsAfterInsert, [&](const auto& row) {
+    return row.first.at(4) == word;
+  });
+  ASSERT_NE(rewritten, rowsAfterInsert.end());
+  auto rewrittenIdx = rewritten->first.at(4).getLocalVocabIndex();
+  EXPECT_NE(rewrittenIdx, word.getLocalVocabIndex());
+  EXPECT_EQ(deltaTriples.localVocab_.getIndexOrNullopt(*rewrittenIdx),
+            rewrittenIdx);
+
+  // Contract checks: wrong number of columns, UNDEF in a column that must not
+  // contain UNDEF, unregistered view.
+  EXPECT_ANY_THROW(
+      deltaTriples.insertViewRows(handle, "v", makeRows({{s, p, o, g, I(1)}})));
+  EXPECT_ANY_THROW(
+      deltaTriples.insertViewRows(handle, "v", makeRows({{s, p, o, g, U, U}})));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      deltaTriples.deleteViewRows(handle, "w", makeRows({r1})),
+      ::testing::HasSubstr("not registered"));
+  EXPECT_EQ(current().size(), 4);
+
+  // Registering again with the same metadata keeps the updates, registering
+  // with different metadata drops them.
+  deltaTriples.registerView("v", metadata, 2, {5});
+  EXPECT_EQ(current().size(), 4);
+  auto v1 = version();
+  auto otherMetadata =
+      std::make_shared<const std::vector<CompressedBlockMetadata>>(*metadata);
+  deltaTriples.registerView("v", otherMetadata, 2, {5});
+  EXPECT_TRUE(current().empty());
+  EXPECT_GT(version(), v1);
+  EXPECT_TRUE(deltaTriples.views_.at("v").rowsInserted_.empty());
+  // The older snapshot is unaffected.
+  EXPECT_EQ(locatedRows(*snapshot).size(), 3);
+
+  // `clear` drops the updates, but keeps the registration.
+  deltaTriples.insertViewRows(handle, "v", makeRows({r1}));
+  EXPECT_EQ(current().size(), 1);
+  deltaTriples.clear();
+  EXPECT_TRUE(current().empty());
+  EXPECT_TRUE(deltaTriples.views_.at("v").rowsInserted_.empty());
+  deltaTriples.insertViewRows(handle, "v", makeRows({r1}));
+  EXPECT_EQ(current().size(), 1);
+
+  // Unregistering drops the updates.
+  auto v2 = version();
+  deltaTriples.unregisterView("v");
+  EXPECT_GT(version(), v2);
+  EXPECT_FALSE(deltaTriples.getLocatedTriplesSharedStateReference()
+                   ->getLocatedTriplesForView("v")
+                   .has_value());
+  EXPECT_ANY_THROW(deltaTriples.insertViewRows(handle, "v", makeRows({r1})));
+  // Unregistering a view that is not registered is a no-op.
+  auto v3 = version();
+  deltaTriples.unregisterView("v");
+  EXPECT_EQ(version(), v3);
+}

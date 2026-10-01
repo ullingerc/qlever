@@ -611,7 +611,6 @@ TEST_F(MaterializedViewsTest, ManualConfigurations) {
   EXPECT_EQ(view->name(), "testView1");
   EXPECT_EQ(view->permutation()->permutation(), Permutation::Enum::SPO);
   EXPECT_EQ(view->permutation()->readableName(), "testView1");
-  EXPECT_NE(view->locatedTriplesState(), nullptr);
   EXPECT_EQ(view->permutation()->permutationType(),
             Permutation::Type::MATERIALIZED_VIEW);
   EXPECT_TRUE(manager.isViewLoaded("testView1"));
@@ -2342,6 +2341,113 @@ TEST_F(MaterializedViewsTest, Updatable) {
     manager.unloadViewIfLoaded("noDuplicates");
     EXPECT_FALSE(manager.getView("noDuplicates", nullptr)->isUpdatable());
   }
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, UpdateViewRows) {
+  // A view with six columns (two payload columns), the last one possibly
+  // undefined.
+  qlv().writeMaterializedView(
+      "upd",
+      "SELECT * { VALUES (?a ?b ?c ?d ?e ?f) { (1 1 1 1 1 1) (1 2 1 1 1 2) "
+      "(2 1 1 1 1 UNDEF) } }");
+  auto indexAndViews = qlv().indexAndViewsSnapshot();
+  auto& deltaTriplesManager = indexAndViews->index_.deltaTriplesManager();
+  auto isRegistered = [&deltaTriplesManager](const std::string& name) {
+    return deltaTriplesManager.getCurrentLocatedTriplesSharedState()
+        ->getLocatedTriplesForView(name)
+        .has_value();
+  };
+  EXPECT_TRUE(isRegistered("upd"));
+
+  const std::string prefix =
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> ";
+  const std::string scanAllQuery = absl::StrCat(
+      prefix,
+      "SELECT ?a ?b ?c ?d ?e ?f { SERVICE view:upd { _:config view:column-a "
+      "?a ; view:column-b ?b ; view:column-c ?c ; view:column-d ?d ; "
+      "view:column-e ?e ; view:column-f ?f . } }");
+  auto scanAll = [&]() { return getQueryResultAsIdTable(scanAllQuery); };
+  auto U = Id::makeUndefined();
+  auto expectedBefore = makeIdTableFromVector(
+      {{1, 1, 1, 1, 1, 1}, {1, 2, 1, 1, 1, 2}, {2, 1, 1, 1, 1, U}}, IntId);
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+
+  // Plan a query before the update, it uses the snapshot from before the
+  // update.
+  auto oldPlan = qlv().parseAndPlanQuery(scanAllQuery);
+
+  // Insert a row with the same key as an existing row but a different payload
+  // and a new row, and delete an existing row.
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  deltaTriplesManager.modify<void>([&handle](DeltaTriples& deltaTriples) {
+    deltaTriples.insertViewRows(
+        handle, "upd",
+        makeIdTableFromVector({{1, 1, 1, 1, 1, 5}, {3, 1, 1, 1, 7, 8}}, IntId));
+    deltaTriples.deleteViewRows(
+        handle, "upd", makeIdTableFromVector({{1, 2, 1, 1, 1, 2}}, IntId));
+  });
+
+  // The rows of the view are changed (in particular, the result of the scan
+  // before the update is not returned from the cache).
+  auto expectedAfter = makeIdTableFromVector({{1, 1, 1, 1, 1, 1},
+                                              {1, 1, 1, 1, 1, 5},
+                                              {2, 1, 1, 1, 1, U},
+                                              {3, 1, 1, 1, 7, 8}},
+                                             IntId);
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedAfter));
+  // The query planned before the update still sees the old rows.
+  EXPECT_THAT(getQueryResultAsIdTable(oldPlan), matchesIdTable(expectedBefore));
+
+  // Scan with a fixed first column.
+  EXPECT_THAT(getQueryResultAsIdTable(absl::StrCat(
+                  prefix,
+                  "SELECT ?b ?f { SERVICE view:upd { _:config view:column-a 1 "
+                  "; view:column-b ?b ; view:column-f ?f . } }")),
+              matchesIdTable(makeIdTableFromVector({{1, 1}, {1, 5}}, IntId)));
+  // Scan of a subset of the columns, including only one payload column.
+  EXPECT_THAT(getQueryResultAsIdTable(absl::StrCat(
+                  prefix,
+                  "SELECT ?a ?e { SERVICE view:upd { _:config view:column-a ?a "
+                  "; view:column-e ?e . } }")),
+              matchesIdTable(makeIdTableFromVector(
+                  {{1, 1}, {1, 1}, {2, 1}, {3, 7}}, IntId)));
+
+  // Unloading the view unregisters it and drops its updates. Loading it lazily
+  // by a query does not register it, loading it explicitly does.
+  EXPECT_TRUE(qlv().unloadMaterializedView("upd"));
+  EXPECT_FALSE(isRegistered("upd"));
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+  EXPECT_TRUE(qlv().isMaterializedViewLoaded("upd"));
+  EXPECT_FALSE(isRegistered("upd"));
+  qlv().loadMaterializedView("upd");
+  EXPECT_TRUE(isRegistered("upd"));
+
+  // Rewriting the view replaces the registration.
+  deltaTriplesManager.modify<void>([&handle](DeltaTriples& deltaTriples) {
+    deltaTriples.insertViewRows(
+        handle, "upd", makeIdTableFromVector({{3, 1, 1, 1, 7, 8}}, IntId));
+  });
+  qlv().writeMaterializedView(
+      "upd", "SELECT * { VALUES (?a ?b ?c ?d ?e ?f) { (1 1 1 1 1 1) } }");
+  EXPECT_THAT(scanAll(), matchesIdTable(makeIdTableFromVector(
+                             {{1, 1, 1, 1, 1, 1}}, IntId)));
+
+  // Deleting the view unregisters it.
+  qlv().deleteMaterializedView("upd");
+  EXPECT_FALSE(isRegistered("upd"));
+
+  // A view with duplicate rows is not updatable, so it is not registered and
+  // can't be updated.
+  qlv().writeMaterializedView(
+      "dup", "SELECT * { VALUES (?a ?b ?c ?d) { (1 1 1 1) (1 1 1 1) } }");
+  EXPECT_FALSE(isRegistered("dup"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      deltaTriplesManager.modify<void>([&handle](DeltaTriples& deltaTriples) {
+        deltaTriples.insertViewRows(
+            handle, "dup", makeIdTableFromVector({{2, 1, 1, 1}}, IntId));
+      }),
+      ::testing::HasSubstr("not registered"));
 }
 
 // _____________________________________________________________________________

@@ -182,7 +182,6 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   std::shared_ptr<Permutation> permutation_{std::make_shared<Permutation>(
       Permutation::Enum::SPO, ad_utility::makeUnlimitedAllocator<Id>(), name_)};
   VariableToColumnMap varToColMap_;
-  std::shared_ptr<LocatedTriplesState> locatedTriplesState_;
   std::optional<std::string> originalQuery_;
   std::optional<ParsedQuery> parsedQuery_;
   // True iff the view has no duplicate rows. Views written before this flag
@@ -195,10 +194,6 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   materializedViewsQueryAnalysis::BindExpressionAndTargetCol coveredBinds_;
 
   using AdditionalScanColumns = SparqlTripleSimple::AdditionalScanColumns;
-
-  // Helper to create an empty `LocatedTriplesState` for `IndexScan`s as
-  // materialized views do not support updates yet.
-  std::shared_ptr<LocatedTriplesState> makeEmptyLocatedTriplesState() const;
 
   FRIEND_TEST(MaterializedViewsTest, ManualConfigurations);
 
@@ -241,11 +236,6 @@ class MaterializedView : public std::enable_shared_from_this<MaterializedView> {
   // the first column. The result of this function is guaranteed to never be
   // `nullptr`.
   std::shared_ptr<const Permutation> permutation() const;
-
-  // Return a reference to the `LocatedTriplesSnapshot` for the permutation. For
-  // now this is always an empty snapshot but with the correct permutation
-  // metadata.
-  LocatedTriplesSharedState locatedTriplesState() const;
 
   // Checks if the given name is allowed for a materialized view. Currently only
   // alphanumerics and hyphens are allowed. This is relevant for safe filenames
@@ -379,6 +369,22 @@ class MaterializedViewsManager {
 
   mutable ad_utility::Synchronized<LoadedViews> loadedViews_;
 
+  // The index this manager belongs to (see `setIndex`). Updatable views are
+  // registered with its `DeltaTriples` when they are loaded. If not set (in
+  // tests), no views are registered.
+  Index* index_ = nullptr;
+
+  // Call `function(DeltaTriples*)` while holding the lock of the delta triples
+  // of `index_`, and update their snapshot afterwards. The argument is
+  // `nullptr` if `index_` is not set.
+  //
+  // NOTE: The lock of the delta triples has to be acquired before
+  // `loadedViews_`, because an update holds it while planning its query, which
+  // may load views via `getView`. For the same reason, `getView` must not use
+  // this function (it can be called while the lock is already held).
+  template <typename Function>
+  void withDeltaTriples(const Function& function) const;
+
   // Load the given view into `state` if it isn't loaded yet and return it.
   // Requires `state` to be the locked contents of `loadedViews_` (this is a
   // helper for `loadView` and `getView`, so that the latter can look up the
@@ -396,6 +402,10 @@ class MaterializedViewsManager {
   // of the `MaterializedViewsManager`. This should only be called once and
   // before any calls to `loadView` and `getView`.
   void setOnDiskBase(const std::string& onDiskBase);
+
+  // Set the index this manager belongs to, see `index_`. The `index` must
+  // outlive this manager.
+  void setIndex(Index& index) { index_ = &index; }
 
   // Permanently prevent this manager from creating or deleting any further view
   // file under `onDiskBase_`. This has to be called before the files of the
@@ -435,21 +445,32 @@ class MaterializedViewsManager {
   // `qec` is forwarded to `MaterializedView::computeCacheKey` for cache-key
   // based query rewriting; passing `nullptr` skips that analysis (currently
   // used by tests that do not care about it).
+  //
+  // If the view is updatable, it is also registered with the `DeltaTriples` of
+  // `index_` (if set). Afterwards, its rows can be modified via
+  // `index.deltaTriplesManager().modify(...)` with
+  // `DeltaTriples::insertViewRows` and `DeltaTriples::deleteViewRows`.
   void loadView(const std::string& name,
                 const QueryExecutionContext* qec) const;
 
   // Unload a materialized view if it is loaded and return `true`. Return
   // `false` (and do nothing else) if it is not loaded. It is `const` for the
-  // same reason described above.
+  // same reason described above. The view is also unregistered from the
+  // `DeltaTriples` of `index_`, which drops its updates.
   bool unloadViewIfLoaded(const std::string& name) const;
 
   // Delete a materialized view: unload it if loaded and delete all of its files
-  // from disk. Throws if the view does not exist.
+  // from disk. Throws if the view does not exist. Its updates are dropped.
   void deleteView(const std::string& name) const;
 
   // Load the given view if it is not already loaded and return it. This pointer
   // is never `nullptr`. If the view does not exist, the function throws. See
   // `loadView` above for details on the use of the `QueryExecutionContext`.
+  //
+  // NOTE: Unlike `loadView`, this does not register the view for updates,
+  // because it can be called by an update that holds the lock of the delta
+  // triples (see `withDeltaTriples`). Updatable views therefore have to be
+  // loaded explicitly (preloaded, written or via `loadView`).
   std::shared_ptr<const MaterializedView> getView(
       const std::string& name, const QueryExecutionContext* qec) const;
 

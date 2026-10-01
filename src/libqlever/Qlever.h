@@ -315,7 +315,9 @@ class Qlever {
     IndexAndViews(Index index,
                   MaterializedViewsManager materializedViewsManager)
         : index_{std::move(index)},
-          materializedViewsManager_{std::move(materializedViewsManager)} {}
+          materializedViewsManager_{std::move(materializedViewsManager)} {
+      materializedViewsManager_.setIndex(index_);
+    }
 
     // Make sue this is only passed around as a shared pointer or reference.
     IndexAndViews(IndexAndViews&&) noexcept = delete;

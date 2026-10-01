@@ -138,7 +138,12 @@ class MaterializedViewsTest : public ::testing::Test {
   // an `IdTable` with the same column ordering as the columns in the `SELECT`
   // statement.
   IdTable getQueryResultAsIdTable(std::string query) {
-    auto plannedQuery = qlv().parseAndPlanQuery(std::move(query));
+    return getQueryResultAsIdTable(qlv().parseAndPlanQuery(std::move(query)));
+  }
+
+  // The same for an already planned query (which is executed with the
+  // snapshot of the delta triples that was taken when it was planned).
+  IdTable getQueryResultAsIdTable(const qlever::PlannedQuery& plannedQuery) {
     auto qet = plannedQuery.sharedQueryExecutionTree();
     auto& parsed = plannedQuery.parsedQuery();
 

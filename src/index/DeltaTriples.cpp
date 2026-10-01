@@ -91,6 +91,12 @@ void DeltaTriples::clear() {
   };
   clearImpl(triplesSetsNormal_, locatedTriples_->getLocatedTriples<false>());
   clearImpl(triplesSetsInternal_, locatedTriples_->getLocatedTriples<true>());
+  // The views stay registered, only their updates are dropped.
+  for (auto& [name, view] : views_) {
+    view.rowsInserted_.clear();
+    view.rowsDeleted_.clear();
+    locatedTriples_->viewLocatedTriples_.at(name).clear();
+  }
 }
 
 // ____________________________________________________________________________
@@ -381,7 +387,174 @@ DeltaTriples::deleteInternalTriplesForTesting<DeltaTriples::Consolidate::No>(
     CancellationHandle, Triples, ad_utility::timer::TimeTracer&);
 
 // ____________________________________________________________________________
+void DeltaTriples::registerView(
+    const std::string& name,
+    std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata,
+    size_t numPayloadColumns,
+    ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns) {
+  AD_CONTRACT_CHECK(metadata != nullptr);
+  if (auto it = views_.find(name);
+      it != views_.end() && it->second.metadata_ == metadata) {
+    AD_CONTRACT_CHECK(
+        locatedTriples_->viewLocatedTriples_.at(name).numPayloadColumns() ==
+        numPayloadColumns);
+    return;
+  }
+  // A replaced registration may have had updates, see `unregisterView`.
+  unregisterView(name);
+  LocatedTriplesPerBlock locatedRows;
+  locatedRows.setNumPayloadColumns(numPayloadColumns);
+  locatedRows.setOriginalMetadata(metadata);
+  locatedTriples_->viewLocatedTriples_.emplace(name, std::move(locatedRows));
+  views_.emplace(
+      name,
+      ViewState{
+          std::move(metadata), std::move(possiblyUndefinedColumns), {}, {}});
+}
+
+// ____________________________________________________________________________
+void DeltaTriples::unregisterView(const std::string& name) {
+  auto it = locatedTriples_->viewLocatedTriples_.find(name);
+  if (it == locatedTriples_->viewLocatedTriples_.end()) {
+    return;
+  }
+  // Only if updates are dropped, the content of the view changes. Otherwise
+  // don't touch the `index_` to not needlessly invalidate the query cache.
+  if (!it->second.isEmpty()) {
+    locatedTriples_->index_++;
+  }
+  locatedTriples_->viewLocatedTriples_.erase(it);
+  views_.erase(name);
+}
+
+// ____________________________________________________________________________
+template <DeltaTriples::Consolidate consolidate>
+void DeltaTriples::insertViewRows(CancellationHandle cancellationHandle,
+                                  const std::string& name, IdTable rows,
+                                  ad_utility::timer::TimeTracer& tracer) {
+  modifyViewRowsImpl<true>(std::move(cancellationHandle), name, std::move(rows),
+                           tracer);
+  // Update the index of the located triples to mark that they have changed.
+  locatedTriples_->index_++;
+  consolidateIfRequested<consolidate>(tracer);
+}
+template void DeltaTriples::insertViewRows<DeltaTriples::Consolidate::Yes>(
+    CancellationHandle, const std::string&, IdTable,
+    ad_utility::timer::TimeTracer&);
+template void DeltaTriples::insertViewRows<DeltaTriples::Consolidate::No>(
+    CancellationHandle, const std::string&, IdTable,
+    ad_utility::timer::TimeTracer&);
+
+// ____________________________________________________________________________
+template <DeltaTriples::Consolidate consolidate>
+void DeltaTriples::deleteViewRows(CancellationHandle cancellationHandle,
+                                  const std::string& name, IdTable rows,
+                                  ad_utility::timer::TimeTracer& tracer) {
+  modifyViewRowsImpl<false>(std::move(cancellationHandle), name,
+                            std::move(rows), tracer);
+  // Update the index of the located triples to mark that they have changed.
+  locatedTriples_->index_++;
+  consolidateIfRequested<consolidate>(tracer);
+}
+template void DeltaTriples::deleteViewRows<DeltaTriples::Consolidate::Yes>(
+    CancellationHandle, const std::string&, IdTable,
+    ad_utility::timer::TimeTracer&);
+template void DeltaTriples::deleteViewRows<DeltaTriples::Consolidate::No>(
+    CancellationHandle, const std::string&, IdTable,
+    ad_utility::timer::TimeTracer&);
+
+// ____________________________________________________________________________
+template <bool insertOrDelete>
+void DeltaTriples::modifyViewRowsImpl(CancellationHandle cancellationHandle,
+                                      const std::string& name, IdTable rows,
+                                      ad_utility::timer::TimeTracer& tracer) {
+  auto it = views_.find(name);
+  AD_CONTRACT_CHECK(it != views_.end(), [&name]() {
+    return absl::StrCat("The materialized view '", name,
+                        "' is not registered for updates.");
+  });
+  auto& view = it->second;
+  auto& locatedRows = locatedTriples_->viewLocatedTriples_.at(name);
+  AD_CONTRACT_CHECK(rows.numColumns() == 4 + locatedRows.numPayloadColumns(),
+                    "The number of columns of the rows to be inserted into or "
+                    "deleted from a materialized view must match the view.");
+  for (size_t col = 0; col < rows.numColumns(); ++col) {
+    AD_CONTRACT_CHECK(
+        view.possiblyUndefinedColumns_.contains(col) ||
+            ql::ranges::none_of(rows.getColumn(col), &Id::isUndefined),
+        [col]() {
+          return absl::StrCat("Column ", col,
+                              " of a materialized view must not contain "
+                              "UNDEF values.");
+        });
+  }
+  auto [targetSet, inverseSet] = [&view]() {
+    if constexpr (insertOrDelete) {
+      return std::tie(view.rowsInserted_, view.rowsDeleted_);
+    } else {
+      return std::tie(view.rowsDeleted_, view.rowsInserted_);
+    }
+  }();
+  tracer.beginTrace("rewriteLocalVocabEntries");
+  rewriteLocalVocabEntriesAndBlankNodes(rows);
+  tracer.endTrace("rewriteLocalVocabEntries");
+
+  // Unlike for the triples, we can't expect the caller to sort the rows, so
+  // sort and deduplicate them here.
+  std::vector<std::vector<Id>> fullRows(rows.numRows(),
+                                        std::vector<Id>(rows.numColumns()));
+  for (size_t i = 0; i < rows.numRows(); ++i) {
+    for (size_t col = 0; col < rows.numColumns(); ++col) {
+      fullRows[i][col] = rows(i, col);
+    }
+  }
+  ql::ranges::sort(fullRows);
+  fullRows.erase(std::unique(fullRows.begin(), fullRows.end()), fullRows.end());
+  ql::erase_if(fullRows, [&targetSet](const std::vector<Id>& row) {
+    return targetSet.contains(row);
+  });
+  ql::ranges::for_each(fullRows, [&inverseSet](const std::vector<Id>& row) {
+    inverseSet.erase(row);
+  });
+
+  tracer.beginTrace("locatedAndAdd");
+  IdTable remainingRows{rows.numColumns(), rows.getAllocator()};
+  remainingRows.reserve(fullRows.size());
+  ql::ranges::for_each(fullRows, [&remainingRows](const std::vector<Id>& row) {
+    remainingRows.push_back(row);
+  });
+  auto locatedTriples = LocatedTriple::locateRowsInView(
+      remainingRows, *view.metadata_, insertOrDelete, cancellationHandle);
+  cancellationHandle->throwIfCancelled();
+  locatedRows.add(locatedTriples, tracer);
+  tracer.endTrace("locatedAndAdd");
+
+  ql::ranges::move(fullRows, std::inserter(targetSet, targetSet.end()));
+}
+
+// ____________________________________________________________________________
 void DeltaTriples::rewriteLocalVocabEntriesAndBlankNodes(Triples& triples) {
+  rewriteLocalVocabEntriesAndBlankNodesImpl([&triples](const auto& convertId) {
+    ql::ranges::for_each(triples, [&convertId](IdTriple<0>& triple) {
+      ql::ranges::for_each(triple.ids(), convertId);
+      ql::ranges::for_each(triple.payload(), convertId);
+    });
+  });
+}
+
+// ____________________________________________________________________________
+void DeltaTriples::rewriteLocalVocabEntriesAndBlankNodes(IdTable& rows) {
+  rewriteLocalVocabEntriesAndBlankNodesImpl([&rows](const auto& convertId) {
+    for (size_t col = 0; col < rows.numColumns(); ++col) {
+      ql::ranges::for_each(rows.getColumn(col), convertId);
+    }
+  });
+}
+
+// ____________________________________________________________________________
+template <typename ForEachId>
+void DeltaTriples::rewriteLocalVocabEntriesAndBlankNodesImpl(
+    const ForEachId& forEachId) {
   // Remember which original blank node (from the parsing of an insert
   // operation) is mapped to which blank node managed by the `localVocab_` of
   // this class.
@@ -431,11 +604,8 @@ void DeltaTriples::rewriteLocalVocabEntriesAndBlankNodes(Triples& triples) {
     }
   };
 
-  // Convert all local vocab and blank node `Id`s in all `triples`.
-  ql::ranges::for_each(triples, [&convertId](IdTriple<0>& triple) {
-    ql::ranges::for_each(triple.ids(), convertId);
-    ql::ranges::for_each(triple.payload(), convertId);
-  });
+  // Convert all local vocab and blank node `Id`s.
+  forEachId(convertId);
 }
 
 // ____________________________________________________________________________
@@ -489,11 +659,12 @@ LocatedTriplesSharedState DeltaTriples::getLocatedTriplesSharedStateCopy()
   // snapshot. NOTE: `LocatedTriplesState` is an aggregate, and `make_shared`
   // initializes with parentheses, which only works for aggregates since C++20.
   // The explicit `LocatedTriplesState{...}` is therefore required for C++17.
-  return LocatedTriplesSharedState{std::make_shared<LocatedTriplesState>(
-      LocatedTriplesState{locatedTriples_->locatedTriplesPerBlock_,
-                          locatedTriples_->internalLocatedTriplesPerBlock_,
-                          localVocab_.getLifetimeExtender(),
-                          locatedTriples_->index_, getCounts()})};
+  return LocatedTriplesSharedState{
+      std::make_shared<LocatedTriplesState>(LocatedTriplesState{
+          locatedTriples_->locatedTriplesPerBlock_,
+          locatedTriples_->internalLocatedTriplesPerBlock_,
+          localVocab_.getLifetimeExtender(), locatedTriples_->index_,
+          getCounts(), locatedTriples_->viewLocatedTriples_})};
 }
 
 // ____________________________________________________________________________
@@ -623,11 +794,12 @@ void DeltaTriples::setOriginalMetadata(
 
 // _____________________________________________________________________________
 void DeltaTriples::consolidateAll() {
-  auto consolidate = [](auto& lt) {
+  auto consolidate = [](auto&& lt) {
     ql::ranges::for_each(lt, &LocatedTriplesPerBlock::consolidateAllBlocks);
   };
   consolidate(locatedTriples_->getLocatedTriples<false>());
   consolidate(locatedTriples_->getLocatedTriples<true>());
+  consolidate(locatedTriples_->viewLocatedTriples_ | ql::views::values);
 }
 
 // _____________________________________________________________________________
@@ -643,11 +815,12 @@ void DeltaTriples::consolidateIfRequested(
 
 // _____________________________________________________________________________
 void DeltaTriples::updateAugmentedMetadata() {
-  auto update = [](auto& lt) {
+  auto update = [](auto&& lt) {
     ql::ranges::for_each(lt, &LocatedTriplesPerBlock::updateAugmentedMetadata);
   };
   update(locatedTriples_->getLocatedTriples<false>());
   update(locatedTriples_->getLocatedTriples<true>());
+  update(locatedTriples_->viewLocatedTriples_ | ql::views::values);
 }
 
 // _____________________________________________________________________________
@@ -765,6 +938,10 @@ void DeltaTriples::addFromSnapshotDiff(
     const qlever::indexRebuilder::IndexRebuildMapping& idMapping,
     CancellationHandle cancellationHandle,
     ad_utility::timer::TimeTracer& tracer) {
+  // NOTE: The located rows of materialized views are deliberately ignored:
+  // the views are not rebuilt together with the index (their `Id`s refer to the
+  // vocabulary of the old index) and are not available for the rebuilt index,
+  // so their updates are dropped together with them.
   tracer.beginTrace("computeLocatedTriplesDiff");
   auto difference = computeLocatedTriplesDiff(oldState, newState);
   difference.remapIds([this, &idMapping](Id& id) {

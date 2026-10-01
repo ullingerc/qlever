@@ -293,6 +293,14 @@ class LocatedTriplesPerBlock {
             std::move(metadata)));
   }
 
+  // Return true iff `metadata` is the original metadata (the same object, not
+  // only equal) set by `setOriginalMetadata`.
+  bool hasOriginalMetadata(
+      const std::vector<CompressedBlockMetadata>& metadata) const {
+    return originalMetadata_.has_value() &&
+           originalMetadata_.value().get() == &metadata;
+  }
+
   // Returns the block metadata where the block borders have been updated to
   // account for the update triples. All triples (both insert and delete) will
   // enlarge the block borders.

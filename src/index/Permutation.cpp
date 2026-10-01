@@ -68,6 +68,9 @@ void Permutation::loadFromDisk(
   }
   ad_utility::File metaFile{filename + META_FILE_SUFFIX, "r"};
   meta_.readFromFile(file, metaFile);
+  if (permutationType == Type::MATERIALIZED_VIEW) {
+    emptyLocatedTriplesForView_.setOriginalMetadata(meta_.blockDataShared());
+  }
   // Materialized views never use graph post-processing, while normal and
   // internal permutations always use it.
   bool useGraphPostProcessing = permutationType != Type::MATERIALIZED_VIEW;
@@ -292,6 +295,19 @@ Permutation::LazyScanWithReader Permutation::lazyScanWithUnlimitedReader(
 // ______________________________________________________________________
 const LocatedTriplesPerBlock& Permutation::getLocatedTriplesForPermutation(
     const LocatedTriplesState& locatedTriplesState) const {
+  if (permutationType_ == Type::MATERIALIZED_VIEW) {
+    // The updates of a view are stored under its name. There are none if the
+    // `locatedTriplesState` was taken before the view was registered, and they
+    // belong to another view of the same name (that was replaced in the
+    // meantime) if the original metadata is different.
+    auto locatedTriplesForView =
+        locatedTriplesState.getLocatedTriplesForView(readableName_);
+    if (locatedTriplesForView.has_value() &&
+        locatedTriplesForView->hasOriginalMetadata(meta_.blockData())) {
+      return locatedTriplesForView.value();
+    }
+    return emptyLocatedTriplesForView_;
+  }
   return permutationType_ == Type::INTERNAL
              ? locatedTriplesState.getLocatedTriplesForPermutation<true>(
                    permutation_)

@@ -452,9 +452,7 @@ const Variable& MaterializedView::dummyObject() {
 
 // _____________________________________________________________________________
 MaterializedView::MaterializedView(std::string onDiskBase, std::string name)
-    : onDiskBase_{std::move(onDiskBase)},
-      name_{std::move(name)},
-      locatedTriplesState_{makeEmptyLocatedTriplesState()} {
+    : onDiskBase_{std::move(onDiskBase)}, name_{std::move(name)} {
   AD_CORRECTNESS_CHECK(onDiskBase_ != "",
                        "The index base filename was not set.");
   throwIfInvalidName(name_);
@@ -575,24 +573,67 @@ MaterializedViewsManager::loadViewIntoLockedState(
 }
 
 // _____________________________________________________________________________
+template <typename Function>
+void MaterializedViewsManager::withDeltaTriples(
+    const Function& function) const {
+  if (index_ == nullptr) {
+    function(nullptr);
+    return;
+  }
+  // The updates of views are not persisted, and registering or unregistering
+  // a view does not change the metadata of any other permutation.
+  index_->deltaTriplesManager().modify<void>(
+      [&function](DeltaTriples& deltaTriples) { function(&deltaTriples); },
+      false, false);
+}
+
+// _____________________________________________________________________________
 void MaterializedViewsManager::loadView(
     const std::string& name, const QueryExecutionContext* qec) const {
-  auto lock = loadedViews_.wlock();
-  loadViewIntoLockedState(name, *lock, qec);
+  withDeltaTriples([this, &name, qec](DeltaTriples* deltaTriples) {
+    auto lock = loadedViews_.wlock();
+    auto view = loadViewIntoLockedState(name, *lock, qec);
+    if (deltaTriples == nullptr || !view->isUpdatable()) {
+      return;
+    }
+    // Views with less than four columns are padded with UNDEF columns.
+    size_t numViewColumns = view->variableToColumnMap().size();
+    size_t numColumns = std::max(numViewColumns, size_t{4});
+    ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns;
+    for (size_t col = 0; col < numColumns; ++col) {
+      if (col >= numViewColumns ||
+          view->permutation()->getColumnUndefStatus(col) ==
+              ColumnIndexAndTypeInfo::PossiblyUndefined) {
+        possiblyUndefinedColumns.insert(col);
+      }
+    }
+    deltaTriples->registerView(
+        name, view->permutation()->metaData().blockDataShared(), numColumns - 4,
+        std::move(possiblyUndefinedColumns));
+  });
 }
 
 // _____________________________________________________________________________
 bool MaterializedViewsManager::unloadViewIfLoaded(
     const std::string& name) const {
-  auto lock = loadedViews_.wlock();
-  auto view = ad_utility::findOptional(lock->views_, name);
-  if (!view.has_value()) {
-    return false;
+  bool wasLoaded = false;
+  withDeltaTriples([this, &name, &wasLoaded](DeltaTriples* deltaTriples) {
+    auto lock = loadedViews_.wlock();
+    auto view = ad_utility::findOptional(lock->views_, name);
+    if (!view.has_value()) {
+      return;
+    }
+    lock->queryPatternCache_.removeView(view.value());
+    lock->views_.erase(name);
+    if (deltaTriples != nullptr) {
+      deltaTriples->unregisterView(name);
+    }
+    wasLoaded = true;
+  });
+  if (wasLoaded) {
+    AD_LOG_INFO << "Materialized view \"" << name << "\" unloaded" << std::endl;
   }
-  lock->queryPatternCache_.removeView(view.value());
-  lock->views_.erase(name);
-  AD_LOG_INFO << "Materialized view \"" << name << "\" unloaded" << std::endl;
-  return true;
+  return wasLoaded;
 }
 
 // _____________________________________________________________________________
@@ -611,29 +652,34 @@ void MaterializedViewsManager::deleteView(const std::string& name) const {
   // concurrent `loadView`/`getView` call for the same view can not reload it
   // in between, and so that of two concurrent `deleteView` calls for the same
   // view exactly one succeeds and the other throws.
-  auto lock = loadedViews_.wlock();
-  if (!ql::filesystem::exists(absl::StrCat(filenameBase, VIEW_INFO_SUFFIX))) {
-    throw std::runtime_error(
-        absl::StrCat("The materialized view '", name, "' does not exist."));
-  }
-  if (auto it = lock->views_.find(name); it != lock->views_.end()) {
-    lock->queryPatternCache_.removeView(it->second);
-    lock->views_.erase(it);
-  }
-
-  // Delete all files belonging to the view from disk. NOTE: This is safe even
-  // if a running query still scans the view: the files are unlinked, but live
-  // on until the last open file handle is closed, and the query's shared
-  // pointer keeps the `MaterializedView` (and its open file) alive.
-  for (std::string_view suffix : VIEW_ALL_SUFFIXES) {
-    ql::error_code ec;
-    ql::filesystem::remove(absl::StrCat(filenameBase, suffix), ec);
-    if (ec) {
-      throw std::runtime_error(absl::StrCat(
-          "Failed to delete file '", filenameBase, suffix,
-          "' while deleting materialized view '", name, "': ", ec.message()));
+  withDeltaTriples([this, &name, &filenameBase](DeltaTriples* deltaTriples) {
+    auto lock = loadedViews_.wlock();
+    if (!ql::filesystem::exists(absl::StrCat(filenameBase, VIEW_INFO_SUFFIX))) {
+      throw std::runtime_error(
+          absl::StrCat("The materialized view '", name, "' does not exist."));
     }
-  }
+    if (auto it = lock->views_.find(name); it != lock->views_.end()) {
+      lock->queryPatternCache_.removeView(it->second);
+      lock->views_.erase(it);
+    }
+    if (deltaTriples != nullptr) {
+      deltaTriples->unregisterView(name);
+    }
+
+    // Delete all files belonging to the view from disk. NOTE: This is safe
+    // even if a running query still scans the view: the files are unlinked,
+    // but live on until the last open file handle is closed, and the query's
+    // shared pointer keeps the `MaterializedView` (and its open file) alive.
+    for (std::string_view suffix : VIEW_ALL_SUFFIXES) {
+      ql::error_code ec;
+      ql::filesystem::remove(absl::StrCat(filenameBase, suffix), ec);
+      if (ec) {
+        throw std::runtime_error(absl::StrCat(
+            "Failed to delete file '", filenameBase, suffix,
+            "' while deleting materialized view '", name, "': ", ec.message()));
+      }
+    }
+  });
 
   AD_LOG_INFO << "Materialized view \"" << name << "\" deleted" << std::endl;
 }
@@ -823,25 +869,6 @@ void MaterializedViewsManager::setOnDiskBase(const std::string& onDiskBase) {
 }
 
 // _____________________________________________________________________________
-LocatedTriplesSharedState MaterializedView::locatedTriplesState() const {
-  return {locatedTriplesState_};
-}
-
-// _____________________________________________________________________________
-std::shared_ptr<LocatedTriplesState>
-MaterializedView::makeEmptyLocatedTriplesState() const {
-  LocatedTriplesPerBlockAllPermutations<false> emptyLocatedTriples;
-  emptyLocatedTriples.at(static_cast<size_t>(permutation_->permutation()))
-      .setOriginalMetadata(permutation_->metaData().blockDataShared());
-  LocatedTriplesPerBlockAllPermutations<true> emptyInternalLocatedTriples;
-  LocalVocab emptyVocab;
-
-  return std::make_shared<LocatedTriplesState>(
-      LocatedTriplesState{emptyLocatedTriples, emptyInternalLocatedTriples,
-                          emptyVocab.getLifetimeExtender(), 0});
-}
-
-// _____________________________________________________________________________
 std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
     QueryExecutionContext* qec,
     const parsedQuery::MaterializedViewQuery& viewQuery) const {
@@ -855,7 +882,7 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
   // query.
   auto scanTriple = makeScanConfig(viewQuery);
   return qec->makeShared<IndexScan>(
-      qec, permutation_, LocatedTriplesSharedState{locatedTriplesState_},
+      qec, permutation_, qec->locatedTriplesSharedState(),
       std::move(scanTriple), IndexScan::Graphs::All(), std::nullopt,
       viewQuery.getVarsToKeep());
 }
@@ -892,7 +919,7 @@ std::shared_ptr<IndexScan> MaterializedView::makeIndexScan(
   auto v = varToCol | ql::ranges::views::keys;
   ad_utility::HashSet<Variable> varsToKeep{v.begin(), v.end()};
   return qec->makeShared<IndexScan>(
-      qec, permutation_, LocatedTriplesSharedState{locatedTriplesState_},
+      qec, permutation_, qec->locatedTriplesSharedState(),
       std::move(scanTriple), IndexScan::Graphs::All(), std::nullopt,
       std::move(varsToKeep));
 }
