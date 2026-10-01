@@ -121,7 +121,7 @@ void DeltaTriples::eraseTriplesInPermutation(
       triples, perm.metaData().blockData(), perm.keyOrder(),
       insertOrDeleteDummyValue, cancellationHandle);
   // `LocatedTriplesPerBlock::erase` requires a sorted input.
-  ql::ranges::sort(locatedTriples, {}, &LocatedTriple::triple_);
+  ql::ranges::sort(locatedTriples, {}, LocatedTriplesProjection{});
   lts.erase(locatedTriples);
 }
 

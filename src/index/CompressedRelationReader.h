@@ -130,6 +130,10 @@ class CompressedRelationReader {
     ColumnIndices scanColumns_;
     FilterDuplicatesAndGraphs graphFilter_;
     const LocatedTriplesPerBlock& locatedTriples_;
+    // All `4 + numPayloadColumns()` columns of the permutation if the
+    // `locatedTriples_` have payload columns, empty otherwise. See
+    // `columnsToRead`.
+    ColumnIndices allColumns_ = {};
   };
 
   // The specification of scan, together with the blocks on which this scan is
@@ -525,8 +529,9 @@ class CompressedRelationReader {
   // with payload (which can only be merged on full rows, see
   // `LocatedTriplesPerBlock::mergeFullRows`), and `scanConfig.scanColumns_`
   // otherwise.
-  static ColumnIndices columnsToRead(const ScanImplConfig& scanConfig,
-                                     const CompressedBlockMetadata& metadata);
+  static ColumnIndicesRef columnsToRead(
+      const ScanImplConfig& scanConfig,
+      const CompressedBlockMetadata& metadata);
 
   // Like `readAndDecompressBlock`, and postprocess by merging the located
   // triples (if any) and applying the graph filters (if any), both specified
