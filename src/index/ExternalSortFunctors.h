@@ -68,6 +68,23 @@ using SortByPSONoGraphColumn = SortTriple<1, 0, 2, false>;
 using SortBySPO = SortTriple<0, 1, 2>;
 using SortByOSP = SortTriple<2, 0, 1>;
 
+// A comparator that sorts rows lexicographically by all of their columns (in
+// order). Both rows must have the same number of columns, which may be only
+// known at runtime.
+struct SortAllColumns {
+  template <typename T1, typename T2>
+  bool operator()(const T1& a, const T2& b) const {
+    AD_EXPENSIVE_CHECK(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      auto c = a[i].compareWithoutLocalVocab(b[i]);
+      if (c != 0) {
+        return c < 0;
+      }
+    }
+    return false;
+  }
+};
+
 struct SortText {
   // < comparator
   template <typename A, typename B>
