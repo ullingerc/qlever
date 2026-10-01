@@ -1196,10 +1196,28 @@ TEST_F(LocatedTriplesTest, addChecksPayloadSize) {
               InsertIntoStream(testing::StrEq(
                   "LT(0 IdTriple(V:1, V:1, V:1, V:28, ) V:1 V:2 1)")));
 
+  // `isLocatedTriple` compares the payload.
+  EXPECT_TRUE(ltpb.isLocatedTriple(IT(1, 1, 1), true, {V(1), V(2)}));
+  EXPECT_FALSE(ltpb.isLocatedTriple(IT(1, 1, 1), true, {V(1), V(3)}));
+  EXPECT_FALSE(ltpb.isLocatedTriple(IT(1, 1, 1), false, {V(1), V(2)}));
+  EXPECT_FALSE(ltpb.isLocatedTriple(IT(1, 1, 1), true));
+
+  // The number of payload columns can't be changed once there are located
+  // triples.
+  EXPECT_ANY_THROW(ltpb.setNumPayloadColumns(3));
+  EXPECT_EQ(ltpb.numPayloadColumns(), 2);
+  ltpb.clear();
+  ltpb.setNumPayloadColumns(3);
+  EXPECT_EQ(ltpb.numPayloadColumns(), 3);
+
   // Without payload columns, a payload is not allowed.
   LocatedTriplesPerBlock mainIndex;
   EXPECT_ANY_THROW(
       mainIndex.add(std::vector{LT{0, IT(1, 1, 1), {V(1)}, true}}));
+
+  // `computeDiff` is only supported without payload columns.
+  EXPECT_ANY_THROW(ltpb.computeDiff(mainIndex));
+  EXPECT_ANY_THROW(mainIndex.computeDiff(ltpb));
 }
 
 // _____________________________________________________________________________

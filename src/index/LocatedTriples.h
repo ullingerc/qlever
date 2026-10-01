@@ -229,7 +229,10 @@ class LocatedTriplesPerBlock {
 
   // Get and set the number of payload columns, see `numPayloadColumns_`.
   size_t numPayloadColumns() const { return numPayloadColumns_; }
+  // NOTE: May only be called while there are no located triples, because the
+  // `payload_` of all located triples must have `numPayloadColumns` entries.
   void setNumPayloadColumns(size_t numPayloadColumns) {
+    AD_CONTRACT_CHECK(map_.empty());
     numPayloadColumns_ = numPayloadColumns;
   }
 
@@ -320,15 +323,18 @@ class LocatedTriplesPerBlock {
       ad_utility::SharedCancellationHandle cancellationHandle) const;
 
   // Return `true` iff one of the blocks contains `triple` with the given
-  // `insertOrDelete` status (`true` for inserted, `false` for deleted).
+  // `insertOrDelete` status (`true` for inserted, `false` for deleted) and the
+  // given `payload` (only relevant for materialized views).
   //
   // NOTE: This is expensive because it iterates over all blocks and checks
   // containment in each. It is only used in our tests, for convenience.
-  bool isLocatedTriple(const IdTriple<0>& triple, bool insertOrDelete) const;
+  bool isLocatedTriple(const IdTriple<0>& triple, bool insertOrDelete,
+                       const std::vector<Id>& payload = {}) const;
 
   // Compute the located triples that are present in this
   // `LocatedTriplesPerBlock` instance but not in `oldBlocks`. The result is a
-  // pair of vectors (insertions, deletions), each sorted in SPO order.
+  // pair of vectors (insertions, deletions), each sorted in SPO order. May only
+  // be used for permutations without payload columns.
   std::array<std::vector<IdTriple<0>>, 2> computeDiff(
       const LocatedTriplesPerBlock& oldBlocks) const;
 

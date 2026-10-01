@@ -977,14 +977,15 @@ DecompressedBlock CompressedRelationReader::decompressBlock(
 }
 
 // ____________________________________________________________________________
-CompressedRelationReader::ColumnIndices CompressedRelationReader::columnsToRead(
+CompressedRelationReader::ColumnIndicesRef
+CompressedRelationReader::columnsToRead(
     const ScanImplConfig& scanConfig, const CompressedBlockMetadata& metadata) {
   const auto& locatedTriples = scanConfig.locatedTriples_;
   if (locatedTriples.numPayloadColumns() > 0 &&
       locatedTriples.containsTriples(metadata.blockIndex_)) {
-    ColumnIndices allColumns(4 + locatedTriples.numPayloadColumns());
-    std::iota(allColumns.begin(), allColumns.end(), ColumnIndex{0});
-    return allColumns;
+    AD_CORRECTNESS_CHECK(scanConfig.allColumns_.size() ==
+                         4 + locatedTriples.numPayloadColumns());
+    return scanConfig.allColumns_;
   }
   return scanConfig.scanColumns_;
 }
@@ -1285,7 +1286,15 @@ auto CompressedRelationReader::getScanConfig(
   }();
   FilterDuplicatesAndGraphs graphFilter{scanSpec.graphFilter(),
                                         graphColumnIndex, deleteGraphColumn};
-  return {std::move(columnIndices), std::move(graphFilter), locatedTriples};
+  // Precompute all columns of the permutation for the blocks that have to be
+  // read completely, see `columnsToRead`.
+  ColumnIndices allColumns;
+  if (locatedTriples.numPayloadColumns() > 0) {
+    allColumns.resize(4 + locatedTriples.numPayloadColumns());
+    std::iota(allColumns.begin(), allColumns.end(), ColumnIndex{0});
+  }
+  return {std::move(columnIndices), std::move(graphFilter), locatedTriples,
+          std::move(allColumns)};
 }
 
 // _____________________________________________________________________________
