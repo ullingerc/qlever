@@ -750,8 +750,9 @@ class Qlever {
   // The result of the first phase of an index rebuild (see
   // `rebuildIndexToDisk`): a snapshot of the delta triples taken at the start
   // of the rebuild, the mapping from the old vocabulary `Id`s to the new ones,
-  // and the freshly built index (loaded from disk) paired with a fresh, empty
-  // `MaterializedViewsManager`.
+  // and the freshly built index (loaded from disk) paired with a fresh
+  // `MaterializedViewsManager` (with the recomputed views on disk, but none of
+  // them loaded).
   using RebuildResult =
       std::tuple<LocatedTriplesSharedState, indexRebuilder::IndexRebuildMapping,
                  std::shared_ptr<IndexAndViews>>;
@@ -762,18 +763,43 @@ class Qlever {
   // C++17 feature set.
 #ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
 
-  // Build a new index from the current state of `index` and write it to disk
-  // under the base name `config.newIndexSource()` (the containing directory is
-  // created if it does not exist), then load it into a fresh `IndexAndViews`.
-  // This is the expensive, read-only first phase of an index rebuild. It
-  // returns the data required by `swapInRebuiltIndex` to atomically switch over
-  // to the new index. `handle` can be used to cancel the rebuild. The reason
-  // why `index` has to be passed in manually instead of using
-  // `indexAndViewsSnapshot()` is to avoid a TOCTOU class of bugs.
+  // Build a new index from the current state of the index of `indexAndViews`
+  // and write it to disk under the base name `config.newIndexSource()` (the
+  // containing directory is created if it does not exist), then load it into a
+  // fresh `IndexAndViews`. Afterwards, recompute all materialized views of the
+  // old index from their queries on the new index (see
+  // `rebuildMaterializedViews`). This is the expensive, read-only first phase
+  // of an index rebuild. It returns the data required by `swapInRebuiltIndex`
+  // to atomically switch over to the new index. `handle` can be used to cancel
+  // the rebuild. The reason why `indexAndViews` has to be passed in manually
+  // instead of using `indexAndViewsSnapshot()` is to avoid a TOCTOU class of
+  // bugs.
+  //
+  // NOTE: Before the views are enumerated, the `MaterializedViewsManager` of
+  // `indexAndViews` is frozen (see
+  // `MaterializedViewsManager::freezeOnDiskFilesForRebuild`), so that no view
+  // change can get lost. It stays frozen when this function returns or throws:
+  // the caller has to either retire it (when swapping in the new index) or
+  // unfreeze it (when the rebuild has failed).
   [[nodiscard]] RebuildResult rebuildIndexToDisk(
-      Index& index, const IndexSwapConfig& config,
+      IndexAndViews& indexAndViews, const IndexSwapConfig& config,
       const ad_utility::SharedCancellationHandle& handle) const;
 
+ private:
+  // Recompute all materialized views that exist on disk for the index with the
+  // base name `oldIndexBaseName` from their original queries on the freshly
+  // built `newIndexAndViews` and write them to disk next to the new index. The
+  // query result cache is not used for this. A view that can not be rebuilt
+  // (e.g. because its query fails on the new index) is skipped and logged as
+  // an error, it does not fail the rebuild. Progress and errors are appended
+  // to the file `logFileName`.
+  void rebuildMaterializedViews(
+      const std::string& oldIndexBaseName,
+      const std::shared_ptr<IndexAndViews>& newIndexAndViews,
+      const ad_utility::SharedCancellationHandle& handle,
+      const std::string& logFileName) const;
+
+ public:
   // Remap the delta triples that accumulated on the old `index` (which has to
   // be the exact same index that was used to create `rebuildResult`) onto the
   // freshly built index (using the `rebuildResult` produced by

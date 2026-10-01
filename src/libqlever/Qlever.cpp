@@ -636,8 +636,9 @@ void Qlever::moveRebuiltIndexIntoPlace(IndexAndViews& newIndexAndViews,
 // build, so they are not compiled in the reduced C++17 feature set.
 #ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
 Qlever::RebuildResult Qlever::rebuildIndexToDisk(
-    Index& index, const IndexSwapConfig& config,
+    IndexAndViews& indexAndViews, const IndexSwapConfig& config,
     const ad_utility::SharedCancellationHandle& handle) const {
+  auto& [index, viewsManager] = indexAndViews;
   const std::string& indexBaseName = config.newIndexSource();
   ql::filesystem::path directory =
       ql::filesystem::path{indexBaseName}.parent_path();
@@ -651,16 +652,122 @@ Qlever::RebuildResult Qlever::rebuildIndexToDisk(
   auto mapping =
       materializeToIndex(index, indexBaseName, currentSnapshot, localVocabCopy,
                          ownedBlocks, handle, logFileName);
-  auto indexAndViews = std::make_shared<IndexAndViews>(
+  auto newIndexAndViews = std::make_shared<IndexAndViews>(
       Index{allocator()}, MaterializedViewsManager{});
-  auto& [newIndex, newManager] = *indexAndViews;
+  auto& [newIndex, newManager] = *newIndexAndViews;
   newIndex.usePatterns() = index.usePatterns();
   newIndex.loadAllPermutations() = index.loadAllPermutations();
   newIndex.createFromOnDiskIndex(indexBaseName,
                                  index.deltaTriplesManager().persists());
   newManager.setOnDiskBase(indexBaseName);
+
+  // The views of the old index can not be carried over (their `Id`s refer to
+  // the old vocabulary, and their contents to the old data), so recompute them
+  // from their queries on the new index. Freeze the old views first, so that
+  // none of them is written, overwritten, or deleted after they have been
+  // enumerated (the caller undoes this if the rebuild fails, see the
+  // documentation in the header).
+  viewsManager.freezeOnDiskFilesForRebuild();
+  rebuildMaterializedViews(index.getOnDiskBase(), newIndexAndViews, handle,
+                           logFileName);
   return {std::move(currentSnapshot), std::move(mapping),
-          std::move(indexAndViews)};
+          std::move(newIndexAndViews)};
+}
+
+// ___________________________________________________________________________
+void Qlever::rebuildMaterializedViews(
+    const std::string& oldIndexBaseName,
+    const std::shared_ptr<IndexAndViews>& newIndexAndViews,
+    const ad_utility::SharedCancellationHandle& handle,
+    const std::string& logFileName) const {
+  auto& [newIndex, newManager] = *newIndexAndViews;
+  auto logFile = ad_utility::makeOfstream(logFileName, std::ios::app);
+  auto log = [&logFile](std::string_view severity = "INFO") -> std::ostream& {
+    return logFile << ad_utility::Log::getTimeStamp() << " - " << severity
+                   << ": ";
+  };
+  auto memoryLimit =
+      getRuntimeParameter<&RuntimeParameters::materializedViewWriterMemory_>();
+
+  // Compute the view `name` from `query` on the new index and write it to
+  // disk next to the new index.
+  auto writeView = [&](const std::string& name, const std::string& query) {
+    // Caching has to be disabled: the query cache is shared with the old
+    // index, which is still being served, and its cache keys do not
+    // distinguish between the two indexes.
+    auto qec = createQueryExecutionContext(
+        newIndexAndViews, ad_utility::noop, false, false,
+        QueryExecutionContext::DisableCaching::True);
+    auto parsedQuery = SparqlParser::parseQuery(
+        &newIndex.getImpl().encodedIriManager(), query, {});
+    newManager.writeViewToDisk(
+        name,
+        planQuery(ParsedQueryAndContext{std::move(parsedQuery), qec}, handle),
+        memoryLimit);
+  };
+
+  std::vector<std::pair<std::string, std::string>> pending;
+  for (auto& [name, query] :
+       MaterializedViewsManager::viewQueriesOnDisk(oldIndexBaseName)) {
+    if (query.has_value()) {
+      pending.emplace_back(std::move(name), std::move(query.value()));
+    } else {
+      log("WARN") << "Materialized view \"" << name
+                  << "\" can not be rebuilt, because its query is unknown"
+                  << std::endl;
+    }
+  }
+  log() << "Rebuilding " << pending.size()
+        << " materialized view(s) on the new index ..." << std::endl;
+
+  // A view's query may read another view, which then has to be rebuilt first.
+  // Instead of analyzing these dependencies, retry the views that failed for
+  // as long as the previous round has rebuilt at least one view.
+  // ponytail: a view that fails for another reason is retried once per round,
+  // analyze the view dependencies if that ever gets expensive.
+  std::vector<std::string> rebuilt;
+  std::vector<std::pair<std::string, std::string>> failed;
+  std::vector<std::string> errors;
+  while (true) {
+    failed.clear();
+    errors.clear();
+    for (auto& [name, query] : pending) {
+      handle->throwIfCancelled();
+      try {
+        writeView(name, query);
+        log() << "Materialized view \"" << name << "\" rebuilt" << std::endl;
+        rebuilt.push_back(name);
+      } catch (const ad_utility::CancellationException&) {
+        throw;
+      } catch (const std::exception& e) {
+        failed.emplace_back(std::move(name), std::move(query));
+        errors.emplace_back(e.what());
+      }
+    }
+    if (failed.empty() || failed.size() == pending.size()) {
+      break;
+    }
+    std::swap(pending, failed);
+  }
+
+  // A failed view must not fail the whole rebuild (an automatic rebuild would
+  // then fail over and over again). It is still available in the directory to
+  // which the old index is retired.
+  for (size_t i = 0; i < failed.size(); ++i) {
+    log("ERROR") << "Failed to rebuild materialized view \"" << failed[i].first
+                 << "\": " << errors[i] << std::endl;
+    AD_LOG_ERROR << "Failed to rebuild materialized view \"" << failed[i].first
+                 << "\" on the rebuilt index: " << errors[i] << std::endl;
+  }
+
+  // `writeViewToDisk` loads each view it writes, but the views have to be
+  // unloaded again: the new manager can only be moved to its final place when
+  // no view is loaded (see `moveRebuiltIndexIntoPlace`), and the views were
+  // analyzed with caching disabled (see above). The views that were loaded for
+  // the old index are loaded again after the swap (see `Server::rebuildIndex`).
+  for (const auto& name : rebuilt) {
+    newManager.unloadViewIfLoaded(name);
+  }
 }
 
 // ___________________________________________________________________________

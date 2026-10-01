@@ -75,6 +75,7 @@ class Server {
   FRIEND_TEST(ServerTest, configurePinnedResultWithName);
   FRIEND_TEST(IndexRebuilder, serverIntegration);
   FRIEND_TEST(IndexRebuilder, serverIntegrationDroppedStateWarnings);
+  FRIEND_TEST(IndexRebuilder, serverIntegrationMaterializedViews);
   FRIEND_TEST(IndexRebuilder, serverIntegrationAutomaticRebuild);
   FRIEND_TEST(IndexRebuilder, serverIntegrationKeepPreviousIndexDirs);
   friend serverTestHelpers::ServerForTesting;

@@ -616,6 +616,7 @@ TEST_F(MaterializedViewsTest, ManualConfigurations) {
             Permutation::Type::MATERIALIZED_VIEW);
   EXPECT_TRUE(manager.isViewLoaded("testView1"));
   EXPECT_FALSE(manager.isViewLoaded("something"));
+  EXPECT_THAT(manager.loadedViewNames(), ::testing::ElementsAre("testView1"));
 
   // Unloading a view that is not loaded is a no-op, unloading a loaded view
   // reports that it was loaded.
@@ -623,6 +624,7 @@ TEST_F(MaterializedViewsTest, ManualConfigurations) {
   EXPECT_FALSE(manager.isViewLoaded("something"));
   EXPECT_TRUE(manager.unloadViewIfLoaded("testView1"));
   EXPECT_FALSE(manager.isViewLoaded("testView1"));
+  EXPECT_THAT(manager.loadedViewNames(), ::testing::IsEmpty());
   EXPECT_FALSE(manager.unloadViewIfLoaded("testView1"));
   EXPECT_THAT(view->originalQuery(),
               ::testing::Optional(::testing::Eq(simpleWriteQuery_)));
@@ -1264,6 +1266,74 @@ TEST_F(MaterializedViewsTest, RetireOnDiskFiles) {
       absl::StrCat(testIndexBase_, ".view.testViewRetired", VIEW_INFO_SUFFIX)));
   EXPECT_TRUE(manager.isViewLoaded("testViewRetired"));
   EXPECT_NE(manager.getView("testViewRetired", nullptr), nullptr);
+}
+
+// _____________________________________________________________________________
+// While an index rebuild recomputes the views, the on-disk files are frozen
+// (see `MaterializedViewsManager::freezeOnDiskFilesForRebuild`): no view may be
+// written or deleted until they are unfrozen again. Retired files stay retired.
+TEST_F(MaterializedViewsTest, FreezeOnDiskFiles) {
+  MaterializedViewsManager manager{testIndexBase_};
+  auto plan = qlv().parseAndPlanQuery(simpleWriteQuery_);
+  auto cleanUp = absl::Cleanup{[this]() {
+    for (std::string_view suffix : VIEW_ALL_SUFFIXES) {
+      ql::filesystem::remove(
+          absl::StrCat(testIndexBase_, ".view.testViewFrozen", suffix));
+    }
+  }};
+
+  manager.freezeOnDiskFilesForRebuild();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      manager.writeViewToDisk("testViewFrozen", plan),
+      ::testing::HasSubstr("Cannot write the materialized view "
+                           "'testViewFrozen' because an index rebuild is "
+                           "currently recomputing the materialized views"));
+  EXPECT_FALSE(ql::filesystem::exists(
+      absl::StrCat(testIndexBase_, ".view.testViewFrozen", VIEW_INFO_SUFFIX)));
+
+  manager.unfreezeOnDiskFiles();
+  manager.writeViewToDisk("testViewFrozen", plan);
+  manager.freezeOnDiskFilesForRebuild();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      manager.deleteView("testViewFrozen"),
+      ::testing::HasSubstr("because an index rebuild is currently"));
+
+  // Unfreezing does not undo a retirement, and freezing a retired manager
+  // keeps it retired.
+  manager.retireOnDiskFiles();
+  manager.unfreezeOnDiskFiles();
+  manager.freezeOnDiskFilesForRebuild();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      manager.deleteView("testViewFrozen"),
+      ::testing::HasSubstr("have been moved away by an index rebuild"));
+}
+
+// _____________________________________________________________________________
+TEST(MaterializedViewsManager, viewQueriesOnDisk) {
+  auto [directory, cleanup] = makeTemporaryDirectory("viewQueriesOnDisk");
+  std::string base = directory + "/index";
+  auto writeInfo = [&base](std::string_view name, const nlohmann::json& info) {
+    ad_utility::makeOfstream(absl::StrCat(
+        MaterializedView::getFilenameBase(base, name), VIEW_INFO_SUFFIX))
+        << info.dump();
+  };
+  writeInfo("viewB", {{"version", 1}, {"query", "SELECT * { ?s ?p ?o }"}});
+  writeInfo("viewA", {{"version", 2}});
+  // Ignored: an invalid view name, a file that is not the metadata of a view,
+  // and a view of a different index.
+  writeInfo("invalid name", {{"query", "x"}});
+  ad_utility::makeOfstream(absl::StrCat(
+      MaterializedView::getFilenameBase(base, "viewC"), VIEW_SPO_SUFFIX))
+      << "x";
+  ad_utility::makeOfstream(
+      absl::StrCat(directory, "/other.view.viewD", VIEW_INFO_SUFFIX))
+      << "{}";
+
+  using P = MaterializedViewsManager::ViewNameAndQuery;
+  EXPECT_THAT(
+      MaterializedViewsManager::viewQueriesOnDisk(base),
+      ::testing::ElementsAre(P{"viewA", std::nullopt},
+                             P{"viewB", std::string{"SELECT * { ?s ?p ?o }"}}));
 }
 
 // _____________________________________________________________________________

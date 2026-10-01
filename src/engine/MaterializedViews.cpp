@@ -16,6 +16,7 @@
 #include <optional>
 #include <stdexcept>
 
+#include "backports/StartsWithAndEndsWith.h"
 #include "backports/filesystem.h"
 #include "engine/IndexScan.h"
 #include "engine/Join.h"
@@ -135,8 +136,8 @@ void MaterializedViewsManager::writeViewToDisk(
   // would leave them behind under the base name of the rebuilt index, where
   // they don't belong, see `retireOnDiskFiles`). NOTE: It has to be acquired
   // before `loadedViews_` (which `unloadViewIfLoaded` locks).
-  auto notRetiredLock = lockIfNotRetired(
-      absl::StrCat("write the materialized view '", name, "'"));
+  auto notRetiredLock =
+      lockIfWritable(absl::StrCat("write the materialized view '", name, "'"));
   unloadViewIfLoaded(name);
   MaterializedViewWriter writer{onDiskBase_, std::move(name), plannedQuery,
                                 std::move(memoryLimit), std::move(allocator)};
@@ -575,8 +576,8 @@ void MaterializedViewsManager::deleteView(const std::string& name) const {
   // files that an index rebuild has already replaced by the files of the
   // rebuilt index (see `retireOnDiskFiles`). NOTE: It has to be acquired before
   // `loadedViews_` below.
-  auto notRetiredLock = lockIfNotRetired(
-      absl::StrCat("delete the materialized view '", name, "'"));
+  auto notRetiredLock =
+      lockIfWritable(absl::StrCat("delete the materialized view '", name, "'"));
 
   // Hold the lock for the whole check-unload-delete sequence below, so that a
   // concurrent `loadView`/`getView` call for the same view can not reload it
@@ -622,8 +623,11 @@ bool MaterializedViewsManager::isViewLoaded(const std::string& name) const {
 }
 
 // _____________________________________________________________________________
-bool MaterializedViewsManager::hasLoadedViews() const {
-  return !loadedViews_.rlock()->views_.empty();
+std::vector<std::string> MaterializedViewsManager::loadedViewNames() const {
+  auto names = loadedViews_.rlock()->views_ | ql::views::keys |
+               ::ranges::to<std::vector<std::string>>();
+  ql::ranges::sort(names);
+  return names;
 }
 
 // _____________________________________________________________________________
@@ -632,6 +636,36 @@ std::vector<ql::filesystem::path> MaterializedViewsManager::viewFilesOnDisk(
   // View files are named `<base>.view.<name>...`, so let the shared helper
   // enumerate the files with that infix in the directory of `onDiskBase`.
   return qlever::util::filesWithBaseNameAndSuffix(onDiskBase, VIEW_FILE_INFIX);
+}
+
+// _____________________________________________________________________________
+std::vector<MaterializedViewsManager::ViewNameAndQuery>
+MaterializedViewsManager::viewQueriesOnDisk(const std::string& onDiskBase) {
+  std::string prefix = MaterializedView::getFilenameBase(onDiskBase, "");
+  std::vector<ViewNameAndQuery> result;
+  for (const auto& file : viewFilesOnDisk(onDiskBase)) {
+    std::string filename = file.string();
+    if (!ql::ends_with(filename, VIEW_INFO_SUFFIX)) {
+      continue;
+    }
+    // `viewFilesOnDisk` returns paths that textually start with `prefix`.
+    AD_CORRECTNESS_CHECK(ql::starts_with(filename, prefix));
+    std::string name =
+        filename.substr(prefix.size(), filename.size() - prefix.size() -
+                                           VIEW_INFO_SUFFIX.size());
+    if (!MaterializedView::isValidName(name)) {
+      continue;
+    }
+    nlohmann::json viewInfoJson;
+    ad_utility::makeIfstream(file) >> viewInfoJson;
+    std::optional<std::string> query;
+    if (viewInfoJson.contains("query")) {
+      query = viewInfoJson.at("query").get<std::string>();
+    }
+    result.emplace_back(std::move(name), std::move(query));
+  }
+  ql::ranges::sort(result, {}, ad_utility::first);
+  return result;
 }
 
 // _____________________________________________________________________________

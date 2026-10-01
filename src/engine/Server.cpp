@@ -9,6 +9,7 @@
 
 #include "engine/Server.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/functional/bind_front.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_join.h>
@@ -1619,22 +1620,20 @@ Awaitable<qlever::IndexSwapConfig> Server::rebuildIndex(
   auto config = qlever::Qlever::makeIndexRebuildConfig(
       index, std::move(rebuildTmpDir), std::move(rebuildPreviousIndexDir));
 
+  // `rebuildIndexToDisk` freezes the views of the old index, undo this if the
+  // rebuild fails (after a successful swap, the views are retired, and this is
+  // a no-op).
+  absl::Cleanup unfreezeViews{
+      [&oldManager] { oldManager.unfreezeOnDiskFiles(); }};
+
   // Warn if state that won't carry over to the rebuilt index was previously
-  // loaded: the new index never calls `addTextFromOnDiskIndex()` and is paired
-  // with a fresh, empty `MaterializedViewsManager`.
+  // loaded: the new index never calls `addTextFromOnDiskIndex()`.
   if (index.getNofTextRecords() > 0) {
     AD_LOG_WARN << "A text index was loaded for the current index, but text "
                    "search will no longer work after the rebuild completes. "
                    "Restart the server using the original index to re-enable "
                    "text search."
                 << std::endl;
-  }
-  if (oldManager.hasLoadedViews()) {
-    AD_LOG_WARN
-        << "Materialized views were loaded for the current index, but they "
-           "will no longer be available after the rebuild completes. You'll "
-           "have to recompute them on the rebuilt index."
-        << std::endl;
   }
   // NOTE: We deliberately use the plain `runFunctionOnExecutor` and not
   // `computeInNewThread` here: the latter wraps the awaitable in
@@ -1648,8 +1647,8 @@ Awaitable<qlever::IndexSwapConfig> Server::rebuildIndex(
   // Conan setup.
   auto coroutine = ad_utility::runFunctionOnExecutor(
       queryThreadPool_.get_executor(),
-      [this, &index, &handle, &config] {
-        return qlever().rebuildIndexToDisk(index, config, handle);
+      [this, &indexAndViews, &handle, &config] {
+        return qlever().rebuildIndexToDisk(*indexAndViews, config, handle);
       },
       net::use_awaitable);
   auto rebuildResult = co_await std::move(coroutine);
@@ -1685,6 +1684,19 @@ Awaitable<qlever::IndexSwapConfig> Server::rebuildIndex(
         // request, because the new index is already in place.
         qlever().swapInRebuiltIndex(index, std::move(rebuildResult), handle,
                                     config, keepPreviousIndexDirs_);
+        // The views were recomputed on the new index, but not loaded (see
+        // `Qlever::rebuildMaterializedViews`), so load the ones that were
+        // loaded for the old index. The rebuild has already succeeded, so a
+        // failure is only logged.
+        for (const auto& name : oldManager.loadedViewNames()) {
+          try {
+            qlever().loadMaterializedView(name);
+          } catch (const std::exception& e) {
+            AD_LOG_ERROR << "Failed to load the materialized view \"" << name
+                         << "\" on the rebuilt index: " << e.what()
+                         << std::endl;
+          }
+        }
         auto now = std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::system_clock::now().time_since_epoch())
                        .count();

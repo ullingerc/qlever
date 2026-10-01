@@ -47,6 +47,7 @@
 #endif
 #include "global/Constants.h"
 #include "global/FileSuffixConstants.h"
+#include "global/MaterializedViewConstants.h"
 #include "index/IndexFormatVersion.h"
 #include "index/IndexRebuilder.h"
 #include "index/IndexRebuilderImpl.h"
@@ -1092,16 +1093,8 @@ TEST(IndexRebuilder, serverIntegrationDroppedStateWarnings) {
   // Keep all previous index directories, see `serverIntegration` above.
   config.keepPreviousIndexDirs_ = qlever::KeepPreviousIndexDirs::All;
 
-  // Write a materialized view to disk so it can be preloaded below.
-  {
-    qlever::Qlever engine{config};
-    engine.writeMaterializedView("droppedView", "SELECT * { ?s ?p ?o }");
-  }
-
-  // Load both the text index and the materialized view, so the rebuild warns
-  // that they will be dropped.
+  // Load the text index, so the rebuild warns that it will be dropped.
   config.loadTextIndex_ = true;
-  config.preloadMaterializedViews_ = {"droppedView"};
   Server server{4321, 1, "accessToken", config};
 
   auto [cleanup, logStream] = setGlobalLoggingStreamToStringStream();
@@ -1118,11 +1111,93 @@ TEST(IndexRebuilder, serverIntegrationDroppedStateWarnings) {
 
   EXPECT_THAT(logStream.str(),
               ::testing::HasSubstr("text search will no longer work"));
-  EXPECT_THAT(logStream.str(),
-              ::testing::HasSubstr("Materialized views were loaded"));
 
   threadPool.join();
   cleanDirsWithPrefix("droppedState.");
+}
+
+// _____________________________________________________________________________
+// The materialized views of the old index are recomputed from their queries on
+// the rebuilt index (so that they reflect the updates), and the views that were
+// loaded before the rebuild are loaded again afterwards.
+TEST(IndexRebuilder, serverIntegrationMaterializedViews) {
+  // See the comment in `serverIntegration` above.
+  auto cleanup = ad_utility::testing::useFreshWorkingDirectory();
+  std::string indexName = gtestCurrentTestName();
+  ad_utility::testing::makeTestIndex(indexName, "<a> <b> <c> .");
+
+  qlever::EngineConfig config;
+  config.baseName_ = indexName;
+  config.persistUpdates_ = false;
+  config.keepPreviousIndexDirs_ = qlever::KeepPreviousIndexDirs::All;
+
+  // `aDerived` reads `zBase`, so it can only be rebuilt after `zBase`,
+  // although it comes first by name. The query of `broken` fails on the
+  // rebuilt index (it was replaced by an invalid one below).
+  constexpr std::string_view prefix =
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> ";
+  {
+    qlever::Qlever engine{config};
+    engine.writeMaterializedView("zBase", "SELECT ?s ?o { ?s <b> ?o }");
+    engine.writeMaterializedView(
+        "aDerived",
+        absl::StrCat(prefix, "SELECT ?s ?o { ?s view:zBase-o ?o }"));
+    engine.writeMaterializedView("broken", "SELECT ?s { ?s <b> ?o }");
+  }
+  auto brokenInfo = absl::StrCat(indexName, ".view.broken", VIEW_INFO_SUFFIX);
+  nlohmann::json info;
+  ad_utility::makeIfstream(brokenInfo) >> info;
+  info["query"] = "SELECT ?s {";
+  ad_utility::makeOfstream(brokenInfo) << info.dump();
+
+  config.preloadMaterializedViews_ = {"zBase"};
+  serverTestHelpers::ServerForTesting server{1, "accessToken", config};
+  auto process = [&server](auto request) {
+    auto response = server.process(request);
+    EXPECT_EQ(response.base().result(), boost::beast::http::status::ok);
+    return serverTestHelpers::responseBodyToString(std::move(response.body()));
+  };
+  process(ad_utility::testing::makePostRequest(
+      "/?access-token=accessToken", "application/sparql-update",
+      "INSERT DATA { <d> <b> <e> . }"));
+
+  auto [logCleanup, logStream] = setGlobalLoggingStreamToStringStream();
+  process(ad_utility::testing::makeGetRequest(
+      "/?cmd=rebuild-index&access-token=accessToken"));
+  EXPECT_THAT(logStream.str(),
+              ::testing::HasSubstr(
+                  "Failed to rebuild materialized view \"broken\" on the "
+                  "rebuilt index"));
+
+  // Only the view that was loaded before the rebuild is loaded now.
+  auto& qlv = server.server().qlever();
+  EXPECT_TRUE(qlv.isMaterializedViewLoaded("zBase"));
+  EXPECT_FALSE(qlv.isMaterializedViewLoaded("aDerived"));
+  EXPECT_FALSE(ql::filesystem::exists(brokenInfo));
+
+  // Both views contain the inserted triple.
+  auto queryView = [&process, prefix](std::string_view view) {
+    return process(ad_utility::testing::makePostRequest(
+        "/", "application/sparql-query",
+        absl::StrCat(prefix, "SELECT * { ?s view:", view, "-o ?o }")));
+  };
+  for (std::string_view view : {"zBase", "aDerived"}) {
+    EXPECT_THAT(queryView(view),
+                ::testing::AllOf(::testing::HasSubstr("\"value\":\"c\""),
+                                 ::testing::HasSubstr("\"value\":\"e\"")));
+  }
+
+  // The old views were retired together with the old index.
+  auto previousDirs = dirsWithPrefix("previous.");
+  ASSERT_EQ(previousDirs.size(), 1u);
+  for (std::string_view view : {"zBase", "aDerived", "broken"}) {
+    EXPECT_TRUE(ql::filesystem::exists(
+        previousDirs.front() /
+        absl::StrCat(indexName, ".view.", view, VIEW_INFO_SUFFIX)));
+  }
+
+  // Views can be written to the rebuilt index again.
+  qlv.writeMaterializedView("afterRebuild", "SELECT ?s ?o { ?s <b> ?o }");
 }
 
 // _____________________________________________________________________________
