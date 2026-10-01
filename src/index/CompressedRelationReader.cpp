@@ -977,14 +977,15 @@ DecompressedBlock CompressedRelationReader::decompressBlock(
 }
 
 // ____________________________________________________________________________
-CompressedRelationReader::ColumnIndices CompressedRelationReader::columnsToRead(
+CompressedRelationReader::ColumnIndicesRef
+CompressedRelationReader::columnsToRead(
     const ScanImplConfig& scanConfig, const CompressedBlockMetadata& metadata) {
   const auto& locatedTriples = scanConfig.locatedTriples_;
-  if (locatedTriples.numPayloadColumns() > 0 &&
+  if (locatedTriples.mergesFullRows() &&
       locatedTriples.containsTriples(metadata.blockIndex_)) {
-    ColumnIndices allColumns(4 + locatedTriples.numPayloadColumns());
-    std::iota(allColumns.begin(), allColumns.end(), ColumnIndex{0});
-    return allColumns;
+    AD_CORRECTNESS_CHECK(scanConfig.allColumns_.size() ==
+                         4 + locatedTriples.numPayloadColumns());
+    return scanConfig.allColumns_;
   }
   return scanConfig.scanColumns_;
 }
@@ -1001,7 +1002,7 @@ CompressedRelationReader::decompressAndPostprocessBlock(
   bool hasUpdates = false;
   const auto& locatedTriples = scanConfig.locatedTriples_;
   if (locatedTriples.containsTriples(metadata.blockIndex_)) {
-    if (locatedTriples.numPayloadColumns() > 0) {
+    if (locatedTriples.mergesFullRows()) {
       // The block was read with all columns (see `columnsToRead`), merge the
       // full rows and then project to the requested columns.
       AD_CORRECTNESS_CHECK(decompressedBlock.numColumns() ==
@@ -1285,7 +1286,15 @@ auto CompressedRelationReader::getScanConfig(
   }();
   FilterDuplicatesAndGraphs graphFilter{scanSpec.graphFilter(),
                                         graphColumnIndex, deleteGraphColumn};
-  return {std::move(columnIndices), std::move(graphFilter), locatedTriples};
+  // Precompute all columns of the permutation for the blocks that have to be
+  // read completely, see `columnsToRead`.
+  ColumnIndices allColumns;
+  if (locatedTriples.mergesFullRows()) {
+    allColumns.resize(4 + locatedTriples.numPayloadColumns());
+    std::iota(allColumns.begin(), allColumns.end(), ColumnIndex{0});
+  }
+  return {std::move(columnIndices), std::move(graphFilter), locatedTriples,
+          std::move(allColumns)};
 }
 
 // _____________________________________________________________________________

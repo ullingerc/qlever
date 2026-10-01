@@ -27,6 +27,14 @@ size_t LocatedTriple::locateBlock(
   // A triple belongs to the first block that contains at least one triple
   // that larger than or equal to the triple. See `LocatedTriples.h` for a
   // discussion of the corner cases.
+  //
+  // NOTE: Only the first three columns are compared. This is also correct for
+  // rows with payload columns (materialized views), because the
+  // `CompressedRelationWriter` never splits rows that are equal in their first
+  // three columns across blocks (see `PermutationWriter::
+  // addRowsOfCurrentRelation` and `CompressedRelationWriter::
+  // addCompleteLargeRelation`), so all rows with the same key (independent of
+  // the graph and payload) are in the same block.
   return ql::ranges::lower_bound(
              blockMetadata, permutedTriple.toPermutedTriple(),
              [](const auto& a, const auto& b) {
@@ -41,24 +49,42 @@ size_t LocatedTriple::locateBlock(
          blockMetadata.begin();
 }
 
+namespace {
+// Common implementation of `locateTriplesInPermutation` and `locateRowsInView`:
+// Locate `numRows` rows, where `getRow(i)` returns a pair of the key (in the
+// order of the permutation) and the payload of the `i`-th row.
+template <typename GetRow>
+std::vector<LocatedTriple> locateRows(
+    size_t numRows, ql::span<const CompressedBlockMetadata> blockMetadata,
+    bool insertOrDelete,
+    const ad_utility::SharedCancellationHandle& cancellationHandle,
+    const GetRow& getRow) {
+  std::vector<LocatedTriple> out;
+  out.reserve(numRows);
+  ad_utility::chunkedForLoop<10'000>(
+      0, numRows,
+      [&out, &blockMetadata, insertOrDelete, &getRow](size_t i) {
+        auto [triple, payload] = getRow(i);
+        size_t blockIndex = LocatedTriple::locateBlock(triple, blockMetadata);
+        out.push_back({blockIndex, std::move(triple), std::move(payload),
+                       insertOrDelete});
+      },
+      [&cancellationHandle]() { cancellationHandle->throwIfCancelled(); });
+  return out;
+}
+}  // namespace
+
 // ____________________________________________________________________________
 std::vector<LocatedTriple> LocatedTriple::locateTriplesInPermutation(
     ql::span<const IdTriple<0>> triples,
     ql::span<const CompressedBlockMetadata> blockMetadata,
     const qlever::KeyOrder& keyOrder, bool insertOrDelete,
     ad_utility::SharedCancellationHandle cancellationHandle) {
-  std::vector<LocatedTriple> out;
-  out.reserve(triples.size());
-  ad_utility::chunkedForLoop<10'000>(
-      0, triples.size(),
-      [&triples, &out, &blockMetadata, &keyOrder, &insertOrDelete](size_t i) {
-        auto triple = triples[i].permute(keyOrder);
-        out.push_back(
-            {locateBlock(triple, blockMetadata), triple, {}, insertOrDelete});
-      },
-      [&cancellationHandle]() { cancellationHandle->throwIfCancelled(); });
-
-  return out;
+  return locateRows(triples.size(), blockMetadata, insertOrDelete,
+                    cancellationHandle, [&triples, &keyOrder](size_t i) {
+                      return std::pair{triples[i].permute(keyOrder),
+                                       std::vector<Id>{}};
+                    });
 }
 
 // ____________________________________________________________________________
@@ -67,23 +93,14 @@ std::vector<LocatedTriple> LocatedTriple::locateRowsInView(
     bool insertOrDelete,
     ad_utility::SharedCancellationHandle cancellationHandle) {
   AD_CONTRACT_CHECK(rows.numColumns() >= 4);
-  std::vector<LocatedTriple> out;
-  out.reserve(rows.numRows());
-  ad_utility::chunkedForLoop<10'000>(
-      0, rows.numRows(),
-      [&rows, &out, &blockMetadata, insertOrDelete](size_t i) {
+  return locateRows(
+      rows.numRows(), blockMetadata, insertOrDelete, cancellationHandle,
+      [&rows](size_t i) {
         const auto& row = rows[i];
-        IdTriple<0> triple{std::array{row[0], row[1], row[2], row[3]}};
-        std::vector<Id> payload;
-        payload.reserve(rows.numColumns() - 4);
-        for (size_t col = 4; col < rows.numColumns(); ++col) {
-          payload.push_back(row[col]);
-        }
-        out.push_back({locateBlock(triple, blockMetadata), triple,
-                       std::move(payload), insertOrDelete});
-      },
-      [&cancellationHandle]() { cancellationHandle->throwIfCancelled(); });
-  return out;
+        return std::pair{
+            IdTriple<0>{std::array{row[0], row[1], row[2], row[3]}},
+            std::vector<Id>(row.begin() + 4, row.end())};
+      });
 }
 
 // ____________________________________________________________________________
@@ -151,8 +168,7 @@ static constexpr auto tieLocatedTriplesIndices = []() {
   return a;
 }();
 
-// Like `tieLocatedTriple`, but takes a `const LocatedTriple&` value instead of
-// an iterator. Needed for algorithms like `set_intersection` that pass values.
+// Return a `std::tie` of the relevant entries of the `const LocatedTriple& lt`.
 CPP_template(size_t numIndexColumns, bool includeGraphColumn,
              typename T)(requires(numIndexColumns >= 1 &&
                                   numIndexColumns <=
@@ -163,38 +179,21 @@ CPP_template(size_t numIndexColumns, bool includeGraphColumn,
       ad_utility::toIntegerSequenceRef<
           tieLocatedTriplesIndices<numIndexColumns, includeGraphColumn>>());
 }
-CPP_template(size_t numIndexColumns, bool includeGraphColumn,
-             typename T)(requires(numIndexColumns >= 1 &&
-                                  numIndexColumns <=
-                                      3)) auto tieLocatedTriple(T& lt) {
-  return tieLocatedTripleValue<numIndexColumns, includeGraphColumn>(*lt);
-}
 
-// ____________________________________________________________________________
-template <size_t numIndexColumns, bool includeGraphColumn>
-IdTable LocatedTriplesPerBlock::mergeTriplesImpl(size_t blockIndex,
-                                                 const IdTable& block) const {
-  // This method should only be called if there are located triples in the
-  // specified block.
-  AD_CONTRACT_CHECK(map_.contains(blockIndex));
-
-  AD_CONTRACT_CHECK(numIndexColumns + static_cast<size_t>(includeGraphColumn) <=
-                    block.numColumns());
-
-  auto numInsertsAndDeletes = numTriples(blockIndex);
+namespace {
+// Three-way merge of the sorted `block` with the sorted `locatedTriples`, which
+// is the common implementation of `mergeTriplesImpl` and `mergeFullRows`.
+// `compare(lt, row)` returns a negative value, zero, or a positive value if the
+// located triple `lt` is less than, equal to, or greater than the `row` of the
+// `block`. `writeLocatedTriple(lt, resultIt)` writes the inserted located
+// triple `lt` to the row of the result that `resultIt` points to. `numAdded` is
+// an upper bound for the number of inserted located triples.
+template <typename Compare, typename WriteLocatedTriple>
+IdTable mergeBlockAndLocatedTriples(
+    const IdTable& block, const LocatedTriples& locatedTriples, size_t numAdded,
+    const Compare& compare, const WriteLocatedTriple& writeLocatedTriple) {
   IdTable result{block.numColumns(), block.getAllocator()};
-  result.resize(block.numRows() + numInsertsAndDeletes.numAdded_);
-
-  const auto& locatedTriples = map_.at(blockIndex);
-
-  auto lessThan = [](const auto& lt, const auto& row) {
-    return tieLocatedTriple<numIndexColumns, includeGraphColumn>(lt) <
-           tieIdTableRow<numIndexColumns, includeGraphColumn>(row);
-  };
-  auto equal = [](const auto& lt, const auto& row) {
-    return tieLocatedTriple<numIndexColumns, includeGraphColumn>(lt) ==
-           tieIdTableRow<numIndexColumns, includeGraphColumn>(row);
-  };
+  result.resize(block.numRows() + numAdded);
 
   auto rowIt = block.begin();
   auto sortedLocatedTriples = locatedTriples.getSortedView();
@@ -203,33 +202,22 @@ IdTable LocatedTriplesPerBlock::mergeTriplesImpl(size_t blockIndex,
   auto resultIt = result.begin();
 
   // Write the given `locatedTriple` to `result` at position `resultIt` and
-  // advance `resultIt` by one. See the example in the comment of the
-  // declaration of `mergeTriples` to understand the behavior of this function.
-  auto writeLocatedTripleToResult = [&result, &resultIt](auto& locatedTriple) {
-    // Write part from `locatedTriple` that also occurs in the input `block` to
-    // the result.
-    static constexpr auto plusOneIfGraph =
-        static_cast<size_t>(includeGraphColumn);
-    for (size_t i = 0; i < numIndexColumns + plusOneIfGraph; i++) {
-      (*resultIt)[i] = locatedTriple.triple_.ids()[3 - numIndexColumns + i];
-    }
-    // If the input `block` has payload columns (which located triples don't
-    // have), set their values to UNDEF.
-    for (size_t i = numIndexColumns + plusOneIfGraph; i < result.numColumns();
-         i++) {
-      (*resultIt)[i] = ValueId::makeUndefined();
-    }
-    resultIt++;
-  };
+  // advance `resultIt` by one.
+  auto writeLocatedTripleToResult =
+      [&resultIt, &writeLocatedTriple](const LocatedTriple& locatedTriple) {
+        writeLocatedTriple(locatedTriple, resultIt);
+        resultIt++;
+      };
 
   while (rowIt != block.end() && locatedTripleIt != locatedTripleEnd) {
-    if (lessThan(locatedTripleIt, *rowIt)) {
+    int cmp = compare(*locatedTripleIt, *rowIt);
+    if (cmp < 0) {
       if (locatedTripleIt->insertOrDelete_) {
         // Insertion of a non-existent triple.
         writeLocatedTripleToResult(*locatedTripleIt);
       }
       locatedTripleIt++;
-    } else if (equal(locatedTripleIt, *rowIt)) {
+    } else if (cmp == 0) {
       if (!locatedTripleIt->insertOrDelete_) {
         // Deletion of an existing triple.
         rowIt++;
@@ -259,6 +247,66 @@ IdTable LocatedTriplesPerBlock::mergeTriplesImpl(size_t blockIndex,
   return result;
 }
 
+// Three-way comparison of the full row of `lt` (key and payload) with the
+// full `row` of a materialized view. Returns a negative value, zero, or a
+// positive value.
+constexpr auto compareFullRow = [](const LocatedTriple& lt, const auto& row) {
+  auto ltKey = tieLocatedTripleValue<3, true>(lt);
+  auto rowKey = tieIdTableRow<3, true>(row);
+  if (ltKey != rowKey) {
+    return ltKey < rowKey ? -1 : 1;
+  }
+  for (size_t i = 0; i < lt.payload_.size(); ++i) {
+    if (lt.payload_[i] != row[4 + i]) {
+      return lt.payload_[i] < row[4 + i] ? -1 : 1;
+    }
+  }
+  return 0;
+};
+}  // namespace
+
+// ____________________________________________________________________________
+template <size_t numIndexColumns, bool includeGraphColumn>
+IdTable LocatedTriplesPerBlock::mergeTriplesImpl(size_t blockIndex,
+                                                 const IdTable& block) const {
+  // This method should only be called if there are located triples in the
+  // specified block.
+  AD_CONTRACT_CHECK(map_.contains(blockIndex));
+
+  AD_CONTRACT_CHECK(numIndexColumns + static_cast<size_t>(includeGraphColumn) <=
+                    block.numColumns());
+
+  auto compare = [](const LocatedTriple& lt, const auto& row) {
+    auto ltKey = tieLocatedTripleValue<numIndexColumns, includeGraphColumn>(lt);
+    auto rowKey = tieIdTableRow<numIndexColumns, includeGraphColumn>(row);
+    return ltKey < rowKey ? -1 : (ltKey == rowKey ? 0 : 1);
+  };
+
+  // Write the given `locatedTriple` to the row that `resultIt` points to. See
+  // the example in the comment of the declaration of `mergeTriples` to
+  // understand the behavior of this function.
+  auto writeLocatedTriple = [numColumns = block.numColumns()](
+                                const LocatedTriple& locatedTriple,
+                                const auto& resultIt) {
+    // Write part from `locatedTriple` that also occurs in the input `block` to
+    // the result.
+    static constexpr auto plusOneIfGraph =
+        static_cast<size_t>(includeGraphColumn);
+    for (size_t i = 0; i < numIndexColumns + plusOneIfGraph; i++) {
+      (*resultIt)[i] = locatedTriple.triple_.ids()[3 - numIndexColumns + i];
+    }
+    // If the input `block` has payload columns (which located triples don't
+    // have), set their values to UNDEF.
+    for (size_t i = numIndexColumns + plusOneIfGraph; i < numColumns; i++) {
+      (*resultIt)[i] = ValueId::makeUndefined();
+    }
+  };
+
+  return mergeBlockAndLocatedTriples(block, map_.at(blockIndex),
+                                     numTriples(blockIndex).numAdded_, compare,
+                                     writeLocatedTriple);
+}
+
 // ____________________________________________________________________________
 IdTable LocatedTriplesPerBlock::mergeTriples(size_t blockIndex,
                                              const IdTable& block,
@@ -285,24 +333,6 @@ IdTable LocatedTriplesPerBlock::mergeTriples(size_t blockIndex,
   }
 }
 
-// Three-way comparison of the full row of `lt` (key and payload) with the
-// full `row` of a materialized view. Returns a negative value, zero, or a
-// positive value.
-template <typename Row>
-static int compareFullRow(const LocatedTriple& lt, const Row& row) {
-  auto ltKey = tieLocatedTripleValue<3, true>(lt);
-  auto rowKey = tieIdTableRow<3, true>(row);
-  if (ltKey != rowKey) {
-    return ltKey < rowKey ? -1 : 1;
-  }
-  for (size_t i = 0; i < lt.payload_.size(); ++i) {
-    if (lt.payload_[i] != row[4 + i]) {
-      return lt.payload_[i] < row[4 + i] ? -1 : 1;
-    }
-  }
-  return 0;
-}
-
 // ____________________________________________________________________________
 IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
                                               const IdTable& block) const {
@@ -311,58 +341,21 @@ IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
   AD_CONTRACT_CHECK(map_.contains(blockIndex));
   AD_CONTRACT_CHECK(block.numColumns() == 4 + numPayloadColumns_);
 
-  IdTable result{block.numColumns(), block.getAllocator()};
-  result.resize(block.numRows() + numTriples(blockIndex).numAdded_);
-
-  auto rowIt = block.begin();
-  auto sortedLocatedTriples = map_.at(blockIndex).getSortedView();
-  auto locatedTripleIt = sortedLocatedTriples.begin();
-  auto locatedTripleEnd = sortedLocatedTriples.end();
-  auto resultIt = result.begin();
-
-  // Write the full row of `locatedTriple` (key and payload) to `result` at
-  // position `resultIt` and advance `resultIt` by one.
-  auto writeLocatedTripleToResult = [this, &resultIt](const LocatedTriple& lt) {
+  // Write the full row of `lt` (key and payload) to the row that `resultIt`
+  // points to.
+  auto writeLocatedTriple = [this](const LocatedTriple& lt,
+                                   const auto& resultIt) {
     for (size_t i = 0; i < 4; ++i) {
       (*resultIt)[i] = lt.triple_.ids()[i];
     }
     for (size_t i = 0; i < numPayloadColumns_; ++i) {
       (*resultIt)[4 + i] = lt.payload_[i];
     }
-    resultIt++;
   };
 
-  // Same three-way merge as in `mergeTriplesImpl`.
-  while (rowIt != block.end() && locatedTripleIt != locatedTripleEnd) {
-    int cmp = compareFullRow(*locatedTripleIt, *rowIt);
-    if (cmp < 0) {
-      if (locatedTripleIt->insertOrDelete_) {
-        // Insertion of a non-existent row.
-        writeLocatedTripleToResult(*locatedTripleIt);
-      }
-      locatedTripleIt++;
-    } else if (cmp == 0) {
-      if (!locatedTripleIt->insertOrDelete_) {
-        // Deletion of an existing row.
-        rowIt++;
-      }
-      locatedTripleIt++;
-    } else {
-      // The rowIt is not deleted - copy it
-      *resultIt++ = *rowIt++;
-    }
-  }
-  for (; locatedTripleIt != locatedTripleEnd; ++locatedTripleIt) {
-    if (locatedTripleIt->insertOrDelete_) {
-      writeLocatedTripleToResult(*locatedTripleIt);
-    }
-  }
-  while (rowIt != block.end()) {
-    *resultIt++ = *rowIt++;
-  }
-
-  result.resize(resultIt - result.begin());
-  return result;
+  return mergeBlockAndLocatedTriples(block, map_.at(blockIndex),
+                                     numTriples(blockIndex).numAdded_, compareFullRow,
+                                     writeLocatedTriple);
 }
 
 namespace {
@@ -705,11 +698,12 @@ std::ostream& operator<<(std::ostream& os, const std::vector<IdTriple<0>>& v) {
 }
 
 // ____________________________________________________________________________
-bool LocatedTriplesPerBlock::isLocatedTriple(const IdTriple<0>& triple,
-                                             bool insertOrDelete) const {
-  auto blockContains = [&triple, insertOrDelete](const LocatedTriples& lt,
-                                                 size_t blockIndex) {
-    LocatedTriple locatedTriple{blockIndex, triple, {}, insertOrDelete};
+bool LocatedTriplesPerBlock::isLocatedTriple(
+    const IdTriple<0>& triple, bool insertOrDelete,
+    const std::vector<Id>& payload) const {
+  auto blockContains = [&triple, insertOrDelete, &payload](
+                           const LocatedTriples& lt, size_t blockIndex) {
+    LocatedTriple locatedTriple{blockIndex, triple, payload, insertOrDelete};
     locatedTriple.blockIndex_ = blockIndex;
     return ad_utility::contains(lt.getSortedView(), locatedTriple);
   };
@@ -723,6 +717,11 @@ bool LocatedTriplesPerBlock::isLocatedTriple(const IdTriple<0>& triple,
 // _____________________________________________________________________________
 std::array<std::vector<IdTriple<0>>, 2> LocatedTriplesPerBlock::computeDiff(
     const LocatedTriplesPerBlock& oldBlocks) const {
+  // The result consists of the `triple_`s only, so a `payload_` would be lost.
+  // This is fine because `computeDiff` is only used for the main index (to
+  // carry over the updates when rebuilding the index, which doesn't carry over
+  // the materialized views).
+  AD_CONTRACT_CHECK(!mergesFullRows_ && !oldBlocks.mergesFullRows_);
   std::array<std::vector<IdTriple<0>>, 2> result;
   auto addTriple = [&result](const LocatedTriple& lt) {
     result.at(lt.insertOrDelete_ ? 0 : 1).push_back(lt.triple_);

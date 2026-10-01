@@ -96,7 +96,7 @@ void DeltaTriples::clear() {
   for (auto& [name, view] : views_) {
     view.rowsInserted_.clear();
     view.rowsDeleted_.clear();
-    locatedTriples_->viewLocatedTriples_.at(name).clear();
+    viewLocatedRows(name).clear();
   }
 }
 
@@ -122,7 +122,7 @@ void DeltaTriples::eraseTriplesInPermutation(
       triples, perm.metaData().blockData(), perm.keyOrder(),
       insertOrDeleteDummyValue, cancellationHandle);
   // `LocatedTriplesPerBlock::erase` requires a sorted input.
-  ql::ranges::sort(locatedTriples, {}, &LocatedTriple::triple_);
+  ql::ranges::sort(locatedTriples, {}, LocatedTriplesProjection{});
   lts.erase(locatedTriples);
 }
 
@@ -446,26 +446,26 @@ std::vector<Id> viewIdentity(
 // ____________________________________________________________________________
 void DeltaTriples::registerView(
     const std::string& name, std::shared_ptr<const Permutation> permutation,
-    size_t numPayloadColumns,
+    size_t numColumns,
     ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns) {
   AD_CONTRACT_CHECK(permutation != nullptr);
   auto metadata = permutation->metaData().blockDataShared();
   AD_CONTRACT_CHECK(metadata != nullptr);
   if (auto it = views_.find(name);
-      it != views_.end() && it->second.metadata_ == metadata) {
-    AD_CONTRACT_CHECK(
-        locatedTriples_->viewLocatedTriples_.at(name).numPayloadColumns() ==
-        numPayloadColumns);
+      it != views_.end() &&
+      viewLocatedRows(name).hasOriginalMetadata(*metadata)) {
+    AD_CONTRACT_CHECK(it->second.numColumns_ == numColumns);
     return;
   }
   // A replaced registration may have had updates, see `unregisterView`.
   unregisterView(name);
+  auto identity = viewIdentity(*metadata, numColumns);
+  // Views with less than four columns are stored padded to four columns.
   LocatedTriplesPerBlock locatedRows;
-  locatedRows.setNumPayloadColumns(numPayloadColumns);
-  locatedRows.setOriginalMetadata(metadata);
+  locatedRows.setNumPayloadColumns(std::max(numColumns, size_t{4}) - 4);
+  locatedRows.setOriginalMetadata(std::move(metadata));
   locatedTriples_->viewLocatedTriples_.emplace(name, std::move(locatedRows));
-  auto identity = viewIdentity(*metadata, 4 + numPayloadColumns);
-  views_.emplace(name, ViewState{std::move(metadata),
+  views_.emplace(name, ViewState{numColumns,
                                  std::move(permutation),
                                  std::move(identity),
                                  std::move(possiblyUndefinedColumns),
@@ -515,7 +515,7 @@ void DeltaTriples::readViewFromDisk(const std::string& name) {
                                   toRows(idRanges.at(0)));
   locatedRows.consolidateAllBlocks();
   // The registration doesn't update the metadata (see
-  // `MaterializedViewsManager::withDeltaTriples`), so do it here.
+  // `MaterializedViewsManager::syncViewRegistration`), so do it here.
   locatedRows.updateAugmentedMetadata();
   AD_LOG_INFO << "Done, #inserted rows = " << idRanges.at(1).size() / numColumns
               << ", #deleted rows = " << idRanges.at(0).size() / numColumns
@@ -527,6 +527,14 @@ std::string DeltaTriples::viewFilename(const std::string& name) const {
   // NOTE: The `name` is safe to use in a filename, because the names of
   // materialized views are checked by `MaterializedView::throwIfInvalidName`.
   return absl::StrCat(filenameForPersisting_.value(), VIEW_FILE_INFIX, name);
+}
+
+// ____________________________________________________________________________
+LocatedTriplesPerBlock& DeltaTriples::viewLocatedRows(const std::string& name) {
+  auto it = locatedTriples_->viewLocatedTriples_.find(name);
+  // `views_` and `viewLocatedTriples_` always have the same keys.
+  AD_CORRECTNESS_CHECK(it != locatedTriples_->viewLocatedTriples_.end());
+  return it->second;
 }
 
 // ____________________________________________________________________________
@@ -594,11 +602,22 @@ void DeltaTriples::modifyViewRowsImpl(CancellationHandle cancellationHandle,
                         "' is not registered for updates.");
   });
   auto& view = it->second;
-  auto& locatedRows = locatedTriples_->viewLocatedTriples_.at(name);
+  auto& locatedRows = viewLocatedRows(name);
   AD_CONTRACT_CHECK(rows.numColumns() == 4 + locatedRows.numPayloadColumns(),
                     "The number of columns of the rows to be inserted into or "
                     "deleted from a materialized view must match the view.");
   for (size_t col = 0; col < rows.numColumns(); ++col) {
+    // The padding columns of views with less than four columns are always
+    // UNDEF.
+    if (col >= view.numColumns_) {
+      AD_CONTRACT_CHECK(
+          ql::ranges::all_of(rows.getColumn(col), &Id::isUndefined), [col]() {
+            return absl::StrCat("Column ", col,
+                                " is a padding column of a materialized view "
+                                "and must only contain UNDEF values.");
+          });
+      continue;
+    }
     AD_CONTRACT_CHECK(
         view.possiblyUndefinedColumns_.contains(col) ||
             ql::ranges::none_of(rows.getColumn(col), &Id::isUndefined),
@@ -620,36 +639,42 @@ void DeltaTriples::modifyViewRowsImpl(CancellationHandle cancellationHandle,
   tracer.endTrace("rewriteLocalVocabEntries");
 
   // Unlike for the triples, we can't expect the caller to sort the rows, so
-  // sort and deduplicate them here.
-  std::vector<std::vector<Id>> fullRows(rows.numRows(),
-                                        std::vector<Id>(rows.numColumns()));
+  // sort them here. Then (in place) drop the duplicates and the rows that are
+  // already in the `targetSet`, and remove the remaining rows from the
+  // `inverseSet`.
+  ql::ranges::sort(rows, [](const auto& a, const auto& b) {
+    return ql::ranges::lexicographical_compare(a, b);
+  });
+  std::vector<Id> key(rows.numColumns());
+  auto toKey = [&key](const auto& row) -> const std::vector<Id>& {
+    ql::ranges::copy(row, key.begin());
+    return key;
+  };
+  size_t numKept = 0;
   for (size_t i = 0; i < rows.numRows(); ++i) {
-    for (size_t col = 0; col < rows.numColumns(); ++col) {
-      fullRows[i][col] = rows(i, col);
+    if ((numKept > 0 && rows[numKept - 1] == rows[i]) ||
+        targetSet.contains(toKey(rows[i]))) {
+      continue;
     }
+    inverseSet.erase(key);
+    if (numKept != i) {
+      rows[numKept] = rows[i];
+    }
+    ++numKept;
   }
-  ql::ranges::sort(fullRows);
-  fullRows.erase(std::unique(fullRows.begin(), fullRows.end()), fullRows.end());
-  ql::erase_if(fullRows, [&targetSet](const std::vector<Id>& row) {
-    return targetSet.contains(row);
-  });
-  ql::ranges::for_each(fullRows, [&inverseSet](const std::vector<Id>& row) {
-    inverseSet.erase(row);
-  });
+  rows.resize(numKept);
 
   tracer.beginTrace("locatedAndAdd");
-  IdTable remainingRows{rows.numColumns(), rows.getAllocator()};
-  remainingRows.reserve(fullRows.size());
-  ql::ranges::for_each(fullRows, [&remainingRows](const std::vector<Id>& row) {
-    remainingRows.push_back(row);
-  });
-  auto locatedTriples = LocatedTriple::locateRowsInView(
-      remainingRows, *view.metadata_, insertOrDelete, cancellationHandle);
+  auto locatedTriples =
+      LocatedTriple::locateRowsInView(rows, locatedRows.getOriginalMetadata(),
+                                      insertOrDelete, cancellationHandle);
   cancellationHandle->throwIfCancelled();
   locatedRows.add(locatedTriples, tracer);
   tracer.endTrace("locatedAndAdd");
 
-  ql::ranges::move(fullRows, std::inserter(targetSet, targetSet.end()));
+  for (const auto& row : rows) {
+    targetSet.insert(toKey(row));
+  }
 }
 
 // ____________________________________________________________________________

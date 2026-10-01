@@ -300,6 +300,10 @@ const LocatedTriplesPerBlock& Permutation::getLocatedTriplesForPermutation(
     // `locatedTriplesState` was taken before the view was registered, and they
     // belong to another view of the same name (that was replaced in the
     // meantime) if the original metadata is different.
+    //
+    // NOTE: This is a hash lookup of the name for each call (roughly once per
+    // scan), which is cheap compared to the scan itself, and the number of
+    // views is small.
     auto locatedTriplesForView =
         locatedTriplesState.getLocatedTriplesForView(readableName_);
     if (locatedTriplesForView.has_value() &&

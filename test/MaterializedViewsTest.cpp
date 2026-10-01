@@ -569,13 +569,13 @@ TEST_F(MaterializedViewsTest, InvalidInputToWriter) {
                              "may not contain a `LIMIT` or `OFFSET` clause");
 
   // An explicit `ORDER BY` clause is always rejected, because a view is
-  // always stored in the internal order of its first three columns.
+  // always stored in the internal order of all its columns.
   expectWriteViewToDiskError(simpleWriteQuery_ + " ORDER BY ?p",
                              "may not contain an `ORDER BY` clause");
   expectWriteViewToDiskError(simpleWriteQuery_ + " ORDER BY DESC(?s)",
                              "may not contain an `ORDER BY` clause");
 
-  // An `INTERNAL SORT BY` inconsistent with the view's SPO order is rejected.
+  // An `INTERNAL SORT BY` inconsistent with the view's order is rejected.
   expectWriteViewToDiskError(simpleWriteQuery_ + " INTERNAL SORT BY ?p",
                              "must be a prefix of the view's columns");
   expectWriteViewToDiskError(
@@ -2250,10 +2250,10 @@ TEST(MaterializedViewsManager, viewFilesOnDisk) {
 }
 
 // _____________________________________________________________________________
-TEST(ExternalSortFunctors, SortAllColumns) {
+TEST(ExternalSortFunctors, SortText) {
   auto t = makeIdTableFromVector(
       {{1, 2, 3, 4, 5}, {1, 2, 3, 4, 6}, {1, 2, 3, 5, 0}, {1, 2, 3, 4, 5}});
-  SortAllColumns cmp;
+  SortText cmp;
   // Rows differing only in column 4 or 3.
   EXPECT_TRUE(cmp(t[0], t[1]));
   EXPECT_FALSE(cmp(t[1], t[0]));
@@ -2413,6 +2413,16 @@ TEST_F(MaterializedViewsTest, UpdateViewRows) {
               matchesIdTable(makeIdTableFromVector(
                   {{1, 1}, {1, 1}, {2, 1}, {3, 7}}, IntId)));
 
+  // Loading an already registered view and unloading a view that is not
+  // loaded don't touch the delta triples (in particular, the snapshot is not
+  // copied).
+  auto snapshotBefore =
+      deltaTriplesManager.getCurrentLocatedTriplesSharedState();
+  qlv().loadMaterializedView("upd");
+  EXPECT_FALSE(qlv().unloadMaterializedView("notLoaded"));
+  EXPECT_EQ(deltaTriplesManager.getCurrentLocatedTriplesSharedState(),
+            snapshotBefore);
+
   // Unloading the view unregisters it and drops its updates. Loading it lazily
   // by a query does not register it, loading it explicitly does.
   EXPECT_TRUE(qlv().unloadMaterializedView("upd"));
@@ -2515,6 +2525,73 @@ TEST_F(MaterializedViewsTest, PersistAndVacuumViewRows) {
   restartEngine();
   qlv().loadMaterializedView("upd");
   EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, UpdateViewRowsWithoutPayload) {
+  // Views with exactly four columns and with less than four columns (padded
+  // to four columns) have no payload columns, but their updates have to be
+  // merged on full rows nevertheless: column 3 is a regular column of the view
+  // and not a graph column.
+  qlv().writeMaterializedView(
+      "four", "SELECT * { VALUES (?a ?b ?c ?d) { (1 1 1 1) (2 2 2 2) } }");
+  qlv().writeMaterializedView("two",
+                              "SELECT * { VALUES (?a ?b) { (1 1) (2 2) } }");
+  auto indexAndViews = qlv().indexAndViewsSnapshot();
+  auto& deltaTriplesManager = indexAndViews->index_.deltaTriplesManager();
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  auto U = Id::makeUndefined();
+  deltaTriplesManager.modify<void>([&](DeltaTriples& deltaTriples) {
+    // Insert a row that differs from an existing row only in column 3, and
+    // delete a row.
+    deltaTriples.insertViewRows(handle, "four",
+                                makeIdTableFromVector({{1, 1, 1, 2}}, IntId));
+    deltaTriples.deleteViewRows(handle, "four",
+                                makeIdTableFromVector({{2, 2, 2, 2}}, IntId));
+    deltaTriples.insertViewRows(handle, "two",
+                                makeIdTableFromVector({{1, 2, U, U}}, IntId));
+    deltaTriples.deleteViewRows(handle, "two",
+                                makeIdTableFromVector({{2, 2, U, U}}, IntId));
+  });
+
+  const std::string prefix =
+      "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> ";
+  // Query the `view` with the given `config` (the predicate-object list of the
+  // config node) and `SELECT` the given `variables`.
+  auto query = [this, &prefix](std::string_view view, std::string_view config,
+                               std::string_view variables) {
+    return getQueryResultAsIdTable(
+        absl::StrCat(prefix, "SELECT ", variables, " { SERVICE view:", view,
+                     " { _:config ", config, " . } }"));
+  };
+  auto table = [](const VectorTable& rows) {
+    return matchesIdTable(makeIdTableFromVector(rows, IntId));
+  };
+  EXPECT_THAT(query("four",
+                    "view:column-a ?a ; view:column-b ?b ; view:column-c ?c ; "
+                    "view:column-d ?d",
+                    "?a ?b ?c ?d"),
+              table({{1, 1, 1, 1}, {1, 1, 1, 2}}));
+  // Column 3 is not selected, with and without a fixed first column (the
+  // latter reads the block via `readPossiblyIncompleteBlock`, which doesn't
+  // read the graph column then).
+  EXPECT_THAT(
+      query("four", "view:column-a ?a ; view:column-b ?b ; view:column-c ?c",
+            "?a ?b ?c"),
+      table({{1, 1, 1}, {1, 1, 1}}));
+  EXPECT_THAT(
+      query("four", "view:column-a 1 ; view:column-b ?b ; view:column-c ?c",
+            "?b ?c"),
+      table({{1, 1}, {1, 1}}));
+  EXPECT_THAT(query("four", "view:column-a 1 ; view:column-b ?b", "?b"),
+              table({{1}, {1}}));
+  EXPECT_THAT(query("four", "view:column-a 2 ; view:column-d ?d", "?d"),
+              table({}));
+  EXPECT_THAT(query("two", "view:column-a ?a ; view:column-b ?b", "?a ?b"),
+              table({{1, 1}, {1, 2}}));
+  EXPECT_THAT(query("two", "view:column-a 1 ; view:column-b ?b", "?b"),
+              table({{1}, {2}}));
+  EXPECT_THAT(query("two", "view:column-a ?a", "?a"), table({{1}, {1}}));
 }
 
 // _____________________________________________________________________________

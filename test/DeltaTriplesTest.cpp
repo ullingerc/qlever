@@ -1389,7 +1389,7 @@ TEST_F(DeltaTriplesTest, viewRows) {
   auto pso = nonOwningPermutation(index, Permutation::PSO);
   auto maxNumBlocks = std::max(spo->metaData().blockData().size(),
                                pso->metaData().blockData().size());
-  deltaTriples.registerView("v", spo, 2, {5});
+  deltaTriples.registerView("v", spo, 6, {5});
 
   // Rows `<s> <p> <o> <g> payload1 payload2` with the IDs of `<a> <upp> <A>`.
   LocalVocab localVocabOutside;
@@ -1494,10 +1494,10 @@ TEST_F(DeltaTriplesTest, viewRows) {
 
   // Registering again with the same metadata keeps the updates, registering
   // with different metadata drops them.
-  deltaTriples.registerView("v", spo, 2, {5});
+  deltaTriples.registerView("v", spo, 6, {5});
   EXPECT_EQ(current().size(), 4);
   auto v1 = version();
-  deltaTriples.registerView("v", pso, 2, {5});
+  deltaTriples.registerView("v", pso, 6, {5});
   EXPECT_TRUE(current().empty());
   EXPECT_GT(version(), v1);
   EXPECT_TRUE(deltaTriples.views_.at("v").rowsInserted_.empty());
@@ -1525,6 +1525,24 @@ TEST_F(DeltaTriplesTest, viewRows) {
   auto v3 = version();
   deltaTriples.unregisterView("v");
   EXPECT_EQ(version(), v3);
+
+  // A view with two columns is padded to four columns, which must be UNDEF.
+  deltaTriples.registerView("padded", spo, 2, {});
+  EXPECT_EQ(deltaTriples.viewLocatedRows("padded").numPayloadColumns(), 0);
+  EXPECT_TRUE(deltaTriples.viewLocatedRows("padded").mergesFullRows());
+  EXPECT_ANY_THROW(
+      deltaTriples.insertViewRows(handle, "padded", makeRows({{s, p}})));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      deltaTriples.insertViewRows(handle, "padded", makeRows({{s, p, U, g}})),
+      ::testing::HasSubstr("padding column"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      deltaTriples.deleteViewRows(handle, "padded", makeRows({{s, p, o, U}})),
+      ::testing::HasSubstr("padding column"));
+  // UNDEF is not allowed in the real columns.
+  EXPECT_ANY_THROW(
+      deltaTriples.insertViewRows(handle, "padded", makeRows({{s, U, U, U}})));
+  deltaTriples.insertViewRows(handle, "padded", makeRows({{s, p, U, U}}));
+  EXPECT_EQ(deltaTriples.views_.at("padded").rowsInserted_.size(), 1);
 }
 
 namespace {
@@ -1582,7 +1600,7 @@ TEST_F(DeltaTriplesTest, viewRowsPersistence) {
     auto deltaTriples = makeDeltaTriples();
     viewFile = deltaTriples->viewFilename("v");
     EXPECT_EQ(viewFile, absl::StrCat(tmpFile.string(), ".view.v"));
-    deltaTriples->registerView("v", spo, 2, {5});
+    deltaTriples->registerView("v", spo, 6, {5});
     deltaTriples->insertViewRows(handle, "v", makeViewRows({r1, r2}));
     deltaTriples->deleteViewRows(handle, "v", makeViewRows({r3}));
     // Nothing is written before `writeToDisk`.
@@ -1598,7 +1616,7 @@ TEST_F(DeltaTriplesTest, viewRowsPersistence) {
   {
     // The rows are restored when the view is registered.
     auto deltaTriples = makeDeltaTriples();
-    deltaTriples->registerView("v", spo, 2, {5});
+    deltaTriples->registerView("v", spo, 6, {5});
     const auto& view = deltaTriples->views_.at("v");
     EXPECT_EQ(view.rowsInserted_.size(), 2);
     EXPECT_EQ(view.rowsDeleted_.size(), 1);
@@ -1614,7 +1632,7 @@ TEST_F(DeltaTriplesTest, viewRowsPersistence) {
     EXPECT_TRUE(view.rowsInserted_.contains(std::vector<Id>{
         s, p, o, g, I(1), Id::makeFromLocalVocabIndex(restoredWord.value())}));
     // Registering again does not read the file again.
-    deltaTriples->registerView("v", spo, 2, {5});
+    deltaTriples->registerView("v", spo, 6, {5});
     EXPECT_EQ(numLocatedRows(*deltaTriples), 3);
 
     // When the view has no rows anymore (here: after `clear`), its file is
@@ -1632,7 +1650,7 @@ TEST_F(DeltaTriplesTest, viewRowsPersistence) {
     EXPECT_FALSE(ql::filesystem::exists(viewFile));
 
     // Write the rows again for the staleness checks below.
-    deltaTriples->registerView("v", spo, 2, {5});
+    deltaTriples->registerView("v", spo, 6, {5});
     deltaTriples->insertViewRows(handle, "v", makeViewRows({r1}));
     deltaTriples->writeToDisk();
     EXPECT_TRUE(ql::filesystem::exists(viewFile));
@@ -1640,21 +1658,21 @@ TEST_F(DeltaTriplesTest, viewRowsPersistence) {
 
   // A file that belongs to a different version of the view (here: different
   // block metadata, or a different number of columns) is discarded.
-  for (auto [permutation, numPayloadColumns] :
-       {std::pair{pso, size_t{2}}, std::pair{spo, size_t{1}}}) {
+  for (auto [permutation, numColumns] :
+       {std::pair{pso, size_t{6}}, std::pair{spo, size_t{5}}}) {
     {
       auto deltaTriples = makeDeltaTriples();
-      deltaTriples->registerView("v", spo, 2, {5});
+      deltaTriples->registerView("v", spo, 6, {5});
       EXPECT_EQ(numLocatedRows(*deltaTriples), 1);
       deltaTriples->writeToDisk();
     }
     auto deltaTriples = makeDeltaTriples();
-    deltaTriples->registerView("v", permutation, numPayloadColumns, {});
+    deltaTriples->registerView("v", permutation, numColumns, {});
     EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
     EXPECT_FALSE(ql::filesystem::exists(viewFile));
     // Restore the file for the next iteration.
     auto other = makeDeltaTriples();
-    other->registerView("v", spo, 2, {5});
+    other->registerView("v", spo, 6, {5});
     other->insertViewRows(handle, "v", makeViewRows({r1}));
     other->writeToDisk();
   }
@@ -1669,7 +1687,7 @@ TEST_F(DeltaTriplesTest, vacuumViewRows) {
   // A fake view with the four columns of the SPO permutation (no payload
   // columns), so that the rows of the view are the triples of the index.
   deltaTriples.registerView("v", nonOwningPermutation(index, Permutation::SPO),
-                            0, {});
+                            4, {});
   LocalVocab localVocab;
   auto toRow = [&](const std::string& turtle) {
     auto ids = makeIdTriples(index, localVocab, {turtle})[0].ids();
