@@ -1379,7 +1379,7 @@ TEST_F(DeltaTriplesTest, viewRows) {
   // may be UNDEF.
   auto metadata =
       index.getPermutation(Permutation::SPO).metaData().blockDataShared();
-  deltaTriples.registerView("v", metadata, 2, {5});
+  deltaTriples.registerView("v", metadata, 6, {5});
 
   // Rows `<s> <p> <o> <g> payload1 payload2` with the IDs of `<a> <upp> <A>`.
   LocalVocab localVocabOutside;
@@ -1484,12 +1484,12 @@ TEST_F(DeltaTriplesTest, viewRows) {
 
   // Registering again with the same metadata keeps the updates, registering
   // with different metadata drops them.
-  deltaTriples.registerView("v", metadata, 2, {5});
+  deltaTriples.registerView("v", metadata, 6, {5});
   EXPECT_EQ(current().size(), 4);
   auto v1 = version();
   auto otherMetadata =
       std::make_shared<const std::vector<CompressedBlockMetadata>>(*metadata);
-  deltaTriples.registerView("v", otherMetadata, 2, {5});
+  deltaTriples.registerView("v", otherMetadata, 6, {5});
   EXPECT_TRUE(current().empty());
   EXPECT_GT(version(), v1);
   EXPECT_TRUE(deltaTriples.views_.at("v").rowsInserted_.empty());
@@ -1517,4 +1517,22 @@ TEST_F(DeltaTriplesTest, viewRows) {
   auto v3 = version();
   deltaTriples.unregisterView("v");
   EXPECT_EQ(version(), v3);
+
+  // A view with two columns is padded to four columns, which must be UNDEF.
+  deltaTriples.registerView("padded", metadata, 2, {});
+  EXPECT_EQ(deltaTriples.viewLocatedRows("padded").numPayloadColumns(), 0);
+  EXPECT_TRUE(deltaTriples.viewLocatedRows("padded").mergesFullRows());
+  EXPECT_ANY_THROW(
+      deltaTriples.insertViewRows(handle, "padded", makeRows({{s, p}})));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      deltaTriples.insertViewRows(handle, "padded", makeRows({{s, p, U, g}})),
+      ::testing::HasSubstr("padding column"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      deltaTriples.deleteViewRows(handle, "padded", makeRows({{s, p, o, U}})),
+      ::testing::HasSubstr("padding column"));
+  // UNDEF is not allowed in the real columns.
+  EXPECT_ANY_THROW(
+      deltaTriples.insertViewRows(handle, "padded", makeRows({{s, U, U, U}})));
+  deltaTriples.insertViewRows(handle, "padded", makeRows({{s, p, U, U}}));
+  EXPECT_EQ(deltaTriples.views_.at("padded").rowsInserted_.size(), 1);
 }

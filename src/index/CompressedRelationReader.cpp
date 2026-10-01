@@ -981,7 +981,7 @@ CompressedRelationReader::ColumnIndicesRef
 CompressedRelationReader::columnsToRead(
     const ScanImplConfig& scanConfig, const CompressedBlockMetadata& metadata) {
   const auto& locatedTriples = scanConfig.locatedTriples_;
-  if (locatedTriples.numPayloadColumns() > 0 &&
+  if (locatedTriples.mergesFullRows() &&
       locatedTriples.containsTriples(metadata.blockIndex_)) {
     AD_CORRECTNESS_CHECK(scanConfig.allColumns_.size() ==
                          4 + locatedTriples.numPayloadColumns());
@@ -1002,7 +1002,7 @@ CompressedRelationReader::decompressAndPostprocessBlock(
   bool hasUpdates = false;
   const auto& locatedTriples = scanConfig.locatedTriples_;
   if (locatedTriples.containsTriples(metadata.blockIndex_)) {
-    if (locatedTriples.numPayloadColumns() > 0) {
+    if (locatedTriples.mergesFullRows()) {
       // The block was read with all columns (see `columnsToRead`), merge the
       // full rows and then project to the requested columns.
       AD_CORRECTNESS_CHECK(decompressedBlock.numColumns() ==
@@ -1289,7 +1289,7 @@ auto CompressedRelationReader::getScanConfig(
   // Precompute all columns of the permutation for the blocks that have to be
   // read completely, see `columnsToRead`.
   ColumnIndices allColumns;
-  if (locatedTriples.numPayloadColumns() > 0) {
+  if (locatedTriples.mergesFullRows()) {
     allColumns.resize(4 + locatedTriples.numPayloadColumns());
     std::iota(allColumns.begin(), allColumns.end(), ColumnIndex{0});
   }

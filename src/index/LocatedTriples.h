@@ -159,6 +159,11 @@ class LocatedTriplesPerBlock {
   // after the graph column). The `payload_` of each added `LocatedTriple` must
   // have exactly this size. Nonzero only for materialized views.
   size_t numPayloadColumns_ = 0;
+  // True iff `setNumPayloadColumns` was called (only for materialized views).
+  // Then the located triples are full rows that have to be merged with
+  // `mergeFullRows`, even if `numPayloadColumns_ == 0` (a view with exactly
+  // four columns, whose column 3 is not a graph, but a regular column).
+  bool mergesFullRows_ = false;
 
   FRIEND_TEST(LocatedTriplesTest, numTriplesInBlock);
 
@@ -228,13 +233,17 @@ class LocatedTriplesPerBlock {
   IdTable mergeFullRows(size_t blockIndex, const IdTable& block) const;
 
   // Get and set the number of payload columns, see `numPayloadColumns_`.
+  // Setting it also enables `mergesFullRows()`.
   size_t numPayloadColumns() const { return numPayloadColumns_; }
   // NOTE: May only be called while there are no located triples, because the
   // `payload_` of all located triples must have `numPayloadColumns` entries.
   void setNumPayloadColumns(size_t numPayloadColumns) {
     AD_CONTRACT_CHECK(map_.empty());
     numPayloadColumns_ = numPayloadColumns;
+    mergesFullRows_ = true;
   }
+  // See `mergesFullRows_`.
+  bool mergesFullRows() const { return mergesFullRows_; }
 
   // Return true iff there are located triples in the block with the given
   // index.
@@ -294,6 +303,12 @@ class LocatedTriplesPerBlock {
     setOriginalMetadata(
         std::make_shared<const std::vector<CompressedBlockMetadata>>(
             std::move(metadata)));
+  }
+
+  // Return the original metadata set by `setOriginalMetadata`.
+  const std::vector<CompressedBlockMetadata>& getOriginalMetadata() const {
+    AD_CONTRACT_CHECK(originalMetadata_.has_value());
+    return *originalMetadata_.value();
   }
 
   // Return true iff `metadata` is the original metadata (the same object, not

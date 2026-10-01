@@ -185,11 +185,14 @@ class DeltaTriples {
   TriplesSets<true> triplesSetsInternal_;
 
   // The state of a materialized view that is registered for updates, see
-  // `registerView`. The located rows themselves are stored in
-  // `LocatedTriplesState::viewLocatedTriples_`.
+  // `registerView`. The located rows themselves (and the original block
+  // metadata of the view) are stored in
+  // `LocatedTriplesState::viewLocatedTriples_`, which always has the same keys
+  // as `views_` (see `viewLocatedRows`).
   struct ViewState {
-    // The original block metadata of the view's permutation.
-    std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata_;
+    // The number of columns of the view, without the padding columns (see
+    // `registerView`).
+    size_t numColumns_;
     // The columns that may contain UNDEF values.
     ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns_;
     // The full rows (all columns) inserted into and deleted from the view, with
@@ -199,6 +202,9 @@ class DeltaTriples {
     RowSet rowsDeleted_;
   };
   ad_utility::HashMap<std::string, ViewState> views_;
+
+  // Return the located rows of the registered view with the given `name`.
+  LocatedTriplesPerBlock& viewLocatedRows(const std::string& name);
 
  public:
   // Construct for given index.
@@ -293,17 +299,20 @@ class DeltaTriples {
 
   // Register the materialized view with the given `name` for updates. The
   // view's located rows are tracked using the original block `metadata` of its
-  // permutation. Inserted and deleted rows must have `4 + numPayloadColumns`
-  // columns and may contain UNDEF only in the `possiblyUndefinedColumns`. If
-  // the view is already registered with the same `metadata`, nothing happens;
-  // otherwise the old registration (including its updates) is replaced.
+  // permutation. The view has `numColumns` columns; views with less than four
+  // columns are padded with UNDEF columns to four columns (like on disk).
+  // Inserted and deleted rows must have `max(numColumns, 4)` columns, contain
+  // only UNDEF in the padding columns, and may contain UNDEF only in the
+  // `possiblyUndefinedColumns` otherwise. If the view is already registered
+  // with the same `metadata`, nothing happens; otherwise the old registration
+  // (including its updates) is replaced.
   //
   // NOTE: The rows of views are not persisted by `writeToDisk` and not counted
   // by `getCounts`.
   void registerView(
       const std::string& name,
       std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata,
-      size_t numPayloadColumns,
+      size_t numColumns,
       ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns);
 
   // Unregister the materialized view with the given `name` and drop all its

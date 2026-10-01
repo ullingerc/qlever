@@ -664,8 +664,7 @@ std::array<std::vector<IdTriple<0>>, 2> LocatedTriplesPerBlock::computeDiff(
   // This is fine because `computeDiff` is only used for the main index (to
   // carry over the updates when rebuilding the index, which doesn't carry over
   // the materialized views).
-  AD_CONTRACT_CHECK(numPayloadColumns_ == 0 &&
-                    oldBlocks.numPayloadColumns_ == 0);
+  AD_CONTRACT_CHECK(!mergesFullRows_ && !oldBlocks.mergesFullRows_);
   std::array<std::vector<IdTriple<0>>, 2> result;
   auto addTriple = [&result](const LocatedTriple& lt) {
     result.at(lt.insertOrDelete_ ? 0 : 1).push_back(lt.triple_);

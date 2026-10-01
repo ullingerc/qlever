@@ -1218,6 +1218,15 @@ TEST_F(LocatedTriplesTest, addChecksPayloadSize) {
   // `computeDiff` is only supported without payload columns.
   EXPECT_ANY_THROW(ltpb.computeDiff(mainIndex));
   EXPECT_ANY_THROW(mainIndex.computeDiff(ltpb));
+
+  // Setting the number of payload columns (even to zero, for views with four
+  // columns) enables the merging of full rows.
+  EXPECT_FALSE(mainIndex.mergesFullRows());
+  EXPECT_TRUE(ltpb.mergesFullRows());
+  LocatedTriplesPerBlock fourColumnView;
+  fourColumnView.setNumPayloadColumns(0);
+  EXPECT_TRUE(fourColumnView.mergesFullRows());
+  EXPECT_ANY_THROW(fourColumnView.computeDiff(mainIndex));
 }
 
 // _____________________________________________________________________________

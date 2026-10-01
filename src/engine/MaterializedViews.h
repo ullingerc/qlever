@@ -374,16 +374,28 @@ class MaterializedViewsManager {
   // tests), no views are registered.
   Index* index_ = nullptr;
 
-  // Call `function(DeltaTriples*)` while holding the lock of the delta triples
-  // of `index_`, and update their snapshot afterwards. The argument is
-  // `nullptr` if `index_` is not set.
+  // Make the registration of the view `name` in the `DeltaTriples` of `index_`
+  // match the view that is loaded under this `name` (registered iff it is
+  // loaded and updatable). Has to be called after `changedView` was loaded
+  // into or removed from `loadedViews_` (and with `loadedViews_` released). It
+  // does nothing if `index_` is not set or `changedView` is not updatable.
   //
-  // NOTE: The lock of the delta triples has to be acquired before
-  // `loadedViews_`, because an update holds it while planning its query, which
-  // may load views via `getView`. For the same reason, `getView` must not use
-  // this function (it can be called while the lock is already held).
-  template <typename Function>
-  void withDeltaTriples(const Function& function) const;
+  // The view is loaded/unloaded (disk reads, query analysis) without the lock
+  // of the delta triples, so that updates are not blocked. Only this function
+  // takes that lock (via `modify`), and while holding it, looks up the view
+  // that is loaded *now*. Since every change of `loadedViews_` is followed by
+  // such a call, the last one to run sees the final state, so a stale
+  // registration can never overwrite a fresh one, and a view that was unloaded
+  // in between is never registered (and a view that was loaded in between is
+  // never unregistered).
+  //
+  // NOTE: The lock order is `onDiskFilesRetired_` -> delta triples ->
+  // `loadedViews_`, because an update holds the lock of the delta triples while
+  // planning its query, which may load views via `getView`. Therefore this
+  // function must never be called while holding `loadedViews_`, and `getView`
+  // must not call it (it can be called while the lock is already held).
+  void syncViewRegistration(const std::string& name,
+                            const MaterializedView& changedView) const;
 
   // Load the given view into `state` if it isn't loaded yet and return it.
   // Requires `state` to be the locked contents of `loadedViews_` (this is a
@@ -469,7 +481,7 @@ class MaterializedViewsManager {
   //
   // NOTE: Unlike `loadView`, this does not register the view for updates,
   // because it can be called by an update that holds the lock of the delta
-  // triples (see `withDeltaTriples`). Updatable views therefore have to be
+  // triples (see `syncViewRegistration`). Updatable views therefore have to be
   // loaded explicitly (preloaded, written or via `loadView`).
   std::shared_ptr<const MaterializedView> getView(
       const std::string& name, const QueryExecutionContext* qec) const;

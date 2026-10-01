@@ -40,6 +40,7 @@
 #include "util/FilesystemHelpers.h"
 #include "util/InputRangeUtils.h"
 #include "util/MemorySize/MemorySize.h"
+#include "util/OnDestructionDontThrowDuringStackUnwinding.h"
 #include "util/ProgressBar.h"
 #include "util/Views.h"
 
@@ -576,67 +577,88 @@ MaterializedViewsManager::loadViewIntoLockedState(
 }
 
 // _____________________________________________________________________________
-template <typename Function>
-void MaterializedViewsManager::withDeltaTriples(
-    const Function& function) const {
-  if (index_ == nullptr) {
-    function(nullptr);
+void MaterializedViewsManager::syncViewRegistration(
+    const std::string& name, const MaterializedView& changedView) const {
+  // Loading or unloading a view that is not updatable never changes whether
+  // (and how) a view of this name has to be registered, so the expensive
+  // `modify` (which copies the snapshot) is not needed.
+  if (index_ == nullptr || !changedView.isUpdatable()) {
     return;
   }
   // The updates of views are not persisted, and registering or unregistering
   // a view does not change the metadata of any other permutation.
   index_->deltaTriplesManager().modify<void>(
-      [&function](DeltaTriples& deltaTriples) { function(&deltaTriples); },
+      [this, &name](DeltaTriples& deltaTriples) {
+        // Look up the view that is loaded under this name *now*, while
+        // holding the lock of the delta triples (see the NOTE in the header
+        // for why this order of the locks is the only allowed one).
+        auto view = loadedViews_.withReadLock(
+            [&name](const LoadedViews& state)
+                -> std::shared_ptr<const MaterializedView> {
+              auto it = state.views_.find(name);
+              return it == state.views_.end() ? nullptr : it->second;
+            });
+        if (view == nullptr || !view->isUpdatable()) {
+          deltaTriples.unregisterView(name);
+          return;
+        }
+        size_t numColumns = view->variableToColumnMap().size();
+        ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns;
+        for (size_t col = 0; col < numColumns; ++col) {
+          if (view->permutation()->getColumnUndefStatus(col) ==
+              ColumnIndexAndTypeInfo::PossiblyUndefined) {
+            possiblyUndefinedColumns.insert(col);
+          }
+        }
+        // This is a no-op if the same view object is already registered.
+        deltaTriples.registerView(
+            name, view->permutation()->metaData().blockDataShared(), numColumns,
+            std::move(possiblyUndefinedColumns));
+      },
       false, false);
 }
 
 // _____________________________________________________________________________
 void MaterializedViewsManager::loadView(
     const std::string& name, const QueryExecutionContext* qec) const {
-  withDeltaTriples([this, &name, qec](DeltaTriples* deltaTriples) {
-    auto lock = loadedViews_.wlock();
-    auto view = loadViewIntoLockedState(name, *lock, qec);
-    if (deltaTriples == nullptr || !view->isUpdatable()) {
+  auto view = loadedViews_.withWriteLock([this, &name, qec](auto& state) {
+    return loadViewIntoLockedState(name, state, qec);
+  });
+  // Avoid the `modify` if the view is already registered (for example, if it
+  // was already loaded explicitly before).
+  if (index_ != nullptr) {
+    auto state =
+        index_->deltaTriplesManager().getCurrentLocatedTriplesSharedState();
+    auto registered = state->getLocatedTriplesForView(name);
+    if (registered.has_value() &&
+        registered->hasOriginalMetadata(
+            view->permutation()->metaData().blockData())) {
       return;
     }
-    // Views with less than four columns are padded with UNDEF columns.
-    size_t numViewColumns = view->variableToColumnMap().size();
-    size_t numColumns = std::max(numViewColumns, size_t{4});
-    ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns;
-    for (size_t col = 0; col < numColumns; ++col) {
-      if (col >= numViewColumns ||
-          view->permutation()->getColumnUndefStatus(col) ==
-              ColumnIndexAndTypeInfo::PossiblyUndefined) {
-        possiblyUndefinedColumns.insert(col);
-      }
-    }
-    deltaTriples->registerView(
-        name, view->permutation()->metaData().blockDataShared(), numColumns - 4,
-        std::move(possiblyUndefinedColumns));
-  });
+  }
+  syncViewRegistration(name, *view);
 }
 
 // _____________________________________________________________________________
 bool MaterializedViewsManager::unloadViewIfLoaded(
     const std::string& name) const {
-  bool wasLoaded = false;
-  withDeltaTriples([this, &name, &wasLoaded](DeltaTriples* deltaTriples) {
-    auto lock = loadedViews_.wlock();
-    auto view = ad_utility::findOptional(lock->views_, name);
-    if (!view.has_value()) {
-      return;
-    }
-    lock->queryPatternCache_.removeView(view.value());
-    lock->views_.erase(name);
-    if (deltaTriples != nullptr) {
-      deltaTriples->unregisterView(name);
-    }
-    wasLoaded = true;
-  });
-  if (wasLoaded) {
-    AD_LOG_INFO << "Materialized view \"" << name << "\" unloaded" << std::endl;
+  auto view = loadedViews_.withWriteLock(
+      [&name](LoadedViews& state) -> std::shared_ptr<MaterializedView> {
+        auto it = state.views_.find(name);
+        if (it == state.views_.end()) {
+          return nullptr;
+        }
+        auto result = it->second;
+        state.queryPatternCache_.removeView(result);
+        state.views_.erase(it);
+        return result;
+      });
+  if (view == nullptr) {
+    return false;
   }
-  return wasLoaded;
+  syncViewRegistration(name, *view);
+  AD_LOG_INFO << "Materialized view \"" << name << "\" unloaded" << std::endl;
+  return true;
 }
 
 // _____________________________________________________________________________
@@ -651,38 +673,46 @@ void MaterializedViewsManager::deleteView(const std::string& name) const {
   auto notRetiredLock = lockIfNotRetired(
       absl::StrCat("delete the materialized view '", name, "'"));
 
+  // Unregister the unloaded view (if any) after `loadedViews_` is released,
+  // also if deleting a file below throws. NOTE: This has to be declared before
+  // the lock, so that it runs after the lock is released.
+  std::shared_ptr<MaterializedView> unloadedView;
+  auto syncRegistration =
+      ad_utility::makeOnDestructionDontThrowDuringStackUnwinding(
+          [this, &name, &unloadedView]() {
+            if (unloadedView != nullptr) {
+              syncViewRegistration(name, *unloadedView);
+            }
+          });
+
   // Hold the lock for the whole check-unload-delete sequence below, so that a
   // concurrent `loadView`/`getView` call for the same view can not reload it
   // in between, and so that of two concurrent `deleteView` calls for the same
   // view exactly one succeeds and the other throws.
-  withDeltaTriples([this, &name, &filenameBase](DeltaTriples* deltaTriples) {
-    auto lock = loadedViews_.wlock();
-    if (!ql::filesystem::exists(absl::StrCat(filenameBase, VIEW_INFO_SUFFIX))) {
-      throw std::runtime_error(
-          absl::StrCat("The materialized view '", name, "' does not exist."));
-    }
-    if (auto it = lock->views_.find(name); it != lock->views_.end()) {
-      lock->queryPatternCache_.removeView(it->second);
-      lock->views_.erase(it);
-    }
-    if (deltaTriples != nullptr) {
-      deltaTriples->unregisterView(name);
-    }
+  auto lock = loadedViews_.wlock();
+  if (!ql::filesystem::exists(absl::StrCat(filenameBase, VIEW_INFO_SUFFIX))) {
+    throw std::runtime_error(
+        absl::StrCat("The materialized view '", name, "' does not exist."));
+  }
+  if (auto it = lock->views_.find(name); it != lock->views_.end()) {
+    lock->queryPatternCache_.removeView(it->second);
+    unloadedView = it->second;
+    lock->views_.erase(it);
+  }
 
-    // Delete all files belonging to the view from disk. NOTE: This is safe
-    // even if a running query still scans the view: the files are unlinked,
-    // but live on until the last open file handle is closed, and the query's
-    // shared pointer keeps the `MaterializedView` (and its open file) alive.
-    for (std::string_view suffix : VIEW_ALL_SUFFIXES) {
-      ql::error_code ec;
-      ql::filesystem::remove(absl::StrCat(filenameBase, suffix), ec);
-      if (ec) {
-        throw std::runtime_error(absl::StrCat(
-            "Failed to delete file '", filenameBase, suffix,
-            "' while deleting materialized view '", name, "': ", ec.message()));
-      }
+  // Delete all files belonging to the view from disk. NOTE: This is safe even
+  // if a running query still scans the view: the files are unlinked, but live
+  // on until the last open file handle is closed, and the query's shared
+  // pointer keeps the `MaterializedView` (and its open file) alive.
+  for (std::string_view suffix : VIEW_ALL_SUFFIXES) {
+    ql::error_code ec;
+    ql::filesystem::remove(absl::StrCat(filenameBase, suffix), ec);
+    if (ec) {
+      throw std::runtime_error(absl::StrCat(
+          "Failed to delete file '", filenameBase, suffix,
+          "' while deleting materialized view '", name, "': ", ec.message()));
     }
-  });
+  }
 
   AD_LOG_INFO << "Materialized view \"" << name << "\" deleted" << std::endl;
 }
