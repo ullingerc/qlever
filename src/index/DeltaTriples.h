@@ -211,6 +211,20 @@ class DeltaTriples {
   };
   ad_utility::HashMap<std::string, ViewState> views_;
 
+  // The rows of materialized views that are currently NOT registered (they
+  // were read by `readFromDisk`, or the view was unregistered), keyed by the
+  // name of the view. They are written by `writeToDisk` (so that they are not
+  // lost), applied by `registerView` (if the `identity_` matches), and dropped
+  // by `dropViewDeltas` and `clear`. The `Id`s are already managed by the
+  // `localVocab_`. The key sets of `pendingViews_` and `views_` are disjoint.
+  struct PendingViewRows {
+    std::vector<Id> identity_;
+    // The full rows, flattened (row after row).
+    std::vector<Id> rowsDeleted_;
+    std::vector<Id> rowsInserted_;
+  };
+  ad_utility::HashMap<std::string, PendingViewRows> pendingViews_;
+
   // Return the located rows of the registered view with the given `name`.
   LocatedTriplesPerBlock& viewLocatedRows(const std::string& name);
 
@@ -314,23 +328,31 @@ class DeltaTriples {
   // Inserted and deleted rows must have `max(numColumns, 4)` columns, contain
   // only UNDEF in the padding columns, and may contain UNDEF only in the
   // `possiblyUndefinedColumns` otherwise. If the view is already registered
-  // with the same metadata, nothing happens; otherwise the old registration
-  // (including its updates) is replaced.
+  // with the same metadata, nothing happens; otherwise the old registration is
+  // replaced (its updates are kept iff the view's identity didn't change, like
+  // for pending rows, see below).
   //
-  // If the updates are persisted (see `setPersists`), `writeToDisk` writes the
-  // rows of each registered view to the file `viewFilename(name)`, and a fresh
-  // registration reads them back from there (unless the view has changed in
-  // the meantime, then the file is deleted). The rows of views are not counted
-  // by `getCounts`.
+  // The pending rows of the view (see `pendingViews_`, e.g. persisted rows read
+  // by `readFromDisk`) are applied if they belong to the same version of the
+  // view (see `viewIdentity` in `DeltaTriples.cpp`), and dropped (with a
+  // warning) otherwise. If applying them throws, the view stays unregistered
+  // and the pending rows are kept. The rows of views are not counted by
+  // `getCounts`.
   void registerView(const std::string& name,
                     std::shared_ptr<const Permutation> permutation,
                     size_t numColumns,
                     ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns);
 
-  // Unregister the materialized view with the given `name` and drop all its
-  // updates (also the persisted ones). Does nothing if the view is not
-  // registered.
+  // Unregister the materialized view with the given `name`. Its updates are
+  // kept as pending rows (see `pendingViews_`), so they are still persisted and
+  // restored when the view is registered again. Does nothing if the view is
+  // not registered.
   void unregisterView(const std::string& name);
+
+  // Drop all updates of the materialized view with the given `name`, both of
+  // the registered view (which stays registered) and the pending ones. Used
+  // when a view is deleted or rewritten.
+  void dropViewDeltas(const std::string& name);
 
   // Insert/delete full `rows` into/from the registered materialized view with
   // the given `name`. See `insertTriples` for the meaning of `consolidate`.
@@ -354,15 +376,22 @@ class DeltaTriples {
   // false otherwise.
   bool persists() const;
 
-  // Write the delta triples to disk to persist them between restarts.
+  // Write the delta triples to disk to persist them between restarts. All
+  // updates are written to a single file (atomically via a temporary file and
+  // a rename): the ranges of `Id`s are the deleted and the inserted triples,
+  // followed by four ranges for each materialized view with updates (registered
+  // or pending): the name of the view (one `Int` `Id` per byte), its identity
+  // (see `viewIdentity`), and its deleted and inserted rows (flattened). A file
+  // without views therefore has the same format as before views could be
+  // updated.
   void writeToDisk() const;
 
-  // Read the delta triples from disk to restore them after a restart.
+  // Read the delta triples from disk to restore them after a restart. The rows
+  // of the materialized views become pending (see `pendingViews_`) until the
+  // view is registered. NOTE: The local vocab entries and blank nodes of all
+  // triples and rows of the file are rewritten together (with one mapping of
+  // the blank nodes), so that a blank node shared between them stays the same.
   void readFromDisk();
-
-  // The file to which the rows of the materialized view with the given `name`
-  // are persisted. Requires `persists()`.
-  std::string viewFilename(const std::string& name) const;
 
   // Return a deep copy of the `LocatedTriples` and the corresponding
   // `LocalVocab` which form an unchanging snapshot of the current state of
@@ -460,10 +489,6 @@ class DeltaTriples {
   void modifyTriplesImpl(CancellationHandle cancellationHandle, Triples triples,
                          ad_utility::timer::TimeTracer& tracer =
                              ad_utility::timer::DEFAULT_TIME_TRACER);
-
-  // Read the persisted rows of the freshly registered materialized view with
-  // the given `name`, see `registerView`.
-  void readViewFromDisk(const std::string& name);
 
   // Like `modifyTriplesImpl`, but for the full `rows` of the registered
   // materialized view with the given `name`.

@@ -39,6 +39,7 @@
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionPimpl.h"
 #include "global/Constants.h"
+#include "global/FileSuffixConstants.h"
 #include "index/vocabulary/EncodedIriManager.h"
 #include "libqlever/Qlever.h"
 #include "parser/MaterializedViewQuery.h"
@@ -54,6 +55,7 @@
 #include "util/CompilerWarnings.h"
 #include "util/GTestHelpers.h"
 #include "util/IdTableHelpers.h"
+#include "util/Serializer/TripleSerializer.h"
 
 namespace {
 
@@ -2520,11 +2522,167 @@ TEST_F(MaterializedViewsTest, PersistAndVacuumViewRows) {
   EXPECT_EQ(stats["views"]["upd"]["totalRemoved"], 0);
   EXPECT_EQ(stats["views"]["upd"]["totalKept"], 3);
 
-  // Unloading the view drops its updates, also the persisted ones.
+  // Unloading the view keeps its updates, also after a restart.
+  EXPECT_TRUE(qlv().unloadMaterializedView("upd"));
+  qlv().loadMaterializedView("upd");
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedAfter));
   EXPECT_TRUE(qlv().unloadMaterializedView("upd"));
   restartEngine();
   qlv().loadMaterializedView("upd");
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedAfter));
+
+  // Rewriting the view drops its updates (also the persisted ones), although
+  // the new view has the same contents (and thus the same identity). NOTE: The
+  // query has to be different from the original query, otherwise it would be
+  // answered from the (updated) view itself.
+  auto writeView = [this]() {
+    qlv().writeMaterializedView(
+        "upd",
+        "SELECT * { VALUES (?a ?b ?c ?d ?e ?f) { (2 1 1 1 1 UNDEF) "
+        "(1 2 1 1 1 2) (1 1 1 1 1 1) } }");
+  };
+  writeView();
   EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+  restartEngine();
+  qlv().loadMaterializedView("upd");
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+
+  // Insert the updates again, and check that rewriting and deleting a view that
+  // is not loaded (so its updates are pending) also drops the updates.
+  auto insertRows = [this, &handle]() {
+    qlv().indexAndViewsSnapshot()->index_.deltaTriplesManager().modify<void>(
+        [&handle](DeltaTriples& deltaTriples) {
+          deltaTriples.insertViewRows(
+              handle, "upd",
+              makeIdTableFromVector({{3, 1, 1, 1, 7, 8}}, IntId));
+        });
+  };
+  // The number of ranges in the file with the persisted updates (two for the
+  // main triples, and four for each view with updates).
+  auto numPersistedRanges = [this]() {
+    return std::get<1>(ad_utility::deserializeIds(
+                           absl::StrCat(testIndexBase_, UPDATE_TRIPLES_SUFFIX),
+                           qlv()
+                               .indexAndViewsSnapshot()
+                               ->index_.getImpl()
+                               .getLocalVocabContext()))
+        .size();
+  };
+  auto expectedInserted = makeIdTableFromVector({{1, 1, 1, 1, 1, 1},
+                                                 {1, 2, 1, 1, 1, 2},
+                                                 {2, 1, 1, 1, 1, U},
+                                                 {3, 1, 1, 1, 7, 8}},
+                                                IntId);
+  insertRows();
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedInserted));
+  restartEngine();
+  EXPECT_FALSE(qlv().isMaterializedViewLoaded("upd"));
+  writeView();
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+  EXPECT_EQ(numPersistedRanges(), 2);
+
+  insertRows();
+  EXPECT_EQ(numPersistedRanges(), 6);
+  restartEngine();
+  qlv().deleteMaterializedView("upd");
+  EXPECT_EQ(numPersistedRanges(), 2);
+  writeView();
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+  restartEngine();
+  qlv().loadMaterializedView("upd");
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, PersistViewRowsWithBlankNodes) {
+  // A blank node that is shared between a main triple and the (inserted and
+  // deleted) rows of a view is the same after a restart.
+  qlv().writeMaterializedView(
+      "bn", "SELECT * { VALUES (?a ?b ?c ?d ?e) { (1 1 1 1 1) } }");
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  auto I = ad_utility::testing::IntId;
+  auto modify = [this](const std::function<void(DeltaTriples&)>& function) {
+    qlv().indexAndViewsSnapshot()->index_.deltaTriplesManager().modify<void>(
+        function);
+  };
+  // Insert a main triple `<newBlankNode> <predicate> 1 1` (the graph is an
+  // arbitrary `Id`).
+  auto insertMainTriple = [&](int64_t predicate) {
+    modify([&](DeltaTriples& deltaTriples) {
+      // NOTE: This local vocab must not outlive the engine (whose blank node
+      // manager it uses).
+      LocalVocab localVocabOutside;
+      auto blankNode =
+          Id::makeFromBlankNodeIndex(localVocabOutside.getBlankNodeIndex(
+              qlv().indexAndViewsSnapshot()->index_.getBlankNodeManager()));
+      deltaTriples.insertTriples(
+          handle,
+          {IdTriple<0>{std::array{blankNode, I(predicate), I(1), I(1)}}});
+    });
+  };
+  // The subject of the main triple with the given `predicate`.
+  auto mainBlankNode = [this](int64_t predicate) {
+    auto result = getQueryResultAsIdTable(
+        absl::StrCat("SELECT ?s { ?s ?p ?o FILTER(?p = ", predicate, ") }"));
+    EXPECT_EQ(result.numRows(), 1) << result;
+    return result.numRows() == 1 ? result(0, 0) : Id::makeUndefined();
+  };
+  // Check that the inserted row `b 1 1 1 1` and the deleted row `b 2 2 2 2` of
+  // the view are located (the latter is not visible in a scan).
+  auto expectViewRows = [this, &I](Id b) {
+    ASSERT_EQ(b.getDatatype(), Datatype::BlankNodeIndex);
+    auto state = qlv()
+                     .indexAndViewsSnapshot()
+                     ->index_.deltaTriplesManager()
+                     .getCurrentLocatedTriplesSharedState();
+    auto rows = state->getLocatedTriplesForView("bn");
+    ASSERT_TRUE(rows.has_value());
+    EXPECT_TRUE(rows->isLocatedTriple(
+        IdTriple<0>{std::array{b, I(1), I(1), I(1)}}, true, {I(1)}));
+    EXPECT_TRUE(rows->isLocatedTriple(
+        IdTriple<0>{std::array{b, I(2), I(2), I(2)}}, false, {I(2)}));
+    EXPECT_THAT(
+        getQueryResultAsIdTable(
+            "PREFIX view: "
+            "<https://qlever.cs.uni-freiburg.de/materializedView/> "
+            "SELECT ?a ?b ?c ?d ?e { SERVICE view:bn { _:config view:column-a "
+            "?a ; view:column-b ?b ; view:column-c ?c ; view:column-d ?d ; "
+            "view:column-e ?e . } }"),
+        matchesIdTable(makeIdTableFromVector(
+            {{I(1), I(1), I(1), I(1), I(1)}, {b, I(1), I(1), I(1), I(1)}})));
+  };
+
+  insertMainTriple(100);
+  // The blank node of the main triple is now managed by the `DeltaTriples`, use
+  // it in the rows of the view.
+  Id b = mainBlankNode(100);
+  modify([&](DeltaTriples& deltaTriples) {
+    deltaTriples.insertViewRows(handle, "bn",
+                                makeIdTableFromVector({{b, 1, 1, 1, 1}}, I));
+    deltaTriples.deleteViewRows(handle, "bn",
+                                makeIdTableFromVector({{b, 2, 2, 2, 2}}, I));
+  });
+  expectViewRows(b);
+
+  // After a restart (which reads all persisted updates in one go), the blank
+  // node of the main triple and the view rows is the same.
+  restartEngine();
+  qlv().loadMaterializedView("bn");
+  b = mainBlankNode(100);
+  expectViewRows(b);
+
+  // The same if an update creates a new blank node before the view is loaded
+  // (and its pending rows are applied).
+  restartEngine();
+  insertMainTriple(200);
+  b = mainBlankNode(100);
+  EXPECT_NE(b, mainBlankNode(200));
+  qlv().loadMaterializedView("bn");
+  expectViewRows(b);
+  restartEngine();
+  qlv().loadMaterializedView("bn");
+  expectViewRows(mainBlankNode(100));
+  EXPECT_NE(mainBlankNode(100), mainBlankNode(200));
 }
 
 // _____________________________________________________________________________

@@ -28,6 +28,7 @@
 #include "index/TripleComponentConversions.h"
 #include "parser/RdfParser.h"
 #include "parser/Tokenizer.h"
+#include "util/Serializer/TripleSerializer.h"
 
 namespace {
 using namespace deltaTriplesTestHelpers;
@@ -1493,7 +1494,8 @@ TEST_F(DeltaTriplesTest, viewRows) {
   EXPECT_EQ(current().size(), 4);
 
   // Registering again with the same metadata keeps the updates, registering
-  // with different metadata drops them.
+  // with different metadata (of a different version of the view, see
+  // `viewIdentity`) drops them.
   deltaTriples.registerView("v", spo, 6, {5});
   EXPECT_EQ(current().size(), 4);
   auto v1 = version();
@@ -1513,10 +1515,12 @@ TEST_F(DeltaTriplesTest, viewRows) {
   deltaTriples.insertViewRows(handle, "v", makeRows({r1}));
   EXPECT_EQ(current().size(), 1);
 
-  // Unregistering drops the updates.
+  // Unregistering removes the updates from the located rows, but keeps them as
+  // pending rows.
   auto v2 = version();
   deltaTriples.unregisterView("v");
   EXPECT_GT(version(), v2);
+  EXPECT_EQ(deltaTriples.pendingViews_.at("v").rowsInserted_.size(), 6);
   EXPECT_FALSE(deltaTriples.getLocatedTriplesSharedStateReference()
                    ->getLocatedTriplesForView("v")
                    .has_value());
@@ -1590,93 +1594,177 @@ TEST_F(DeltaTriplesTest, viewRowsPersistence) {
     return deltaTriples;
   };
   auto numLocatedRows = [](const DeltaTriples& deltaTriples) {
-    return deltaTriples.getLocatedTriplesSharedStateReference()
-        ->getLocatedTriplesForView("v")
-        ->numTriplesForTesting();
+    auto rows = deltaTriples.getLocatedTriplesSharedStateReference()
+                    ->getLocatedTriplesForView("v");
+    return rows.has_value() ? rows->numTriplesForTesting() : 0;
   };
-
-  std::string viewFile;
-  {
-    auto deltaTriples = makeDeltaTriples();
-    viewFile = deltaTriples->viewFilename("v");
-    EXPECT_EQ(viewFile, absl::StrCat(tmpFile.string(), ".view.v"));
-    deltaTriples->registerView("v", spo, 6, {5});
-    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1, r2}));
-    deltaTriples->deleteViewRows(handle, "v", makeViewRows({r3}));
-    // Nothing is written before `writeToDisk`.
-    EXPECT_FALSE(ql::filesystem::exists(viewFile));
-    deltaTriples->writeToDisk();
-    EXPECT_TRUE(ql::filesystem::exists(viewFile));
-  }
-
-  // Unregistering a view that is not registered does not touch its file.
-  makeDeltaTriples()->unregisterView("v");
-  EXPECT_TRUE(ql::filesystem::exists(viewFile));
-
-  {
-    // The rows are restored when the view is registered.
-    auto deltaTriples = makeDeltaTriples();
-    deltaTriples->registerView("v", spo, 6, {5});
-    const auto& view = deltaTriples->views_.at("v");
+  auto numRanges = [&tmpFile, &index]() {
+    return std::get<1>(ad_utility::deserializeIds(tmpFile,
+                                                  index.getLocalVocabContext()))
+        .size();
+  };
+  // Check that the rows `r1, r2` (inserted) and `r3` (deleted) are registered
+  // for the view `v` of the given `deltaTriples`.
+  auto expectRestored = [&](const DeltaTriples& deltaTriples) {
+    EXPECT_FALSE(deltaTriples.pendingViews_.contains("v"));
+    const auto& view = deltaTriples.views_.at("v");
     EXPECT_EQ(view.rowsInserted_.size(), 2);
     EXPECT_EQ(view.rowsDeleted_.size(), 1);
     EXPECT_TRUE(view.rowsInserted_.contains(r2));
     EXPECT_TRUE(view.rowsDeleted_.contains(r3));
-    EXPECT_EQ(numLocatedRows(*deltaTriples), 3);
+    EXPECT_EQ(numLocatedRows(deltaTriples), 3);
     // The local vocab entry is restored and managed by the local vocab of the
     // `DeltaTriples`.
     auto restoredWord =
-        deltaTriples->localVocab_.getIndexOrNullopt(LocalVocabEntry::fromIriref(
+        deltaTriples.localVocab_.getIndexOrNullopt(LocalVocabEntry::fromIriref(
             "<notInVocab>", index.getLocalVocabContext()));
     ASSERT_TRUE(restoredWord.has_value());
     EXPECT_TRUE(view.rowsInserted_.contains(std::vector<Id>{
         s, p, o, g, I(1), Id::makeFromLocalVocabIndex(restoredWord.value())}));
-    // Registering again does not read the file again.
+  };
+  // Write the rows `r1, r2` (inserted) and `r3` (deleted) for the view `v`.
+  auto writeRows = [&]() {
+    auto deltaTriples = makeDeltaTriples();
     deltaTriples->registerView("v", spo, 6, {5});
-    EXPECT_EQ(numLocatedRows(*deltaTriples), 3);
+    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1, r2}));
+    deltaTriples->deleteViewRows(handle, "v", makeViewRows({r3}));
+    deltaTriples->writeToDisk();
+  };
 
-    // When the view has no rows anymore (here: after `clear`), its file is
-    // removed.
-    deltaTriples->clear();
+  {
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->registerView("v", spo, 6, {5});
+    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1, r2}));
+    deltaTriples->deleteViewRows(handle, "v", makeViewRows({r3}));
+    deltaTriples->insertTriples(
+        handle, makeIdTriples(index, localVocabOutside, {"<a> <b> <c>"}));
+    // Nothing is written before `writeToDisk`.
+    EXPECT_FALSE(ql::filesystem::exists(tmpFile));
+    deltaTriples->writeToDisk();
+  }
+  // Everything is written to a single file: the main triples and the four
+  // ranges of the view (name, identity, deleted and inserted rows).
+  auto [vocab, idRanges] =
+      ad_utility::deserializeIds(tmpFile, index.getLocalVocabContext());
+  ASSERT_EQ(idRanges.size(), 6);
+  EXPECT_EQ(idRanges.at(1).size(), 4);
+  EXPECT_THAT(idRanges.at(2), ::testing::ElementsAre(I('v')));
+  EXPECT_EQ(idRanges.at(4).size(), 6);
+  EXPECT_EQ(idRanges.at(5).size(), 12);
+
+  {
+    // After a restart, the rows are pending until the view is registered, and
+    // they are also written again before.
+    auto deltaTriples = makeDeltaTriples();
+    EXPECT_EQ(deltaTriples->numInserted(), 1);
+    EXPECT_TRUE(deltaTriples->pendingViews_.contains("v"));
     EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
-    deltaTriples->writeToDisk();
-    EXPECT_FALSE(ql::filesystem::exists(viewFile));
-
-    // Unregistering the view removes its file.
-    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1}));
-    deltaTriples->writeToDisk();
-    EXPECT_TRUE(ql::filesystem::exists(viewFile));
+    // Unregistering a view that is not registered keeps its pending rows.
     deltaTriples->unregisterView("v");
-    EXPECT_FALSE(ql::filesystem::exists(viewFile));
-
-    // Write the rows again for the staleness checks below.
-    deltaTriples->registerView("v", spo, 6, {5});
-    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1}));
+    EXPECT_TRUE(deltaTriples->pendingViews_.contains("v"));
     deltaTriples->writeToDisk();
-    EXPECT_TRUE(ql::filesystem::exists(viewFile));
+    EXPECT_EQ(numRanges(), 6);
+  }
+  {
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->registerView("v", spo, 6, {5});
+    expectRestored(*deltaTriples);
+    // Registering again does not change anything.
+    deltaTriples->registerView("v", spo, 6, {5});
+    expectRestored(*deltaTriples);
+
+    // Unregistering (e.g. unloading the view) keeps the rows as pending rows,
+    // so they are restored when registering again, also after a restart.
+    deltaTriples->unregisterView("v");
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
+    EXPECT_TRUE(deltaTriples->pendingViews_.contains("v"));
+    deltaTriples->registerView("v", spo, 6, {5});
+    expectRestored(*deltaTriples);
+    deltaTriples->unregisterView("v");
+    deltaTriples->writeToDisk();
+  }
+  {
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->registerView("v", spo, 6, {5});
+    expectRestored(*deltaTriples);
+
+    // Dropping the deltas of a registered view keeps the registration.
+    deltaTriples->dropViewDeltas("v");
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
+    EXPECT_TRUE(deltaTriples->views_.at("v").rowsInserted_.empty());
+    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1}));
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 1);
+    // Views without rows are not written.
+    deltaTriples->dropViewDeltas("v");
+    deltaTriples->writeToDisk();
+    EXPECT_EQ(numRanges(), 2);
   }
 
-  // A file that belongs to a different version of the view (here: different
-  // block metadata, or a different number of columns) is discarded.
+  // Dropping the deltas of a view that is not registered drops its pending
+  // rows (also the persisted ones after the next write).
+  writeRows();
+  {
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->dropViewDeltas("v");
+    EXPECT_FALSE(deltaTriples->pendingViews_.contains("v"));
+    deltaTriples->writeToDisk();
+    EXPECT_EQ(numRanges(), 2);
+  }
+
+  // `clear` also drops the pending rows.
+  writeRows();
+  {
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->clear();
+    EXPECT_TRUE(deltaTriples->pendingViews_.empty());
+  }
+
+  // Pending rows that belong to a different version of the view (here:
+  // different block metadata, or a different number of columns) are dropped.
   for (auto [permutation, numColumns] :
        {std::pair{pso, size_t{6}}, std::pair{spo, size_t{5}}}) {
-    {
-      auto deltaTriples = makeDeltaTriples();
-      deltaTriples->registerView("v", spo, 6, {5});
-      EXPECT_EQ(numLocatedRows(*deltaTriples), 1);
-      deltaTriples->writeToDisk();
-    }
+    writeRows();
     auto deltaTriples = makeDeltaTriples();
     deltaTriples->registerView("v", permutation, numColumns, {});
     EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
-    EXPECT_FALSE(ql::filesystem::exists(viewFile));
-    // Restore the file for the next iteration.
-    auto other = makeDeltaTriples();
-    other->registerView("v", spo, 6, {5});
-    other->insertViewRows(handle, "v", makeViewRows({r1}));
-    other->writeToDisk();
+    EXPECT_FALSE(deltaTriples->pendingViews_.contains("v"));
+    EXPECT_TRUE(deltaTriples->views_.contains("v"));
   }
-  ql::filesystem::remove(viewFile);
+
+  // If applying the pending rows fails (here: `r2` has UNDEF in column 5, which
+  // is not allowed anymore), the view is not registered, and the pending rows
+  // are kept (and still written).
+  writeRows();
+  {
+    auto deltaTriples = makeDeltaTriples();
+    EXPECT_ANY_THROW(deltaTriples->registerView("v", spo, 6, {}));
+    EXPECT_FALSE(deltaTriples->views_.contains("v"));
+    EXPECT_FALSE(deltaTriples->getLocatedTriplesSharedStateReference()
+                     ->getLocatedTriplesForView("v")
+                     .has_value());
+    EXPECT_TRUE(deltaTriples->pendingViews_.contains("v"));
+    deltaTriples->writeToDisk();
+  }
+  {
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->registerView("v", spo, 6, {5});
+    expectRestored(*deltaTriples);
+  }
+
+  // A file in the format without views (only the deleted and inserted triples)
+  // can still be read.
+  ql::filesystem::remove(tmpFile);
+  {
+    LocalVocab emptyVocab;
+    auto triple = makeIdTriples(index, localVocabOutside, {"<a> <b> <c>"})[0];
+    ad_utility::serializeIds(
+        tmpFile, emptyVocab,
+        std::array{std::vector<Id>{},
+                   std::vector<Id>{triple.ids().begin(), triple.ids().end()}});
+    auto deltaTriples = makeDeltaTriples();
+    EXPECT_EQ(deltaTriples->numInserted(), 1);
+    EXPECT_TRUE(deltaTriples->pendingViews_.empty());
+  }
 }
 
 // _____________________________________________________________________________

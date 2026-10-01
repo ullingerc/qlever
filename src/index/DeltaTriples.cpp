@@ -19,7 +19,6 @@
 #include "backports/filesystem.h"
 #include "engine/ExecuteUpdate.h"
 #include "engine/ExportQueryExecutionTrees.h"
-#include "global/MaterializedViewConstants.h"
 #include "index/ExportIds.h"
 #include "index/Index.h"
 #include "index/IndexImpl.h"
@@ -98,6 +97,7 @@ void DeltaTriples::clear() {
     view.rowsDeleted_.clear();
     viewLocatedRows(name).clear();
   }
+  pendingViews_.clear();
 }
 
 // ____________________________________________________________________________
@@ -178,12 +178,13 @@ nlohmann::json DeltaTriples::vacuum(
   nlohmann::json result = nlohmann::json::object();
   auto [removeExternal, externalStats] = identifyTriplesToVacuum(vi<false>);
   auto [removeInternal, internalStats] = identifyTriplesToVacuum(vi<true>);
+  // NOTE: Only the registered views are vacuumed, the pending rows (see
+  // `pendingViews_`) are not, because the view is not loaded.
   std::vector<std::pair<std::string, RowsToVacuum>> viewRowsToVacuum;
   for (const auto& [name, view] : views_) {
     viewRowsToVacuum.emplace_back(
-        name,
-        locatedTriples_->viewLocatedTriples_.at(name).identifyRowsToVacuum(
-            *view.permutation_, cancellationHandle));
+        name, viewLocatedRows(name).identifyRowsToVacuum(*view.permutation_,
+                                                         cancellationHandle));
   }
   // Remove the located `rows` from the view with the given `name` and from its
   // `rowSet` (`rowsInserted_` or `rowsDeleted_`).
@@ -192,7 +193,7 @@ nlohmann::json DeltaTriples::vacuum(
                                ViewState::RowSet& rowSet) {
     // `LocatedTriplesPerBlock::erase` requires a sorted input.
     ql::ranges::sort(rows, {}, LocatedTriplesProjection{});
-    locatedTriples_->viewLocatedTriples_.at(name).erase(rows);
+    viewLocatedRows(name).erase(rows);
     for (const auto& lt : rows) {
       std::vector<Id> row{lt.triple_.ids().begin(), lt.triple_.ids().end()};
       row.insert(row.end(), lt.payload_.begin(), lt.payload_.end());
@@ -419,27 +420,40 @@ DeltaTriples::deleteInternalTriplesForTesting<DeltaTriples::Consolidate::No>(
 
 namespace {
 // A cheap identity of a materialized view with the given block `metadata` and
-// `numColumns`: the number of columns, blocks, and rows, and the first and last
-// triple. Two different versions of a view (written with the same name) are
-// very unlikely to have the same identity.
+// `numColumns`, which is persisted together with the view's rows to detect
+// that the view was rewritten while the server was not running (rewrites via
+// the `MaterializedViewsManager` explicitly drop the rows, see
+// `DeltaTriples::dropViewDeltas`). It consists of the number of columns,
+// blocks, and rows, and a hash of the first and last triple of each block. This
+// costs one pass over the (in-memory) block metadata and is much more robust
+// than only using the first and last triple of the view, while reading the
+// view's data or using file timestamps (which are changed by copying the index)
+// would be either expensive or fragile. All entries are `Int` `Id`s, because
+// the identity must not contain `LocalVocabIndex` `Id`s (which are remapped
+// when the file is read back) or anything else that is not stable between
+// runs.
 std::vector<Id> viewIdentity(
     const std::vector<CompressedBlockMetadata>& metadata, size_t numColumns) {
-  auto I = [](size_t value) {
+  auto I = [](uint64_t value) {
     return Id::makeFromInt(static_cast<int64_t>(value));
   };
   size_t numRows = 0;
+  // A simple FNV-1a style hash over the bits of the `Id`s. NOTE: `absl::Hash`
+  // and `std::hash` can not be used, because they are not guaranteed to be
+  // stable between runs.
+  uint64_t hash = 14695981039346656037ULL;
+  auto addToHash = [&hash](Id id) {
+    hash = (hash ^ id.getBits()) * 1099511628211ULL;
+  };
   for (const auto& block : metadata) {
     numRows += block.numRows_;
-  }
-  std::vector<Id> identity{I(numColumns), I(metadata.size()), I(numRows)};
-  if (!metadata.empty()) {
-    for (const auto& t :
-         {metadata.front().firstTriple_, metadata.back().lastTriple_}) {
-      identity.insert(identity.end(),
-                      {t.col0Id_, t.col1Id_, t.col2Id_, t.graphId_});
+    for (const auto& t : {block.firstTriple_, block.lastTriple_}) {
+      ql::ranges::for_each(
+          std::array{t.col0Id_, t.col1Id_, t.col2Id_, t.graphId_}, addToHash);
     }
   }
-  return identity;
+  // Drop bits such that the hash fits into a (non-negative) `Int` `Id`.
+  return {I(numColumns), I(metadata.size()), I(numRows), I(hash >> 5)};
 }
 }  // namespace
 
@@ -457,9 +471,21 @@ void DeltaTriples::registerView(
     AD_CONTRACT_CHECK(it->second.numColumns_ == numColumns);
     return;
   }
-  // A replaced registration may have had updates, see `unregisterView`.
+  // The rows of a replaced registration become pending, and are kept below
+  // iff they belong to the same version of the view (see `viewIdentity`).
   unregisterView(name);
   auto identity = viewIdentity(*metadata, numColumns);
+  auto pendingIt = pendingViews_.find(name);
+  if (pendingIt != pendingViews_.end() &&
+      pendingIt->second.identity_ != identity) {
+    AD_LOG_WARN << "The persisted updates of the materialized view \"" << name
+                << "\" belong to a different version of the view and are "
+                   "discarded"
+                << std::endl;
+    pendingViews_.erase(pendingIt);
+    pendingIt = pendingViews_.end();
+  }
+
   // Views with less than four columns are stored padded to four columns.
   LocatedTriplesPerBlock locatedRows;
   locatedRows.setNumPayloadColumns(std::max(numColumns, size_t{4}) - 4);
@@ -471,62 +497,53 @@ void DeltaTriples::registerView(
                                  std::move(possiblyUndefinedColumns),
                                  {},
                                  {}});
-  readViewFromDisk(name);
-}
+  if (pendingIt == pendingViews_.end()) {
+    return;
+  }
 
-// ____________________________________________________________________________
-void DeltaTriples::readViewFromDisk(const std::string& name) {
-  if (!filenameForPersisting_.has_value()) {
-    return;
-  }
-  auto filename = viewFilename(name);
-  auto [vocab, idRanges] =
-      ad_utility::deserializeIds(filename, index_.getLocalVocabContext());
-  if (idRanges.empty()) {
-    return;
-  }
-  AD_CORRECTNESS_CHECK(idRanges.size() == 3);
-  if (idRanges.at(2) != views_.at(name).identity_) {
-    AD_LOG_WARN << "The persisted updates of the materialized view \"" << name
-                << "\" belong to a different version of the view and are "
-                   "discarded"
-                << std::endl;
-    ql::filesystem::remove(filename);
-    return;
-  }
-  auto& locatedRows = locatedTriples_->viewLocatedTriples_.at(name);
-  size_t numColumns = 4 + locatedRows.numPayloadColumns();
-  auto toRows = [numColumns](const std::vector<Id>& ids) {
-    AD_CORRECTNESS_CHECK(ids.size() % numColumns == 0);
-    IdTable rows{numColumns, ad_utility::makeUnlimitedAllocator<Id>()};
-    rows.resize(ids.size() / numColumns);
-    for (size_t i = 0; i < rows.numRows(); ++i) {
-      for (size_t col = 0; col < numColumns; ++col) {
-        rows(i, col) = ids[i * numColumns + col];
+  // Apply the pending rows. If this fails (e.g. because the rows don't fit the
+  // view), roll back the registration and keep the pending rows, so that they
+  // are not lost (and still written by `writeToDisk`).
+  try {
+    auto& locatedRows = viewLocatedRows(name);
+    const auto& pending = pendingIt->second;
+    size_t width = 4 + locatedRows.numPayloadColumns();
+    auto toRows = [width](const std::vector<Id>& ids) {
+      AD_CONTRACT_CHECK(ids.size() % width == 0,
+                        "The number of columns of the persisted rows does not "
+                        "match the materialized view.");
+      IdTable rows{width, ad_utility::makeUnlimitedAllocator<Id>()};
+      rows.resize(ids.size() / width);
+      for (size_t i = 0; i < rows.numRows(); ++i) {
+        for (size_t col = 0; col < width; ++col) {
+          rows(i, col) = ids[i * width + col];
+        }
       }
-    }
-    return rows;
-  };
-  auto cancellationHandle =
-      std::make_shared<CancellationHandle::element_type>();
-  insertViewRows<Consolidate::No>(cancellationHandle, name,
-                                  toRows(idRanges.at(1)));
-  deleteViewRows<Consolidate::No>(cancellationHandle, name,
-                                  toRows(idRanges.at(0)));
-  locatedRows.consolidateAllBlocks();
-  // The registration doesn't update the metadata (see
-  // `MaterializedViewsManager::syncViewRegistration`), so do it here.
-  locatedRows.updateAugmentedMetadata();
-  AD_LOG_INFO << "Done, #inserted rows = " << idRanges.at(1).size() / numColumns
-              << ", #deleted rows = " << idRanges.at(0).size() / numColumns
-              << std::endl;
-}
-
-// ____________________________________________________________________________
-std::string DeltaTriples::viewFilename(const std::string& name) const {
-  // NOTE: The `name` is safe to use in a filename, because the names of
-  // materialized views are checked by `MaterializedView::throwIfInvalidName`.
-  return absl::StrCat(filenameForPersisting_.value(), VIEW_FILE_INFIX, name);
+      return rows;
+    };
+    auto inserted = toRows(pending.rowsInserted_);
+    auto deleted = toRows(pending.rowsDeleted_);
+    auto cancellationHandle =
+        std::make_shared<CancellationHandle::element_type>();
+    insertViewRows<Consolidate::No>(cancellationHandle, name,
+                                    std::move(inserted));
+    deleteViewRows<Consolidate::No>(cancellationHandle, name,
+                                    std::move(deleted));
+    locatedRows.consolidateAllBlocks();
+    // The registration doesn't update the metadata (see
+    // `MaterializedViewsManager::syncViewRegistration`), so do it here.
+    locatedRows.updateAugmentedMetadata();
+    AD_LOG_INFO << "Restored the updates of the materialized view \"" << name
+                << "\", #inserted rows = "
+                << pending.rowsInserted_.size() / width
+                << ", #deleted rows = " << pending.rowsDeleted_.size() / width
+                << std::endl;
+  } catch (...) {
+    locatedTriples_->viewLocatedTriples_.erase(name);
+    views_.erase(name);
+    throw;
+  }
+  pendingViews_.erase(pendingIt);
 }
 
 // ____________________________________________________________________________
@@ -539,20 +556,43 @@ LocatedTriplesPerBlock& DeltaTriples::viewLocatedRows(const std::string& name) {
 
 // ____________________________________________________________________________
 void DeltaTriples::unregisterView(const std::string& name) {
-  auto it = locatedTriples_->viewLocatedTriples_.find(name);
-  if (it == locatedTriples_->viewLocatedTriples_.end()) {
+  auto it = views_.find(name);
+  if (it == views_.end()) {
     return;
   }
-  // Only if updates are dropped, the content of the view changes. Otherwise
-  // don't touch the `index_` to not needlessly invalidate the query cache.
-  if (!it->second.isEmpty()) {
+  auto& view = it->second;
+  // Keep the updates as pending rows, see `pendingViews_`.
+  if (!view.rowsInserted_.empty() || !view.rowsDeleted_.empty()) {
+    auto flatten = [](const ViewState::RowSet& rows) {
+      return ::ranges::to_vector(rows | ql::views::join);
+    };
+    pendingViews_.insert_or_assign(
+        name,
+        PendingViewRows{std::move(view.identity_), flatten(view.rowsDeleted_),
+                        flatten(view.rowsInserted_)});
+    // The content of the view (as seen by queries) changes. Otherwise don't
+    // touch the `index_` to not needlessly invalidate the query cache.
     locatedTriples_->index_++;
   }
-  if (filenameForPersisting_.has_value()) {
-    ql::filesystem::remove(viewFilename(name));
+  locatedTriples_->viewLocatedTriples_.erase(name);
+  views_.erase(it);
+}
+
+// ____________________________________________________________________________
+void DeltaTriples::dropViewDeltas(const std::string& name) {
+  pendingViews_.erase(name);
+  auto it = views_.find(name);
+  if (it == views_.end()) {
+    return;
   }
-  locatedTriples_->viewLocatedTriples_.erase(it);
-  views_.erase(name);
+  auto& locatedRows = viewLocatedRows(name);
+  if (!locatedRows.isEmpty()) {
+    locatedTriples_->index_++;
+  }
+  it->second.rowsInserted_.clear();
+  it->second.rowsDeleted_.clear();
+  locatedRows.clear();
+  locatedRows.updateAugmentedMetadata();
 }
 
 // ____________________________________________________________________________
@@ -968,6 +1008,24 @@ void DeltaTriples::updateAugmentedMetadata() {
   update(locatedTriples_->viewLocatedTriples_ | ql::views::values);
 }
 
+namespace {
+// Encode the `name` of a materialized view as `Id`s (one `Int` per byte) and
+// back, see `DeltaTriples::writeToDisk`.
+std::vector<Id> encodeViewName(std::string_view name) {
+  return ::ranges::to_vector(name | ql::views::transform([](char c) {
+                               return Id::makeFromInt(
+                                   static_cast<unsigned char>(c));
+                             }));
+}
+std::string decodeViewName(const std::vector<Id>& ids) {
+  return ::ranges::to<std::string>(ids | ql::views::transform([](Id id) {
+                                     AD_CORRECTNESS_CHECK(id.getDatatype() ==
+                                                          Datatype::Int);
+                                     return static_cast<char>(id.getInt());
+                                   }));
+}
+}  // namespace
+
 // _____________________________________________________________________________
 void DeltaTriples::writeToDisk() const {
   if (!filenameForPersisting_.has_value()) {
@@ -985,34 +1043,41 @@ void DeltaTriples::writeToDisk() const {
                }) |
            ql::views::join;
   };
-  ql::filesystem::path tempPath = filenameForPersisting_.value();
-  tempPath += ".tmp";
-  ad_utility::serializeIds(
-      tempPath, localVocab_,
-      std::array{toRange(triplesSetsNormal_.triplesDeleted_),
-                 toRange(triplesSetsNormal_.triplesInserted_)});
-  ql::filesystem::rename(tempPath, filenameForPersisting_.value());
-
-  // NOTE: This rewrites the file of every registered view (including the whole
-  // `localVocab_`) on every write, like for the triples above. Only writing the
-  // changed views would be cheaper.
+  auto rowsToRange = [](const ViewState::RowSet& rows) {
+    return rows | ql::views::join;
+  };
+  // The ranges have different types, see `serializeIds`.
+  using IdRange =
+      std::variant<decltype(toRange(triplesSetsNormal_.triplesDeleted_)),
+                   decltype(rowsToRange(
+                       std::declval<const ViewState::RowSet&>())),
+                   std::vector<Id>, ql::span<const Id>>;
+  std::vector<IdRange> idRanges;
+  idRanges.emplace_back(toRange(triplesSetsNormal_.triplesDeleted_));
+  idRanges.emplace_back(toRange(triplesSetsNormal_.triplesInserted_));
+  // See the documentation of `writeToDisk` for the format. NOTE: Like for the
+  // triples, this rewrites the rows of all views (and the whole `localVocab_`)
+  // on every write, also the rows of views that didn't change. The rows are
+  // not copied, but serialized directly from the sets.
   for (const auto& [name, view] : views_) {
-    auto filename = viewFilename(name);
     if (view.rowsInserted_.empty() && view.rowsDeleted_.empty()) {
-      ql::filesystem::remove(filename);
       continue;
     }
-    auto flatten = [](const ViewState::RowSet& rows) {
-      return ::ranges::to_vector(rows | ql::views::join);
-    };
-    ql::filesystem::path tempViewPath = filename;
-    tempViewPath += ".tmp";
-    ad_utility::serializeIds(
-        tempViewPath, localVocab_,
-        std::array{flatten(view.rowsDeleted_), flatten(view.rowsInserted_),
-                   view.identity_});
-    ql::filesystem::rename(tempViewPath, filename);
+    idRanges.emplace_back(encodeViewName(name));
+    idRanges.emplace_back(ql::span<const Id>{view.identity_});
+    idRanges.emplace_back(rowsToRange(view.rowsDeleted_));
+    idRanges.emplace_back(rowsToRange(view.rowsInserted_));
   }
+  for (const auto& [name, pending] : pendingViews_) {
+    idRanges.emplace_back(encodeViewName(name));
+    idRanges.emplace_back(ql::span<const Id>{pending.identity_});
+    idRanges.emplace_back(ql::span<const Id>{pending.rowsDeleted_});
+    idRanges.emplace_back(ql::span<const Id>{pending.rowsInserted_});
+  }
+  ql::filesystem::path tempPath = filenameForPersisting_.value();
+  tempPath += ".tmp";
+  ad_utility::serializeIds(tempPath, localVocab_, idRanges);
+  ql::filesystem::rename(tempPath, filenameForPersisting_.value());
 }
 
 // _____________________________________________________________________________
@@ -1020,13 +1085,28 @@ void DeltaTriples::readFromDisk() {
   if (!filenameForPersisting_.has_value()) {
     return;
   }
-  AD_CONTRACT_CHECK(localVocab_.empty());
+  AD_CONTRACT_CHECK(localVocab_.empty() && pendingViews_.empty());
   auto [vocab, idRanges] = ad_utility::deserializeIds(
       filenameForPersisting_.value(), index_.getLocalVocabContext());
   if (idRanges.empty()) {
     return;
   }
-  AD_CORRECTNESS_CHECK(idRanges.size() == 2);
+  // See `writeToDisk` for the format.
+  AD_CORRECTNESS_CHECK(idRanges.size() >= 2 && (idRanges.size() - 2) % 4 == 0);
+  // Whether the range with the given index contains triples or rows (and not
+  // the name or identity of a view).
+  auto containsRows = [](size_t i) { return i < 2 || (i - 2) % 4 >= 2; };
+  // Rewrite the triples and rows of all ranges in one go, so that the same
+  // blank node gets the same new `Id` everywhere. The rewrites in
+  // `insertTriples` etc. then don't change anything anymore.
+  rewriteLocalVocabEntriesAndBlankNodesImpl(
+      [&idRanges, &containsRows](const auto& convertId) {
+        for (size_t i = 0; i < idRanges.size(); ++i) {
+          if (containsRows(i)) {
+            ql::ranges::for_each(idRanges[i], convertId);
+          }
+        }
+      });
   auto toTriples = [](const std::vector<Id>& ids) {
     Triples triples;
     static_assert(Triples::value_type::PayloadSize == 0);
@@ -1051,6 +1131,19 @@ void DeltaTriples::readFromDisk() {
   consolidateAll();
   AD_LOG_INFO << "Done, #inserted triples = " << idRanges.at(1).size()
               << ", #deleted triples = " << idRanges.at(0).size() << std::endl;
+  for (size_t i = 2; i < idRanges.size(); i += 4) {
+    auto name = decodeViewName(idRanges.at(i));
+    AD_CORRECTNESS_CHECK(!pendingViews_.contains(name));
+    pendingViews_.emplace(std::move(name),
+                          PendingViewRows{std::move(idRanges.at(i + 1)),
+                                          std::move(idRanges.at(i + 2)),
+                                          std::move(idRanges.at(i + 3))});
+  }
+  if (!pendingViews_.empty()) {
+    AD_LOG_INFO << "The updates of " << pendingViews_.size()
+                << " materialized view(s) are restored when the view is loaded"
+                << std::endl;
+  }
 }
 
 // _____________________________________________________________________________

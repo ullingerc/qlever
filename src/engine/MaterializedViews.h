@@ -397,6 +397,13 @@ class MaterializedViewsManager {
   void syncViewRegistration(const std::string& name,
                             const MaterializedView& changedView) const;
 
+  // Drop all updates of the view `name` (registered and pending, see
+  // `DeltaTriples::dropViewDeltas`) and persist this. Used when a view is
+  // deleted or rewritten, so that its old updates are not applied to a new
+  // view of the same name. Does nothing if `index_` is not set. The same
+  // locking rules as for `syncViewRegistration` apply.
+  void dropViewDeltas(const std::string& name) const;
+
   // Load the given view into `state` if it isn't loaded yet and return it.
   // Requires `state` to be the locked contents of `loadedViews_` (this is a
   // helper for `loadView` and `getView`, so that the latter can look up the
@@ -468,12 +475,14 @@ class MaterializedViewsManager {
   // Unload a materialized view if it is loaded and return `true`. Return
   // `false` (and do nothing else) if it is not loaded. It is `const` for the
   // same reason described above. The view is also unregistered from the
-  // `DeltaTriples` of `index_`, which drops its updates (also the persisted
-  // ones).
+  // `DeltaTriples` of `index_`, which keeps its updates (as pending rows, see
+  // `DeltaTriples::unregisterView`), so they are restored when it is loaded
+  // again (also after a restart).
   bool unloadViewIfLoaded(const std::string& name) const;
 
   // Delete a materialized view: unload it if loaded and delete all of its files
-  // from disk. Throws if the view does not exist. Its updates are dropped.
+  // from disk. Throws if the view does not exist. Its updates are dropped (also
+  // if it was not loaded, see `dropViewDeltas`).
   void deleteView(const std::string& name) const;
 
   // Load the given view if it is not already loaded and return it. This pointer
@@ -513,7 +522,7 @@ class MaterializedViewsManager {
   // result is written to the view. The view is then loaded automatically.
   //
   // If a view with the same name is already loaded, it is unloaded before
-  // writing.
+  // writing. The updates of a previous view with the same name are dropped.
   //
   // The `memoryLimit` and `allocator` are used only for sorting the
   // permutation if the query result is not correctly sorted already. The

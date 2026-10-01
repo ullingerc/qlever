@@ -354,8 +354,8 @@ IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
   };
 
   return mergeBlockAndLocatedTriples(block, map_.at(blockIndex),
-                                     numTriples(blockIndex).numAdded_, compareFullRow,
-                                     writeLocatedTriple);
+                                     numTriples(blockIndex).numAdded_,
+                                     compareFullRow, writeLocatedTriple);
 }
 
 namespace {

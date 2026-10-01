@@ -8,6 +8,7 @@
 
 #include <array>
 #include <fstream>
+#include <variant>
 
 #include "backports/algorithm.h"
 #include "backports/concepts.h"
@@ -186,6 +187,8 @@ std::vector<Id> deserializeIds(Serializer& serializer,
 }  // namespace detail
 
 // Serialize the local vocabulary and the given ranges of Ids to the given path.
+// The elements of `idRanges` may also be `std::variant`s of ranges of Ids (to
+// serialize ranges of different types together).
 CPP_template(typename Range)(
     requires ql::ranges::range<
         Range>) void serializeIds(const ql::filesystem::path& path,
@@ -194,8 +197,15 @@ CPP_template(typename Range)(
   detail::writeHeader(serializer);
   detail::serializeLocalVocab(serializer, vocab);
   serializer << uint64_t{ql::ranges::size(idRanges)};
-  for (const auto& ids : idRanges) {
+  auto serializeRange = [&serializer](const auto& ids) {
     detail::serializeIds(serializer, ids);
+  };
+  for (const auto& ids : idRanges) {
+    if constexpr (similarToInstantiation<decltype(ids), std::variant>) {
+      std::visit(serializeRange, ids);
+    } else {
+      serializeRange(ids);
+    }
   }
 }
 

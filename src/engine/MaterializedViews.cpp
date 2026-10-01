@@ -143,6 +143,9 @@ void MaterializedViewsManager::writeViewToDisk(
   MaterializedViewWriter writer{onDiskBase_, std::move(name), plannedQuery,
                                 std::move(memoryLimit), std::move(allocator)};
   writer.computeResultAndWritePermutation();
+  // The updates of the old version of the view (which became pending when it
+  // was unloaded above) must not be applied to the new version.
+  dropViewDeltas(writer.name_);
   loadView(writer.name_, writer.qec_.get());
 }
 
@@ -585,9 +588,11 @@ void MaterializedViewsManager::syncViewRegistration(
   if (index_ == nullptr || !changedView.isUpdatable()) {
     return;
   }
-  // Registering or unregistering a view reads or deletes its persisted updates
-  // directly (see `DeltaTriples::registerView`), so nothing has to be written,
-  // and it does not change the metadata of any other permutation.
+  // Registering or unregistering a view only moves its updates between the
+  // registered and the pending rows of the `DeltaTriples` (see
+  // `DeltaTriples::registerView`), which doesn't change what `writeToDisk`
+  // writes, so nothing has to be written. It also does not change the metadata
+  // of any other permutation.
   index_->deltaTriplesManager().modify<void>(
       [this, &name](DeltaTriples& deltaTriples) {
         // Look up the view that is loaded under this name *now*, while
@@ -616,6 +621,20 @@ void MaterializedViewsManager::syncViewRegistration(
                                   std::move(possiblyUndefinedColumns));
       },
       false, false);
+}
+
+// _____________________________________________________________________________
+void MaterializedViewsManager::dropViewDeltas(const std::string& name) const {
+  if (index_ == nullptr) {
+    return;
+  }
+  // Write to disk, such that the dropped updates are not restored after a
+  // restart.
+  index_->deltaTriplesManager().modify<void>(
+      [&name](DeltaTriples& deltaTriples) {
+        deltaTriples.dropViewDeltas(name);
+      },
+      true, false);
 }
 
 // _____________________________________________________________________________
@@ -674,14 +693,20 @@ void MaterializedViewsManager::deleteView(const std::string& name) const {
       absl::StrCat("delete the materialized view '", name, "'"));
 
   // Unregister the unloaded view (if any) after `loadedViews_` is released,
-  // also if deleting a file below throws. NOTE: This has to be declared before
-  // the lock, so that it runs after the lock is released.
+  // also if deleting a file below throws. If all files were deleted, also drop
+  // the updates of the view (also if it was not loaded, then its updates may
+  // still be pending, see `DeltaTriples::pendingViews_`). NOTE: This has to be
+  // declared before the lock, so that it runs after the lock is released.
   std::shared_ptr<MaterializedView> unloadedView;
+  bool deleted = false;
   auto syncRegistration =
       ad_utility::makeOnDestructionDontThrowDuringStackUnwinding(
-          [this, &name, &unloadedView]() {
+          [this, &name, &unloadedView, &deleted]() {
             if (unloadedView != nullptr) {
               syncViewRegistration(name, *unloadedView);
+            }
+            if (deleted) {
+              dropViewDeltas(name);
             }
           });
 
@@ -713,6 +738,7 @@ void MaterializedViewsManager::deleteView(const std::string& name) const {
           "' while deleting materialized view '", name, "': ", ec.message()));
     }
   }
+  deleted = true;
 
   AD_LOG_INFO << "Materialized view \"" << name << "\" deleted" << std::endl;
 }
