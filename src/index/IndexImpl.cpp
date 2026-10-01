@@ -28,6 +28,7 @@
 #include "backports/filesystem.h"
 #include "engine/AddCombinedRowToTable.h"
 #include "global/FileSuffixConstants.h"
+#include "global/MaterializedViewConstants.h"
 #include "global/RuntimeParameters.h"
 #include "index/Index.h"
 #include "index/IndexFormatConverter.h"
@@ -1243,6 +1244,13 @@ std::vector<ql::filesystem::path> IndexImpl::allIndexFiles(
   // needed here.
   ql::ranges::move(
       qlever::util::filesWithBaseNameAndSuffix(onDiskBase, VOCAB_SUFFIX),
+      std::back_inserter(result));
+  // The persisted updates of the materialized views (see
+  // `DeltaTriples::viewFilename`). They belong to the updates of the index, so
+  // they must not stay behind when the index is moved.
+  ql::ranges::move(
+      qlever::util::filesWithBaseNameAndSuffix(
+          onDiskBase, absl::StrCat(UPDATE_TRIPLES_SUFFIX, VIEW_FILE_INFIX)),
       std::back_inserter(result));
 
   return result;

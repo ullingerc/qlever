@@ -285,6 +285,24 @@ IdTable LocatedTriplesPerBlock::mergeTriples(size_t blockIndex,
   }
 }
 
+// Three-way comparison of the full row of `lt` (key and payload) with the
+// full `row` of a materialized view. Returns a negative value, zero, or a
+// positive value.
+template <typename Row>
+static int compareFullRow(const LocatedTriple& lt, const Row& row) {
+  auto ltKey = tieLocatedTripleValue<3, true>(lt);
+  auto rowKey = tieIdTableRow<3, true>(row);
+  if (ltKey != rowKey) {
+    return ltKey < rowKey ? -1 : 1;
+  }
+  for (size_t i = 0; i < lt.payload_.size(); ++i) {
+    if (lt.payload_[i] != row[4 + i]) {
+      return lt.payload_[i] < row[4 + i] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
 // ____________________________________________________________________________
 IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
                                               const IdTable& block) const {
@@ -295,22 +313,6 @@ IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
 
   IdTable result{block.numColumns(), block.getAllocator()};
   result.resize(block.numRows() + numTriples(blockIndex).numAdded_);
-
-  // Three-way comparison of the full row of `lt` (key and payload) with `row`.
-  // Returns a negative value, zero, or a positive value.
-  auto compare = [this](const LocatedTriple& lt, const auto& row) {
-    auto ltKey = tieLocatedTripleValue<3, true>(lt);
-    auto rowKey = tieIdTableRow<3, true>(row);
-    if (ltKey != rowKey) {
-      return ltKey < rowKey ? -1 : 1;
-    }
-    for (size_t i = 0; i < numPayloadColumns_; ++i) {
-      if (lt.payload_[i] != row[4 + i]) {
-        return lt.payload_[i] < row[4 + i] ? -1 : 1;
-      }
-    }
-    return 0;
-  };
 
   auto rowIt = block.begin();
   auto sortedLocatedTriples = map_.at(blockIndex).getSortedView();
@@ -332,7 +334,7 @@ IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
 
   // Same three-way merge as in `mergeTriplesImpl`.
   while (rowIt != block.end() && locatedTripleIt != locatedTripleEnd) {
-    int cmp = compare(*locatedTripleIt, *rowIt);
+    int cmp = compareFullRow(*locatedTripleIt, *rowIt);
     if (cmp < 0) {
       if (locatedTripleIt->insertOrDelete_) {
         // Insertion of a non-existent row.
@@ -364,6 +366,19 @@ IdTable LocatedTriplesPerBlock::mergeFullRows(size_t blockIndex,
 }
 
 namespace {
+// The indices of the blocks in `map` that have at least
+// `vacuum-minimum-block-size` located triples.
+std::vector<size_t> blocksToVacuum(
+    const ad_utility::HashMap<size_t, LocatedTriples>& map) {
+  size_t minimumBlockSize =
+      getRuntimeParameter<&RuntimeParameters::vacuumMinimumBlockSize_>();
+  return ::ranges::to_vector(
+      map | ql::views::filter([minimumBlockSize](const auto& e) {
+        return e.second.sizeUpperBound() >= minimumBlockSize;
+      }) |
+      ql::views::keys);
+}
+
 // Identify the triples to vacuum for a single block by comparing the
 // `locatedTriples` with the `idTable` of the block (which has no updates
 // applied).
@@ -433,14 +448,6 @@ VacuumStatistics processBlockForVacuum(
 TriplesToVacuum LocatedTriplesPerBlock::identifyTriplesToVacuum(
     const Permutation& perm,
     ad_utility::SharedCancellationHandle cancellationHandle) const {
-  size_t minimumBlockSize =
-      getRuntimeParameter<&RuntimeParameters::vacuumMinimumBlockSize_>();
-  auto blocksToVacuum = map_ |
-                        ql::views::filter([minimumBlockSize](const auto& e) {
-                          return e.second.sizeUpperBound() >= minimumBlockSize;
-                        }) |
-                        ql::views::keys;
-
   VacuumStatistics totalStats{0, 0, 0, 0};
   std::vector<IdTriple<0>> allDeletionsToRemove;
   std::vector<IdTriple<0>> allInsertionsToRemove;
@@ -456,7 +463,7 @@ TriplesToVacuum LocatedTriplesPerBlock::identifyTriplesToVacuum(
   const auto& blockMetadata = perm.metaData().blockData();
   AD_CORRECTNESS_CHECK(!blockMetadata.empty());
 
-  for (size_t blockIndex : blocksToVacuum) {
+  for (size_t blockIndex : blocksToVacuum(map_)) {
     AD_CORRECTNESS_CHECK(blockIndex <= blockMetadata.size());
     // This is one past the last block with index triples. This block always
     // only has updates but no index triples. Pass in an empty `IdTable`.
@@ -482,6 +489,56 @@ TriplesToVacuum LocatedTriplesPerBlock::identifyTriplesToVacuum(
 
   return {std::move(allDeletionsToRemove), std::move(allInsertionsToRemove),
           totalStats};
+}
+
+// ____________________________________________________________________________
+RowsToVacuum LocatedTriplesPerBlock::identifyRowsToVacuum(
+    const Permutation& perm,
+    ad_utility::SharedCancellationHandle cancellationHandle) const {
+  RowsToVacuum result{{}, {}, {0, 0, 0, 0}};
+  size_t numInsertions = 0;
+  size_t numDeletions = 0;
+  const size_t numColumns = 4 + numPayloadColumns_;
+  // Read the graph column and all payload columns.
+  std::vector<ColumnIndex> additionalColumns;
+  for (ColumnIndex col = ADDITIONAL_COLUMN_GRAPH_ID; col < numColumns; ++col) {
+    additionalColumns.push_back(col);
+  }
+  const auto& blockMetadata = perm.metaData().blockData();
+  for (size_t blockIndex : blocksToVacuum(map_)) {
+    AD_CORRECTNESS_CHECK(blockIndex <= blockMetadata.size());
+    // The block one past the last block only has updates, see
+    // `identifyTriplesToVacuum`.
+    IdTable block =
+        blockIndex == blockMetadata.size()
+            ? IdTable{numColumns, ad_utility::makeAllocatorWithLimit<Id>(0_B)}
+            : perm.reader().readBlockWithoutLocatedTriples(
+                  blockMetadata.at(blockIndex), additionalColumns);
+    // Both the located triples and the rows of the block are sorted by the
+    // full row and unique (the view is updatable).
+    auto rowIt = block.begin();
+    for (const LocatedTriple& lt : map_.at(blockIndex).getSortedView()) {
+      while (rowIt != block.end() && compareFullRow(lt, *rowIt) > 0) {
+        ++rowIt;
+      }
+      bool isInView = rowIt != block.end() && compareFullRow(lt, *rowIt) == 0;
+      (lt.insertOrDelete_ ? numInsertions : numDeletions)++;
+      // Inserting a row that is in the view or deleting a row that is not in
+      // the view has no effect.
+      if (lt.insertOrDelete_ == isInView) {
+        (lt.insertOrDelete_ ? result.insertionsToRemove_
+                            : result.deletionsToRemove_)
+            .push_back(lt);
+      }
+    }
+    cancellationHandle->throwIfCancelled();
+  }
+  auto& stats = result.stats_;
+  stats.numInsertionsRemoved_ = result.insertionsToRemove_.size();
+  stats.numDeletionsRemoved_ = result.deletionsToRemove_.size();
+  stats.numInsertionsKept_ = numInsertions - stats.numInsertionsRemoved_;
+  stats.numDeletionsKept_ = numDeletions - stats.numDeletionsRemoved_;
+  return result;
 }
 
 // ____________________________________________________________________________

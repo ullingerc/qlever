@@ -456,7 +456,8 @@ class MaterializedViewsManager {
   // Unload a materialized view if it is loaded and return `true`. Return
   // `false` (and do nothing else) if it is not loaded. It is `const` for the
   // same reason described above. The view is also unregistered from the
-  // `DeltaTriples` of `index_`, which drops its updates.
+  // `DeltaTriples` of `index_`, which drops its updates (also the persisted
+  // ones).
   bool unloadViewIfLoaded(const std::string& name) const;
 
   // Delete a materialized view: unload it if loaded and delete all of its files

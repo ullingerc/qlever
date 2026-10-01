@@ -2451,6 +2451,73 @@ TEST_F(MaterializedViewsTest, UpdateViewRows) {
 }
 
 // _____________________________________________________________________________
+TEST_F(MaterializedViewsTest, PersistAndVacuumViewRows) {
+  qlv().writeMaterializedView(
+      "upd",
+      "SELECT * { VALUES (?a ?b ?c ?d ?e ?f) { (1 1 1 1 1 1) (1 2 1 1 1 2) "
+      "(2 1 1 1 1 UNDEF) } }");
+  auto scanAll = [this]() {
+    return getQueryResultAsIdTable(
+        "PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/> "
+        "SELECT ?a ?b ?c ?d ?e ?f { SERVICE view:upd { _:config view:column-a "
+        "?a ; view:column-b ?b ; view:column-c ?c ; view:column-d ?d ; "
+        "view:column-e ?e ; view:column-f ?f . } }");
+  };
+  auto U = Id::makeUndefined();
+  auto expectedBefore = makeIdTableFromVector(
+      {{1, 1, 1, 1, 1, 1}, {1, 2, 1, 1, 1, 2}, {2, 1, 1, 1, 1, U}}, IntId);
+  auto expectedAfter = makeIdTableFromVector({{1, 1, 1, 1, 1, 1},
+                                              {1, 1, 1, 1, 1, 5},
+                                              {2, 1, 1, 1, 1, U},
+                                              {3, 1, 1, 1, 7, 8}},
+                                             IntId);
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+
+  // Insert two new rows and one that is already in the view, delete one row of
+  // the view and one that is not in the view (via the user-facing `modify`,
+  // which persists the updates).
+  qlv().indexAndViewsSnapshot()->index_.deltaTriplesManager().modify<void>(
+      [&handle](DeltaTriples& deltaTriples) {
+        deltaTriples.insertViewRows(
+            handle, "upd",
+            makeIdTableFromVector(
+                {{1, 1, 1, 1, 1, 5}, {3, 1, 1, 1, 7, 8}, {1, 1, 1, 1, 1, 1}},
+                IntId));
+        deltaTriples.deleteViewRows(
+            handle, "upd",
+            makeIdTableFromVector({{1, 2, 1, 1, 1, 2}, {9, 9, 9, 9, 9, 9}},
+                                  IntId));
+      });
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedAfter));
+
+  // Vacuuming removes the two redundant updates, but doesn't change the view.
+  auto cleanup =
+      setRuntimeParameterForTest<&RuntimeParameters::vacuumMinimumBlockSize_>(
+          size_t{0});
+  auto stats = qlv().vacuumDeltaTriples(handle);
+  EXPECT_EQ(stats["views"]["upd"]["insertionsRemoved"], 1);
+  EXPECT_EQ(stats["views"]["upd"]["deletionsRemoved"], 1);
+  EXPECT_EQ(stats["views"]["upd"]["insertionsKept"], 2);
+  EXPECT_EQ(stats["views"]["upd"]["deletionsKept"], 1);
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedAfter));
+
+  // After a restart, the (vacuumed) updates are restored when the view is
+  // loaded.
+  restartEngine();
+  qlv().loadMaterializedView("upd");
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedAfter));
+  stats = qlv().vacuumDeltaTriples(handle);
+  EXPECT_EQ(stats["views"]["upd"]["totalRemoved"], 0);
+  EXPECT_EQ(stats["views"]["upd"]["totalKept"], 3);
+
+  // Unloading the view drops its updates, also the persisted ones.
+  EXPECT_TRUE(qlv().unloadMaterializedView("upd"));
+  restartEngine();
+  qlv().loadMaterializedView("upd");
+  EXPECT_THAT(scanAll(), matchesIdTable(expectedBefore));
+}
+
+// _____________________________________________________________________________
 TEST(MaterializedViewWriter, checkForDuplicateRows) {
   // Run `checkForDuplicateRows` on the given blocks, check that the blocks are
   // passed through unchanged and return whether duplicates were found.

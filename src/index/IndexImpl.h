@@ -598,8 +598,9 @@ class IndexImpl {
   // Return the names of all files that belong to the index with the given base
   // name and currently exist on disk: the permutations and their metadata, the
   // vocabulary, the patterns, the configuration, the settings, the text index,
-  // and the persisted updates. Optional components that do not exist for the
-  // given index (e.g. the text index or the persisted updates) are omitted.
+  // and the persisted updates (including those of the materialized views).
+  // Optional components that do not exist for the given index (e.g. the text
+  // index or the persisted updates) are omitted.
   //
   // The following files are deliberately NOT included, even though they may
   // share the base name: the files of the materialized views (enumerated

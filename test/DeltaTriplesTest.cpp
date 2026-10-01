@@ -1368,18 +1368,28 @@ TEST_F(DeltaTriplesTest, addFromSnapshotDiffReanchorsLocalVocabEntries) {
 }
 #endif
 
+namespace {
+// A non-owning pointer to the given `permutation` of the `index`, which can be
+// registered as a fake materialized view.
+std::shared_ptr<const Permutation> nonOwningPermutation(
+    const IndexImpl& index, Permutation::Enum permutation) {
+  return {std::shared_ptr<void>{}, &index.getPermutation(permutation)};
+}
+}  // namespace
+
 // _____________________________________________________________________________
 TEST_F(DeltaTriplesTest, viewRows) {
   auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
   DeltaTriples deltaTriples(testQec->getIndex());
   const auto& index = testQec->getIndex().getImpl();
 
-  // Use the block metadata of the SPO permutation as the metadata of a fake
-  // view with six columns (two payload columns), where only the last column
-  // may be UNDEF.
-  auto metadata =
-      index.getPermutation(Permutation::SPO).metaData().blockDataShared();
-  deltaTriples.registerView("v", metadata, 2, {5});
+  // Use the SPO permutation as a fake view with six columns (two payload
+  // columns), where only the last column may be UNDEF.
+  auto spo = nonOwningPermutation(index, Permutation::SPO);
+  auto pso = nonOwningPermutation(index, Permutation::PSO);
+  auto maxNumBlocks = std::max(spo->metaData().blockData().size(),
+                               pso->metaData().blockData().size());
+  deltaTriples.registerView("v", spo, 2, {5});
 
   // Rows `<s> <p> <o> <g> payload1 payload2` with the IDs of `<a> <upp> <A>`.
   LocalVocab localVocabOutside;
@@ -1401,13 +1411,13 @@ TEST_F(DeltaTriplesTest, viewRows) {
 
   // Get all located rows of the view in the given state as pairs of the full
   // row and the `insertOrDelete_` flag.
-  auto locatedRows = [&metadata](const LocatedTriplesState& state) {
+  auto locatedRows = [maxNumBlocks](const LocatedTriplesState& state) {
     std::vector<std::pair<Row, bool>> result;
     auto lt = state.getLocatedTriplesForView("v");
     if (!lt.has_value()) {
       return result;
     }
-    for (size_t i = 0; i <= metadata->size(); ++i) {
+    for (size_t i = 0; i <= maxNumBlocks; ++i) {
       if (auto updates = lt->getUpdatesIfPresent(i)) {
         for (const auto& locatedTriple : updates->getSortedView()) {
           Row row{locatedTriple.triple_.ids().begin(),
@@ -1484,12 +1494,10 @@ TEST_F(DeltaTriplesTest, viewRows) {
 
   // Registering again with the same metadata keeps the updates, registering
   // with different metadata drops them.
-  deltaTriples.registerView("v", metadata, 2, {5});
+  deltaTriples.registerView("v", spo, 2, {5});
   EXPECT_EQ(current().size(), 4);
   auto v1 = version();
-  auto otherMetadata =
-      std::make_shared<const std::vector<CompressedBlockMetadata>>(*metadata);
-  deltaTriples.registerView("v", otherMetadata, 2, {5});
+  deltaTriples.registerView("v", pso, 2, {5});
   EXPECT_TRUE(current().empty());
   EXPECT_GT(version(), v1);
   EXPECT_TRUE(deltaTriples.views_.at("v").rowsInserted_.empty());
@@ -1517,4 +1525,208 @@ TEST_F(DeltaTriplesTest, viewRows) {
   auto v3 = version();
   deltaTriples.unregisterView("v");
   EXPECT_EQ(version(), v3);
+}
+
+namespace {
+// Convert the given `rows` to an `IdTable`.
+IdTable makeViewRows(const std::vector<std::vector<Id>>& rows) {
+  IdTable table{rows.empty() ? 4 : rows.front().size(),
+                ad_utility::makeUnlimitedAllocator<Id>()};
+  for (const auto& row : rows) {
+    table.push_back(row);
+  }
+  return table;
+}
+}  // namespace
+
+// _____________________________________________________________________________
+TEST_F(DeltaTriplesTest, viewRowsPersistence) {
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  const auto& index = testQec->getIndex().getImpl();
+  auto tmpFile =
+      ql::filesystem::temp_directory_path() / "testDeltaTriplesViewRows";
+  ql::filesystem::remove(tmpFile);
+  absl::Cleanup cleanup{[&tmpFile]() { ql::filesystem::remove(tmpFile); }};
+  // A fake view with six columns (two payload columns), see `viewRows`.
+  auto spo = nonOwningPermutation(index, Permutation::SPO);
+  auto pso = nonOwningPermutation(index, Permutation::PSO);
+
+  LocalVocab localVocabOutside;
+  auto [s, p, o, g] =
+      makeIdTriples(index, localVocabOutside, {"<a> <upp> <A>"})[0].ids();
+  auto I = ad_utility::testing::IntId;
+  auto U = Id::makeUndefined();
+  auto word = Id::makeFromLocalVocabIndex(
+      localVocabOutside.getIndexAndAddIfNotContained(
+          LocalVocabEntry::fromIriref("<notInVocab>",
+                                      index.getLocalVocabContext())));
+  std::vector<Id> r1{s, p, o, g, I(1), word};
+  std::vector<Id> r2{s, p, o, g, I(2), U};
+  std::vector<Id> r3{o, p, s, g, I(3), I(4)};
+
+  // Create `DeltaTriples` that persist to `tmpFile` and read from it.
+  auto makeDeltaTriples = [&index, &tmpFile]() {
+    auto deltaTriples = std::make_unique<DeltaTriples>(index);
+    deltaTriples->setPersists(tmpFile.string());
+    deltaTriples->readFromDisk();
+    return deltaTriples;
+  };
+  auto numLocatedRows = [](const DeltaTriples& deltaTriples) {
+    return deltaTriples.getLocatedTriplesSharedStateReference()
+        ->getLocatedTriplesForView("v")
+        ->numTriplesForTesting();
+  };
+
+  std::string viewFile;
+  {
+    auto deltaTriples = makeDeltaTriples();
+    viewFile = deltaTriples->viewFilename("v");
+    EXPECT_EQ(viewFile, absl::StrCat(tmpFile.string(), ".view.v"));
+    deltaTriples->registerView("v", spo, 2, {5});
+    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1, r2}));
+    deltaTriples->deleteViewRows(handle, "v", makeViewRows({r3}));
+    // Nothing is written before `writeToDisk`.
+    EXPECT_FALSE(ql::filesystem::exists(viewFile));
+    deltaTriples->writeToDisk();
+    EXPECT_TRUE(ql::filesystem::exists(viewFile));
+  }
+
+  // Unregistering a view that is not registered does not touch its file.
+  makeDeltaTriples()->unregisterView("v");
+  EXPECT_TRUE(ql::filesystem::exists(viewFile));
+
+  {
+    // The rows are restored when the view is registered.
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->registerView("v", spo, 2, {5});
+    const auto& view = deltaTriples->views_.at("v");
+    EXPECT_EQ(view.rowsInserted_.size(), 2);
+    EXPECT_EQ(view.rowsDeleted_.size(), 1);
+    EXPECT_TRUE(view.rowsInserted_.contains(r2));
+    EXPECT_TRUE(view.rowsDeleted_.contains(r3));
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 3);
+    // The local vocab entry is restored and managed by the local vocab of the
+    // `DeltaTriples`.
+    auto restoredWord =
+        deltaTriples->localVocab_.getIndexOrNullopt(LocalVocabEntry::fromIriref(
+            "<notInVocab>", index.getLocalVocabContext()));
+    ASSERT_TRUE(restoredWord.has_value());
+    EXPECT_TRUE(view.rowsInserted_.contains(std::vector<Id>{
+        s, p, o, g, I(1), Id::makeFromLocalVocabIndex(restoredWord.value())}));
+    // Registering again does not read the file again.
+    deltaTriples->registerView("v", spo, 2, {5});
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 3);
+
+    // When the view has no rows anymore (here: after `clear`), its file is
+    // removed.
+    deltaTriples->clear();
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
+    deltaTriples->writeToDisk();
+    EXPECT_FALSE(ql::filesystem::exists(viewFile));
+
+    // Unregistering the view removes its file.
+    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1}));
+    deltaTriples->writeToDisk();
+    EXPECT_TRUE(ql::filesystem::exists(viewFile));
+    deltaTriples->unregisterView("v");
+    EXPECT_FALSE(ql::filesystem::exists(viewFile));
+
+    // Write the rows again for the staleness checks below.
+    deltaTriples->registerView("v", spo, 2, {5});
+    deltaTriples->insertViewRows(handle, "v", makeViewRows({r1}));
+    deltaTriples->writeToDisk();
+    EXPECT_TRUE(ql::filesystem::exists(viewFile));
+  }
+
+  // A file that belongs to a different version of the view (here: different
+  // block metadata, or a different number of columns) is discarded.
+  for (auto [permutation, numPayloadColumns] :
+       {std::pair{pso, size_t{2}}, std::pair{spo, size_t{1}}}) {
+    {
+      auto deltaTriples = makeDeltaTriples();
+      deltaTriples->registerView("v", spo, 2, {5});
+      EXPECT_EQ(numLocatedRows(*deltaTriples), 1);
+      deltaTriples->writeToDisk();
+    }
+    auto deltaTriples = makeDeltaTriples();
+    deltaTriples->registerView("v", permutation, numPayloadColumns, {});
+    EXPECT_EQ(numLocatedRows(*deltaTriples), 0);
+    EXPECT_FALSE(ql::filesystem::exists(viewFile));
+    // Restore the file for the next iteration.
+    auto other = makeDeltaTriples();
+    other->registerView("v", spo, 2, {5});
+    other->insertViewRows(handle, "v", makeViewRows({r1}));
+    other->writeToDisk();
+  }
+  ql::filesystem::remove(viewFile);
+}
+
+// _____________________________________________________________________________
+TEST_F(DeltaTriplesTest, vacuumViewRows) {
+  auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
+  const auto& index = testQec->getIndex().getImpl();
+  DeltaTriples deltaTriples(testQec->getIndex());
+  // A fake view with the four columns of the SPO permutation (no payload
+  // columns), so that the rows of the view are the triples of the index.
+  deltaTriples.registerView("v", nonOwningPermutation(index, Permutation::SPO),
+                            0, {});
+  LocalVocab localVocab;
+  auto toRow = [&](const std::string& turtle) {
+    auto ids = makeIdTriples(index, localVocab, {turtle})[0].ids();
+    return std::vector<Id>(ids.begin(), ids.end());
+  };
+  auto inView1 = toRow("<a> <upp> <A>");
+  auto inView2 = toRow("<b> <upp> <B>");
+  auto notInView1 = toRow("<a> <upp> <newval>");
+  auto notInView2 = toRow("<X> <Y> <Z>");
+  deltaTriples.insertViewRows(handle, "v", makeViewRows({inView1, notInView1}));
+  deltaTriples.deleteViewRows(handle, "v", makeViewRows({inView2, notInView2}));
+  // Also some main triples, which are vacuumed independently.
+  deltaTriples.insertTriples(
+      handle, makeIdTriples(index, localVocab, {"<a> <upp> <A>"}));
+  const auto& view = deltaTriples.views_.at("v");
+  auto numLocatedRows = [&deltaTriples]() {
+    return deltaTriples.getLocatedTriplesSharedStateReference()
+        ->getLocatedTriplesForView("v")
+        ->numTriplesForTesting();
+  };
+  EXPECT_EQ(numLocatedRows(), 4);
+
+  // No block is large enough to be vacuumed.
+  {
+    auto cleanup =
+        setRuntimeParameterForTest<&RuntimeParameters::vacuumMinimumBlockSize_>(
+            size_t{1'000});
+    auto result = deltaTriples.vacuum(handle);
+    EXPECT_EQ(result["views"]["v"]["totalRemoved"], 0);
+    EXPECT_EQ(result["views"]["v"]["totalKept"], 0);
+    EXPECT_EQ(numLocatedRows(), 4);
+  }
+
+  auto cleanup =
+      setRuntimeParameterForTest<&RuntimeParameters::vacuumMinimumBlockSize_>(
+          size_t{0});
+  auto result = deltaTriples.vacuum(handle);
+  EXPECT_EQ(result["views"]["v"]["insertionsRemoved"], 1);
+  EXPECT_EQ(result["views"]["v"]["deletionsRemoved"], 1);
+  EXPECT_EQ(result["views"]["v"]["insertionsKept"], 1);
+  EXPECT_EQ(result["views"]["v"]["deletionsKept"], 1);
+  EXPECT_EQ(result["external"]["insertionsRemoved"], 1);
+  EXPECT_EQ(numLocatedRows(), 2);
+  EXPECT_THAT(view.rowsInserted_, ::testing::ElementsAre(notInView1));
+  EXPECT_THAT(view.rowsDeleted_, ::testing::ElementsAre(inView2));
+  auto lt = deltaTriples.getLocatedTriplesSharedStateReference()
+                ->getLocatedTriplesForView("v");
+  EXPECT_TRUE(
+      lt->isLocatedTriple(IdTriple<0>{std::array{notInView1[0], notInView1[1],
+                                                 notInView1[2], notInView1[3]}},
+                          true));
+  EXPECT_TRUE(lt->isLocatedTriple(
+      IdTriple<0>{std::array{inView2[0], inView2[1], inView2[2], inView2[3]}},
+      false));
+
+  // Vacuuming again doesn't change anything.
+  result = deltaTriples.vacuum(handle);
+  EXPECT_EQ(result["views"]["v"]["totalRemoved"], 0);
+  EXPECT_EQ(result["views"]["v"]["totalKept"], 2);
 }

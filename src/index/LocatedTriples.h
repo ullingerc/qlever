@@ -147,6 +147,14 @@ using SortedLocatedTriplesVector =
 
 using LocatedTriples = SortedLocatedTriplesVector;
 
+// Located rows of a materialized view identified for removal during a vacuum
+// operation, see `LocatedTriplesPerBlock::identifyRowsToVacuum`.
+struct RowsToVacuum {
+  std::vector<LocatedTriple> deletionsToRemove_;
+  std::vector<LocatedTriple> insertionsToRemove_;
+  VacuumStatistics stats_;
+};
+
 // Sorted sets of located triples, grouped by block. We use this to store all
 // located triples for a permutation.
 class LocatedTriplesPerBlock {
@@ -324,6 +332,14 @@ class LocatedTriplesPerBlock {
   // triples are then returned as `SPO`. Depending on the updates different
   // permutations may be more or less effective.
   TriplesToVacuum identifyTriplesToVacuum(
+      const Permutation& perm,
+      ad_utility::SharedCancellationHandle cancellationHandle) const;
+
+  // Like `identifyTriplesToVacuum`, but for the permutation `perm` of a
+  // materialized view: the full rows (key and payload) are compared, and the
+  // redundant located triples are returned as they are (the key order of a
+  // view is the identity).
+  RowsToVacuum identifyRowsToVacuum(
       const Permutation& perm,
       ad_utility::SharedCancellationHandle cancellationHandle) const;
 

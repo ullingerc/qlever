@@ -1827,7 +1827,8 @@ TEST(IndexImpl, allIndexFilesAreListed) {
   std::string settings = absl::StrCat(base, SETTINGS_FILE_SUFFIX);
   std::string updates = absl::StrCat(base, UPDATE_TRIPLES_SUFFIX);
   std::string graphs = absl::StrCat(base, ALLOCATED_GRAPHS_SUFFIX);
-  for (const auto& f : {settings, updates, graphs}) {
+  std::string viewUpdates = absl::StrCat(updates, VIEW_FILE_INFIX, "myView");
+  for (const auto& f : {settings, updates, graphs, viewUpdates}) {
     touch(f);
   }
   // Files that share the base name but are NOT index files; they must not be
@@ -1861,7 +1862,7 @@ TEST(IndexImpl, allIndexFilesAreListed) {
            absl::StrCat(base, ".index.pso"),
            absl::StrCat(base, ".index.pso.meta"),
            absl::StrCat(base, QLEVER_INTERNAL_INDEX_INFIX, ".index.pso"),
-           settings, updates, graphs}));
+           settings, updates, graphs, viewUpdates}));
   // At least one vocabulary file is listed (the exact set depends on the
   // vocabulary type).
   EXPECT_TRUE(ql::ranges::any_of(listed, [](const std::string& f) {

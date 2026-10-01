@@ -107,6 +107,8 @@ class DeltaTriples {
   FRIEND_TEST(DeltaTriplesTest, addTriplesToLocalVocab);
   FRIEND_TEST(DeltaTriplesTest, storeAndRestoreData);
   FRIEND_TEST(DeltaTriplesTest, viewRows);
+  FRIEND_TEST(DeltaTriplesTest, viewRowsPersistence);
+  FRIEND_TEST(DeltaTriplesTest, vacuumViewRows);
 
  public:
   using Triples = std::vector<IdTriple<0>>;
@@ -190,6 +192,12 @@ class DeltaTriples {
   struct ViewState {
     // The original block metadata of the view's permutation.
     std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata_;
+    // The view's permutation, required by `vacuum`.
+    std::shared_ptr<const Permutation> permutation_;
+    // A cheap identity of the view (see `viewIdentity` in `DeltaTriples.cpp`),
+    // which is persisted together with the rows to detect that a view was
+    // rewritten while the server was not running.
+    std::vector<Id> identity_;
     // The columns that may contain UNDEF values.
     ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns_;
     // The full rows (all columns) inserted into and deleted from the view, with
@@ -228,7 +236,9 @@ class DeltaTriples {
   // Remove redundant insertions (triples already in the index) and redundant
   // deletions (triples not in the index). The triples to be removed are taken
   // from the blocks in PSO that have at least `vacuum-minimum-block-size`
-  // triples. Returns aggregated statistics.
+  // triples. The same is done for the rows of all registered materialized
+  // views. Returns aggregated statistics (`external`, `internal`, and
+  // `views`, which maps the name of each registered view to its statistics).
   nlohmann::json vacuum(
       ad_utility::SharedCancellationHandle cancellationHandle);
 
@@ -292,22 +302,25 @@ class DeltaTriples {
           ad_utility::timer::DEFAULT_TIME_TRACER);
 
   // Register the materialized view with the given `name` for updates. The
-  // view's located rows are tracked using the original block `metadata` of its
-  // permutation. Inserted and deleted rows must have `4 + numPayloadColumns`
+  // view's located rows are tracked using the original block metadata of its
+  // `permutation`. Inserted and deleted rows must have `4 + numPayloadColumns`
   // columns and may contain UNDEF only in the `possiblyUndefinedColumns`. If
-  // the view is already registered with the same `metadata`, nothing happens;
+  // the view is already registered with the same metadata, nothing happens;
   // otherwise the old registration (including its updates) is replaced.
   //
-  // NOTE: The rows of views are not persisted by `writeToDisk` and not counted
+  // If the updates are persisted (see `setPersists`), `writeToDisk` writes the
+  // rows of each registered view to the file `viewFilename(name)`, and a fresh
+  // registration reads them back from there (unless the view has changed in
+  // the meantime, then the file is deleted). The rows of views are not counted
   // by `getCounts`.
-  void registerView(
-      const std::string& name,
-      std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata,
-      size_t numPayloadColumns,
-      ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns);
+  void registerView(const std::string& name,
+                    std::shared_ptr<const Permutation> permutation,
+                    size_t numPayloadColumns,
+                    ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns);
 
   // Unregister the materialized view with the given `name` and drop all its
-  // updates. Does nothing if the view is not registered.
+  // updates (also the persisted ones). Does nothing if the view is not
+  // registered.
   void unregisterView(const std::string& name);
 
   // Insert/delete full `rows` into/from the registered materialized view with
@@ -337,6 +350,10 @@ class DeltaTriples {
 
   // Read the delta triples from disk to restore them after a restart.
   void readFromDisk();
+
+  // The file to which the rows of the materialized view with the given `name`
+  // are persisted. Requires `persists()`.
+  std::string viewFilename(const std::string& name) const;
 
   // Return a deep copy of the `LocatedTriples` and the corresponding
   // `LocalVocab` which form an unchanging snapshot of the current state of
@@ -434,6 +451,10 @@ class DeltaTriples {
   void modifyTriplesImpl(CancellationHandle cancellationHandle, Triples triples,
                          ad_utility::timer::TimeTracer& tracer =
                              ad_utility::timer::DEFAULT_TIME_TRACER);
+
+  // Read the persisted rows of the freshly registered materialized view with
+  // the given `name`, see `registerView`.
+  void readViewFromDisk(const std::string& name);
 
   // Like `modifyTriplesImpl`, but for the full `rows` of the registered
   // materialized view with the given `name`.

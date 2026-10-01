@@ -580,8 +580,9 @@ void MaterializedViewsManager::withDeltaTriples(
     function(nullptr);
     return;
   }
-  // The updates of views are not persisted, and registering or unregistering
-  // a view does not change the metadata of any other permutation.
+  // Registering or unregistering a view reads or deletes its persisted updates
+  // directly (see `DeltaTriples::registerView`), so nothing has to be written,
+  // and it does not change the metadata of any other permutation.
   index_->deltaTriplesManager().modify<void>(
       [&function](DeltaTriples& deltaTriples) { function(&deltaTriples); },
       false, false);
@@ -607,9 +608,8 @@ void MaterializedViewsManager::loadView(
         possiblyUndefinedColumns.insert(col);
       }
     }
-    deltaTriples->registerView(
-        name, view->permutation()->metaData().blockDataShared(), numColumns - 4,
-        std::move(possiblyUndefinedColumns));
+    deltaTriples->registerView(name, view->permutation(), numColumns - 4,
+                               std::move(possiblyUndefinedColumns));
   });
 }
 

@@ -19,6 +19,7 @@
 #include "backports/filesystem.h"
 #include "engine/ExecuteUpdate.h"
 #include "engine/ExportQueryExecutionTrees.h"
+#include "global/MaterializedViewConstants.h"
 #include "index/ExportIds.h"
 #include "index/Index.h"
 #include "index/IndexImpl.h"
@@ -177,6 +178,27 @@ nlohmann::json DeltaTriples::vacuum(
   nlohmann::json result = nlohmann::json::object();
   auto [removeExternal, externalStats] = identifyTriplesToVacuum(vi<false>);
   auto [removeInternal, internalStats] = identifyTriplesToVacuum(vi<true>);
+  std::vector<std::pair<std::string, RowsToVacuum>> viewRowsToVacuum;
+  for (const auto& [name, view] : views_) {
+    viewRowsToVacuum.emplace_back(
+        name,
+        locatedTriples_->viewLocatedTriples_.at(name).identifyRowsToVacuum(
+            *view.permutation_, cancellationHandle));
+  }
+  // Remove the located `rows` from the view with the given `name` and from its
+  // `rowSet` (`rowsInserted_` or `rowsDeleted_`).
+  auto removeViewRows = [this](const std::string& name,
+                               std::vector<LocatedTriple>& rows,
+                               ViewState::RowSet& rowSet) {
+    // `LocatedTriplesPerBlock::erase` requires a sorted input.
+    ql::ranges::sort(rows, {}, LocatedTriplesProjection{});
+    locatedTriples_->viewLocatedTriples_.at(name).erase(rows);
+    for (const auto& lt : rows) {
+      std::vector<Id> row{lt.triple_.ids().begin(), lt.triple_.ids().end()};
+      row.insert(row.end(), lt.payload_.begin(), lt.payload_.end());
+      AD_CORRECTNESS_CHECK(rowSet.erase(row) == 1);
+    }
+  };
 
   // For a consistent state this block must be executed fully.
   // CancellationHandle's must be ignored inside this block.
@@ -186,6 +208,15 @@ nlohmann::json DeltaTriples::vacuum(
 
     removeInternal();
     result["internal"] = internalStats;
+
+    result["views"] = nlohmann::json::object();
+    for (auto& [name, rowsToVacuum] : viewRowsToVacuum) {
+      auto& view = views_.at(name);
+      removeViewRows(name, rowsToVacuum.deletionsToRemove_, view.rowsDeleted_);
+      removeViewRows(name, rowsToVacuum.insertionsToRemove_,
+                     view.rowsInserted_);
+      result["views"][name] = rowsToVacuum.stats_;
+    }
   }
 
   return result;
@@ -386,12 +417,39 @@ template void
 DeltaTriples::deleteInternalTriplesForTesting<DeltaTriples::Consolidate::No>(
     CancellationHandle, Triples, ad_utility::timer::TimeTracer&);
 
+namespace {
+// A cheap identity of a materialized view with the given block `metadata` and
+// `numColumns`: the number of columns, blocks, and rows, and the first and last
+// triple. Two different versions of a view (written with the same name) are
+// very unlikely to have the same identity.
+std::vector<Id> viewIdentity(
+    const std::vector<CompressedBlockMetadata>& metadata, size_t numColumns) {
+  auto I = [](size_t value) {
+    return Id::makeFromInt(static_cast<int64_t>(value));
+  };
+  size_t numRows = 0;
+  for (const auto& block : metadata) {
+    numRows += block.numRows_;
+  }
+  std::vector<Id> identity{I(numColumns), I(metadata.size()), I(numRows)};
+  if (!metadata.empty()) {
+    for (const auto& t :
+         {metadata.front().firstTriple_, metadata.back().lastTriple_}) {
+      identity.insert(identity.end(),
+                      {t.col0Id_, t.col1Id_, t.col2Id_, t.graphId_});
+    }
+  }
+  return identity;
+}
+}  // namespace
+
 // ____________________________________________________________________________
 void DeltaTriples::registerView(
-    const std::string& name,
-    std::shared_ptr<const std::vector<CompressedBlockMetadata>> metadata,
+    const std::string& name, std::shared_ptr<const Permutation> permutation,
     size_t numPayloadColumns,
     ad_utility::HashSet<ColumnIndex> possiblyUndefinedColumns) {
+  AD_CONTRACT_CHECK(permutation != nullptr);
+  auto metadata = permutation->metaData().blockDataShared();
   AD_CONTRACT_CHECK(metadata != nullptr);
   if (auto it = views_.find(name);
       it != views_.end() && it->second.metadata_ == metadata) {
@@ -406,10 +464,69 @@ void DeltaTriples::registerView(
   locatedRows.setNumPayloadColumns(numPayloadColumns);
   locatedRows.setOriginalMetadata(metadata);
   locatedTriples_->viewLocatedTriples_.emplace(name, std::move(locatedRows));
-  views_.emplace(
-      name,
-      ViewState{
-          std::move(metadata), std::move(possiblyUndefinedColumns), {}, {}});
+  auto identity = viewIdentity(*metadata, 4 + numPayloadColumns);
+  views_.emplace(name, ViewState{std::move(metadata),
+                                 std::move(permutation),
+                                 std::move(identity),
+                                 std::move(possiblyUndefinedColumns),
+                                 {},
+                                 {}});
+  readViewFromDisk(name);
+}
+
+// ____________________________________________________________________________
+void DeltaTriples::readViewFromDisk(const std::string& name) {
+  if (!filenameForPersisting_.has_value()) {
+    return;
+  }
+  auto filename = viewFilename(name);
+  auto [vocab, idRanges] =
+      ad_utility::deserializeIds(filename, index_.getLocalVocabContext());
+  if (idRanges.empty()) {
+    return;
+  }
+  AD_CORRECTNESS_CHECK(idRanges.size() == 3);
+  if (idRanges.at(2) != views_.at(name).identity_) {
+    AD_LOG_WARN << "The persisted updates of the materialized view \"" << name
+                << "\" belong to a different version of the view and are "
+                   "discarded"
+                << std::endl;
+    ql::filesystem::remove(filename);
+    return;
+  }
+  auto& locatedRows = locatedTriples_->viewLocatedTriples_.at(name);
+  size_t numColumns = 4 + locatedRows.numPayloadColumns();
+  auto toRows = [numColumns](const std::vector<Id>& ids) {
+    AD_CORRECTNESS_CHECK(ids.size() % numColumns == 0);
+    IdTable rows{numColumns, ad_utility::makeUnlimitedAllocator<Id>()};
+    rows.resize(ids.size() / numColumns);
+    for (size_t i = 0; i < rows.numRows(); ++i) {
+      for (size_t col = 0; col < numColumns; ++col) {
+        rows(i, col) = ids[i * numColumns + col];
+      }
+    }
+    return rows;
+  };
+  auto cancellationHandle =
+      std::make_shared<CancellationHandle::element_type>();
+  insertViewRows<Consolidate::No>(cancellationHandle, name,
+                                  toRows(idRanges.at(1)));
+  deleteViewRows<Consolidate::No>(cancellationHandle, name,
+                                  toRows(idRanges.at(0)));
+  locatedRows.consolidateAllBlocks();
+  // The registration doesn't update the metadata (see
+  // `MaterializedViewsManager::withDeltaTriples`), so do it here.
+  locatedRows.updateAugmentedMetadata();
+  AD_LOG_INFO << "Done, #inserted rows = " << idRanges.at(1).size() / numColumns
+              << ", #deleted rows = " << idRanges.at(0).size() / numColumns
+              << std::endl;
+}
+
+// ____________________________________________________________________________
+std::string DeltaTriples::viewFilename(const std::string& name) const {
+  // NOTE: The `name` is safe to use in a filename, because the names of
+  // materialized views are checked by `MaterializedView::throwIfInvalidName`.
+  return absl::StrCat(filenameForPersisting_.value(), VIEW_FILE_INFIX, name);
 }
 
 // ____________________________________________________________________________
@@ -422,6 +539,9 @@ void DeltaTriples::unregisterView(const std::string& name) {
   // don't touch the `index_` to not needlessly invalidate the query cache.
   if (!it->second.isEmpty()) {
     locatedTriples_->index_++;
+  }
+  if (filenameForPersisting_.has_value()) {
+    ql::filesystem::remove(viewFilename(name));
   }
   locatedTriples_->viewLocatedTriples_.erase(it);
   views_.erase(name);
@@ -847,6 +967,27 @@ void DeltaTriples::writeToDisk() const {
       std::array{toRange(triplesSetsNormal_.triplesDeleted_),
                  toRange(triplesSetsNormal_.triplesInserted_)});
   ql::filesystem::rename(tempPath, filenameForPersisting_.value());
+
+  // NOTE: This rewrites the file of every registered view (including the whole
+  // `localVocab_`) on every write, like for the triples above. Only writing the
+  // changed views would be cheaper.
+  for (const auto& [name, view] : views_) {
+    auto filename = viewFilename(name);
+    if (view.rowsInserted_.empty() && view.rowsDeleted_.empty()) {
+      ql::filesystem::remove(filename);
+      continue;
+    }
+    auto flatten = [](const ViewState::RowSet& rows) {
+      return ::ranges::to_vector(rows | ql::views::join);
+    };
+    ql::filesystem::path tempViewPath = filename;
+    tempViewPath += ".tmp";
+    ad_utility::serializeIds(
+        tempViewPath, localVocab_,
+        std::array{flatten(view.rowsDeleted_), flatten(view.rowsInserted_),
+                   view.identity_});
+    ql::filesystem::rename(tempViewPath, filename);
+  }
 }
 
 // _____________________________________________________________________________

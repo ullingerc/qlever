@@ -107,6 +107,14 @@ class MaterializedViewsTest : public ::testing::Test {
   void SetUp() override {
     logStreamCleanup_.emplace(setGlobalLoggingStreamForTesting(&log_));
     makeTestIndex(testIndexBase_, getDummyTurtle());
+    restartEngine();
+  }
+
+  // ___________________________________________________________________________
+  // Create a new engine for the index on disk (destroying the current one), for
+  // example to check that persisted updates are restored.
+  void restartEngine() {
+    qlv_ = nullptr;
     qlever::EngineConfig config;
     config.baseName_ = testIndexBase_;
     qlv_ = std::make_shared<qlever::Qlever>(config);
