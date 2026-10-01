@@ -94,13 +94,13 @@ void MaterializedViewWriter::throwIfOrderByInconsistentWithViewOrder() const {
   if (parsedQuery_._isInternalSort == IsInternalSort::False) {
     throw MaterializedViewConfigException(
         "The query to write a materialized view may not contain an `ORDER BY` "
-        "clause. A view is always stored in the internal order of its first "
-        "three columns, so the `ORDER BY` clause's sorting would be silently "
+        "clause. A view is always stored in the internal order of all its "
+        "columns, so the `ORDER BY` clause's sorting would be silently "
         "dropped.");
   }
 
   // The user has explicitly written `INTERNAL SORT BY`. This is fine if the
-  // sorting is a prefix of the view's SPO sorting.
+  // sorting is a prefix of the view's sorting by all columns.
   auto isConsistentWithViewOrder = [&]() {
     // Sort keys beyond the view's columns cannot correspond to view columns,
     // so their requested order could not be guaranteed.
@@ -317,6 +317,9 @@ MaterializedViewWriter::RangeOfIdTables MaterializedViewWriter::getSortedBlocks(
   bool isAlreadySorted = ql::ranges::equal(
       resultSortedBy | ql::views::take(columnPermutation_.size()),
       columnPermutation_);
+  // TODO<ullingerc> A result that is sorted only by a prefix of the view's
+  // columns could be sorted per run of equal prefix instead of using a full
+  // external sort.
 
   // Either call the version that only permutes the correctly sorted blocks or
   // the version that sorts them.

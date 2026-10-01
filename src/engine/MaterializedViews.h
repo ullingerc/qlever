@@ -76,7 +76,7 @@ class MaterializedViewWriter {
   using RangeOfIdTables = ad_utility::InputRangeTypeErased<IdTableStatic<0>>;
   // Comparator on all columns (not only SPO), such that the order of the rows
   // in the view is unique up to duplicates.
-  using Comparator = SortAllColumns;
+  using Comparator = SortText;
   // Sorter for the view's rows with a dynamic number of columns (template
   // argument `NumStaticCols == 0`)
   using Sorter = ad_utility::CompressedExternalIdTableSorter<Comparator, 0>;
@@ -99,9 +99,9 @@ class MaterializedViewWriter {
   // silently discarded when writing the view and is therefore also rejected.
   void throwIfOrderByInconsistentWithViewOrder() const;
 
-  // Called from the constructor. A view is always re-sorted into SPO order for
-  // on-disk storage, so a `LIMIT`/`OFFSET` in the defining query would not even
-  // consistently determine which rows end up in the view. It is therefore
+  // Called from the constructor. A view is always re-sorted by all its columns
+  // for on-disk storage, so a `LIMIT`/`OFFSET` in the defining query would not
+  // even consistently determine which rows end up in the view. It is therefore
   // rejected. If the user wants to circumvent this, they can use an explicit
   // subquery.
   void throwIfLimitOffset() const;
