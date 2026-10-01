@@ -569,13 +569,13 @@ TEST_F(MaterializedViewsTest, InvalidInputToWriter) {
                              "may not contain a `LIMIT` or `OFFSET` clause");
 
   // An explicit `ORDER BY` clause is always rejected, because a view is
-  // always stored in the internal order of its first three columns.
+  // always stored in the internal order of all its columns.
   expectWriteViewToDiskError(simpleWriteQuery_ + " ORDER BY ?p",
                              "may not contain an `ORDER BY` clause");
   expectWriteViewToDiskError(simpleWriteQuery_ + " ORDER BY DESC(?s)",
                              "may not contain an `ORDER BY` clause");
 
-  // An `INTERNAL SORT BY` inconsistent with the view's SPO order is rejected.
+  // An `INTERNAL SORT BY` inconsistent with the view's order is rejected.
   expectWriteViewToDiskError(simpleWriteQuery_ + " INTERNAL SORT BY ?p",
                              "must be a prefix of the view's columns");
   expectWriteViewToDiskError(
@@ -2251,10 +2251,10 @@ TEST(MaterializedViewsManager, viewFilesOnDisk) {
 }
 
 // _____________________________________________________________________________
-TEST(ExternalSortFunctors, SortAllColumns) {
+TEST(ExternalSortFunctors, SortText) {
   auto t = makeIdTableFromVector(
       {{1, 2, 3, 4, 5}, {1, 2, 3, 4, 6}, {1, 2, 3, 5, 0}, {1, 2, 3, 4, 5}});
-  SortAllColumns cmp;
+  SortText cmp;
   // Rows differing only in column 4 or 3.
   EXPECT_TRUE(cmp(t[0], t[1]));
   EXPECT_FALSE(cmp(t[1], t[0]));
