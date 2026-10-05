@@ -205,8 +205,11 @@ TEST(AsyncIdTablePusher, exceptionInSink) {
 // _____________________________________________________________________________
 TEST(AsyncIdTablePusher, completionHandlerRunsOnItsExecutor) {
   auto alloc = ad_utility::testing::makeAllocator();
-  net::thread_pool pool{2};
+  // `handlerPool` has to outlive `pool`: a thread of `pool` posts the handler
+  // to `handlerPool` and may still be inside that post when `future.get()`
+  // returns. Destroying `pool` first joins that thread.
   net::thread_pool handlerPool{1};
+  net::thread_pool pool{2};
   Pusher pusher{pool.get_executor(), 1, 4, alloc, [](IdTableStatic<0>) {}};
   auto table = createRandomlyFilledIdTable(10, 1);
   auto handlerExecutor = handlerPool.get_executor();
