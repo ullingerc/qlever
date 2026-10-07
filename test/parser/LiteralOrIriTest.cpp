@@ -1,7 +1,13 @@
-// Copyright 2023 - 2024, University of Freiburg
-// Chair of Algorithms and Data Structures
-// Authors: Benedikt Maria Beckermann <benedikt.beckermann@dagstuhl.de>
-//          Hannah Bast <bast@cs.uni-freiburg.de>
+// Copyright 2023 - 2026 The QLever Authors, in particular:
+//
+// 2023        Benedikt Maria Beckermann <benedikt.beckermann@dagstuhl.de>
+// 2023 - 2026 Hannah Bast <bast@cs.uni-freiburg.de>, UFR
+// 2026        Johannes Kalmbach <kalmbach@cs.uni-freiburg.de>, UFR
+
+// UFR = University of Freiburg, Chair of Algorithms and Data Structures
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -14,15 +20,14 @@
 #include "rdfTypes/Iri.h"
 #include "rdfTypes/Literal.h"
 #include "util/HashSet.h"
+#include "util/ParsedUri.h"
 
 namespace {
 
 using namespace ad_utility::triple_component;
-using Iri = ad_utility::triple_component::Iri;
-using Literal = ad_utility::triple_component::Literal;
 constexpr std::string_view myDatatype =
     "http://www.w3.org/2001/XMLSchema#myDatatype";
-std::string myDatatypeWithBrackets = absl::StrCat("<", myDatatype, ">");
+const std::string myDatatypeWithBrackets = absl::StrCat("<", myDatatype, ">");
 
 // _____________________________________________________________________________
 TEST(IriTest, IriCreation) {
@@ -33,35 +38,64 @@ TEST(IriTest, IriCreation) {
 }
 
 // _____________________________________________________________________________
-TEST(IriTest, getBaseIri) {
-  // Helper lambda that calls `Iri::getBaseIri` and returns the result as a
-  // string (including the angle brackets).
-  auto getBaseIri = [](std::string_view iriSv, bool domainOnly) {
-    return Iri::fromIriref(iriSv)
-        .getBaseIri(domainOnly)
-        .toStringRepresentation();
+TEST(IriTest, fromIrirefOwnedString) {
+  // Whether or not the input has to be unescaped, the overload for owned
+  // strings yields the same result as the one for `std::string_view`.
+  for (std::string_view input : {"<http://www.wikidata.org/entity/Q3138>",
+                                 R"(<http://example.org/\u0061>)"}) {
+    EXPECT_EQ(Iri::fromIriref(std::string{input}), Iri::fromIriref(input));
+  }
+  // If the input is an owned string with nothing to unescape, it is moved into
+  // the `Iri` instead of being copied. Note that the string is long enough to
+  // be stored on the heap, so moving it preserves the address of its data.
+  std::string input = "<http://www.wikidata.org/entity/Q3138>";
+  const char* data = input.data();
+  std::string representation =
+      Iri::fromIriref(std::move(input)).toStringRepresentation();
+  EXPECT_EQ(representation.data(), data);
+  // An lvalue `std::string` is not moved from, but takes the `std::string_view`
+  // overload.
+  std::string lvalue = "<http://www.wikidata.org/entity/Q3139>";
+  std::string copied = Iri::fromIriref(lvalue).toStringRepresentation();
+  EXPECT_EQ(copied, lvalue);
+  EXPECT_NE(copied.data(), lvalue.data());
+}
+
+// _____________________________________________________________________________
+TEST(IriTest, fromLangtag) {
+  EXPECT_EQ(Iri::fromLangtag("en").toStringRepresentation(),
+            "<http://qlever.cs.uni-freiburg.de/builtin-functions/@en>");
+  EXPECT_NE(Iri::fromLangtag("en"), Iri::fromLangtag("de"));
+}
+
+// _____________________________________________________________________________
+TEST(IriTest, fromIrirefValidated) {
+  // Valid IRI references are accepted and behave like `fromIriref`.
+  EXPECT_EQ(Iri::fromIrirefValidated("<http://www.wikidata.org/entity/Q3138>"),
+            Iri::fromIriref("<http://www.wikidata.org/entity/Q3138>"));
+  // The empty body `<>` is a valid `IRIREF`.
+  EXPECT_NO_THROW(Iri::fromIrirefValidated("<>"));
+  EXPECT_NO_THROW(Iri::fromIrirefValidated("<urn:foo>"));
+
+  // Invalid inputs throw with a descriptive message.
+  auto expectInvalid = [](std::string_view input) {
+    AD_EXPECT_THROW_WITH_MESSAGE(
+        Iri::fromIrirefValidated(input),
+        ::testing::HasSubstr("not a valid IRI reference"));
   };
-  // IRI with path.
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org/uniprot/>", false),
-            "<http://purl.uniprot.org/uniprot/>");
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org/uniprot>", false),
-            "<http://purl.uniprot.org/uniprot/>");
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org/uniprot/>", true),
-            "<http://purl.uniprot.org/>");
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org/uniprot>", true),
-            "<http://purl.uniprot.org/>");
-  // IRI with domain only.
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org/>", false),
-            "<http://purl.uniprot.org/>");
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org>", false),
-            "<http://purl.uniprot.org/>");
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org/>", true),
-            "<http://purl.uniprot.org/>");
-  EXPECT_EQ(getBaseIri("<http://purl.uniprot.org>", true),
-            "<http://purl.uniprot.org/>");
-  // IRI without scheme.
-  EXPECT_EQ(getBaseIri("<blabla>", false), "<blabla/>");
-  EXPECT_EQ(getBaseIri("<blabla>", true), "<blabla/>");
+  // Missing brackets.
+  expectInvalid("http://example.org");
+  expectInvalid("<http://example.org");
+  expectInvalid("http://example.org>");
+  // Forbidden characters inside the brackets.
+  expectInvalid("<http://example.org/a b>");   // space
+  expectInvalid("<http://example.org/a\"b>");  // double quote
+  expectInvalid("<http://example.org/a{b}>");  // braces
+  expectInvalid("<http://example.org/a\\b>");  // backslash
+  expectInvalid("<http://example.org/a^b>");   // caret
+  expectInvalid("<http://example.org/a`b>");   // backtick
+  // The internal `@lang@`-prefixed format is deliberately rejected.
+  expectInvalid("@en@<http://example.org>");
 }
 
 // _____________________________________________________________________________
@@ -72,35 +106,121 @@ TEST(IriTest, emptyIri) {
 
 // _____________________________________________________________________________
 TEST(IriTest, fromIrirefConsiderBase) {
-  // Helper lambda that calls `Iri::fromIrirefConsiderBase` with the two base
-  // IRIs and returns the results as a string (including the angle brackets).
-  Iri baseForRelativeIris;
+  // Helper lambda that calls `Iri::fromIrirefConsiderBase` with the base
+  // IRI and returns the results as a string (including the angle brackets).
+  qlever::util::ParsedUri baseUri{"http://example.com/uniprot"};
   Iri baseForAbsoluteIris;
-  auto fromIrirefConsiderBase = [&baseForRelativeIris, &baseForAbsoluteIris](
-                                    std::string_view iriStringWithBrackets) {
-    return Iri::fromIrirefConsiderBase(iriStringWithBrackets,
-                                       baseForRelativeIris, baseForAbsoluteIris)
-        .toStringRepresentation();
-  };
+  auto fromIrirefConsiderBase =
+      [&baseUri](std::string_view iriStringWithBrackets) {
+        return Iri::fromIrirefConsiderBase(iriStringWithBrackets, baseUri)
+            .toStringRepresentation();
+      };
 
-  // Check that it works for "real" base IRIs.
-  baseForRelativeIris = Iri::fromIriref("<http://.../uniprot/>");
-  baseForAbsoluteIris = Iri::fromIriref("<http://.../>");
   EXPECT_EQ(fromIrirefConsiderBase("<http://purl.uniprot.org/uniprot/>"),
             "<http://purl.uniprot.org/uniprot/>");
   EXPECT_EQ(fromIrirefConsiderBase("<UPI001AF4585D>"),
-            "<http://.../uniprot/UPI001AF4585D>");
+            "<http://example.com/UPI001AF4585D>");
   EXPECT_EQ(fromIrirefConsiderBase("</prosite/PS51927>"),
-            "<http://.../prosite/PS51927>");
-
-  // Check that with the default base, all IRIs remain unchanged.
-  baseForRelativeIris = Iri{};
-  baseForAbsoluteIris = Iri{};
+            "<http://example.com/prosite/PS51927>");
   EXPECT_EQ(fromIrirefConsiderBase("<http://purl.uniprot.org/uniprot/>"),
             "<http://purl.uniprot.org/uniprot/>");
-  EXPECT_EQ(fromIrirefConsiderBase("</a>"), "</a>");
-  EXPECT_EQ(fromIrirefConsiderBase("<a>"), "<a>");
-  EXPECT_EQ(fromIrirefConsiderBase("<>"), "<>");
+  EXPECT_EQ(fromIrirefConsiderBase("</a>"), "<http://example.com/a>");
+  EXPECT_EQ(fromIrirefConsiderBase("<a>"), "<http://example.com/a>");
+  EXPECT_EQ(fromIrirefConsiderBase("<>"), "<http://example.com/uniprot>");
+
+  // Numeric escapes are part of the lexical form of an IRI reference, so they
+  // are resolved before the IRI is resolved against the base IRI. Note that
+  // `\u0061` is `a`, so the results below are the same as for the unescaped
+  // inputs above.
+  EXPECT_EQ(fromIrirefConsiderBase(R"(<\u0061>)"), "<http://example.com/a>");
+  EXPECT_EQ(fromIrirefConsiderBase(R"(</\u0061>)"), "<http://example.com/a>");
+  EXPECT_EQ(fromIrirefConsiderBase(R"(<http://example.org/\u0061>)"),
+            "<http://example.org/a>");
+}
+
+// _____________________________________________________________________________
+TEST(IriTest, resolveAgainstBase) {
+  qlever::util::ParsedUri baseUri{"http://example.com/uniprot"};
+  auto resolve = [&baseUri](const Iri& iri) {
+    return iri.resolveAgainstBase(baseUri).toStringRepresentation();
+  };
+  auto resolveIriref = [&baseUri](std::string_view iriref) {
+    return Iri::fromIrirefConsiderBase(iriref, baseUri)
+        .toStringRepresentation();
+  };
+
+  // For IRIs without escape sequences the result is the same as for
+  // `fromIrirefConsiderBase`.
+  EXPECT_EQ(resolve(Iri::fromIriref("<a>")), "<http://example.com/a>");
+  EXPECT_EQ(resolve(Iri::fromIriref("</a>")), "<http://example.com/a>");
+  EXPECT_EQ(resolve(Iri::fromIriref("<http://example.org/a>")),
+            "<http://example.org/a>");
+  EXPECT_EQ(resolve(Iri::fromIriref("<>")), "<http://example.com/uniprot>");
+
+  // The input is already in the internal representation, so a backslash in it
+  // is an ordinary character and not the start of an escape sequence. Such an
+  // IRI can be built at runtime by the SPARQL `IRI()` function, which does not
+  // unescape its argument.
+  //
+  // A backslash is not a valid character in a URI (RFC 3986), so such an IRI
+  // cannot be resolved against a base IRI at all and is rejected. The point of
+  // `resolveAgainstBase` is that it is rejected rather than silently rewritten:
+  // `fromIrirefConsiderBase` reads the same bytes as the escape sequence
+  // `\u0062` and turns `a\u0062c` into `abc`.
+  auto looksLikeAnEscape = Iri::fromIrirefWithoutBrackets(R"(a\u0062c)");
+  EXPECT_EQ(looksLikeAnEscape.toStringRepresentation(), R"(<a\u0062c>)");
+  EXPECT_ANY_THROW(resolve(looksLikeAnEscape));
+  EXPECT_EQ(resolveIriref(looksLikeAnEscape.toStringRepresentation()),
+            "<http://example.com/abc>");
+
+  // A percent-encoded backslash is a valid URI character and is preserved.
+  EXPECT_EQ(resolve(Iri::fromIrirefWithoutBrackets(R"(a%5Cb)")),
+            "<http://example.com/a%5Cb>");
+}
+
+// _____________________________________________________________________________
+TEST(IriTest, fromLangtagAndIriref) {
+  // The language tag is prepended in QLever's internal `@langtag@<iri>` format.
+  EXPECT_EQ(Iri::fromLangtagAndIriref(
+                "en", "<http://www.w3.org/2000/01/rdf-schema#label>")
+                .toStringRepresentation(),
+            "@en@<http://www.w3.org/2000/01/rdf-schema#label>");
+
+  // The IRI is unescaped exactly as in `fromIriref`, the language tag is taken
+  // verbatim.
+  EXPECT_EQ(Iri::fromLangtagAndIriref("en", R"(<http://example.org/\u0061>)")
+                .toStringRepresentation(),
+            "@en@<http://example.org/a>");
+  EXPECT_EQ(Iri::fromLangtagAndIriref("en", "<http://example.org/a>"),
+            Iri::fromLangtagAndIriref("en", R"(<http://example.org/\u0061>)"));
+
+  // The result is not a valid IRI reference, so it must not be fed back into
+  // `fromIriref`.
+  EXPECT_ANY_THROW(
+      Iri::fromIriref(Iri::fromLangtagAndIriref("en", "<http://example.org/a>")
+                          .toStringRepresentation()));
+}
+
+// _____________________________________________________________________________
+TEST(IriTest, withLanguageTag) {
+  auto label = Iri::fromIriref("<http://www.w3.org/2000/01/rdf-schema#label>");
+  EXPECT_EQ(label.withLanguageTag("en").toStringRepresentation(),
+            "@en@<http://www.w3.org/2000/01/rdf-schema#label>");
+  EXPECT_EQ(label.withLanguageTag("en"),
+            Iri::fromLangtagAndIriref(
+                "en", "<http://www.w3.org/2000/01/rdf-schema#label>"));
+
+  // The `Iri` is already in the internal representation, so a backslash in it
+  // is an ordinary character. In contrast to `fromLangtagAndIriref`, it is not
+  // read as an escape sequence a second time.
+  auto looksLikeAnEscape =
+      Iri::fromIrirefWithoutBrackets(R"(http://x/a\u0062c)");
+  EXPECT_EQ(looksLikeAnEscape.withLanguageTag("en").toStringRepresentation(),
+            R"(@en@<http://x/a\u0062c>)");
+  EXPECT_EQ(Iri::fromLangtagAndIriref(
+                "en", looksLikeAnEscape.toStringRepresentation())
+                .toStringRepresentation(),
+            "@en@<http://x/abc>");
 }
 
 // _____________________________________________________________________________
@@ -112,6 +232,21 @@ TEST(LiteralTest, LiteralTest) {
   EXPECT_EQ("Hello World", asStringViewUnsafe(literal.getContent()));
   EXPECT_THROW(literal.getLanguageTag(), ad_utility::Exception);
   EXPECT_THROW(literal.getDatatype(), ad_utility::Exception);
+
+  literal.addLanguageTag("en");
+  EXPECT_EQ("en", asStringViewUnsafe(literal.getLanguageTag()));
+  EXPECT_EQ("Hello World", asStringViewUnsafe(literal.getContent()));
+  EXPECT_ANY_THROW(literal.addLanguageTag("en"));
+
+  Iri datatype = Iri::fromIriref("<someIri>");
+  EXPECT_ANY_THROW(literal.addDatatype(datatype));
+  literal.removeDatatypeOrLanguageTag();
+  EXPECT_EQ("Hello World", asStringViewUnsafe(literal.getContent()));
+  EXPECT_FALSE(literal.hasLanguageTag());
+  EXPECT_NO_THROW(literal.addDatatype(datatype));
+  EXPECT_EQ(asStringViewUnsafe(literal.getDatatype()), "someIri");
+  EXPECT_ANY_THROW(literal.addLanguageTag("en"));
+  EXPECT_ANY_THROW(literal.addDatatype(datatype));
 }
 
 // _____________________________________________________________________________
@@ -468,14 +603,7 @@ TEST(LiteralTest, spaceshipOperatorLangtagLiteral) {
       "\"Comparative evaluation of the protective effect of sodium "
       "valproate, phenazepam and ionol in stress-induced liver damage in "
       "rats\"@en");
-  using namespace ad_utility::testing;
-  // Ensure that the global singleton comparator (which is used for the <=>
-  // comparison) is available. Creating a QEC sets this comparator.
-  getQec(TestIndexConfig{});
-  ASSERT_NO_THROW(IndexImpl::staticGlobalSingletonComparator());
   EXPECT_THAT(l1, testing::Not(testing::Eq(l2)));
-  EXPECT_THAT(ql::compareThreeWay(l1, l2),
-              testing::Not(testing::Eq(ql::strong_ordering::equal)));
 }
 
 // _____________________________________________________________________________
@@ -508,5 +636,75 @@ TEST(LiteralOrIri, toStringRepresentation) {
     EXPECT_TRUE(lit.toStringRepresentation().empty());
   }
 }
+
+// _____________________________________________________________________________
+TEST(NonOwningTest, IriView) {
+  std::string s = "<http://example.org/foo>";
+  IriView v = IriView::fromStringRepresentation(s);
+  static_assert(
+      std::is_same_v<decltype(v.toStringRepresentation()), std::string_view>);
+  EXPECT_EQ(v.toStringRepresentation(), s);
+  EXPECT_THAT("http://example.org/foo", asStringViewUnsafe(v.getContent()));
+  // Test that the `IriView` actually references the `s` the was passed in.
+  EXPECT_EQ(v.toStringRepresentation(), s);
+  EXPECT_EQ(v.toStringRepresentation().data(), s.data());
+
+  EXPECT_FALSE(v.empty());
+  EXPECT_TRUE(IriView{}.empty());
+  ad_utility::HashSet<IriView> set{v};
+  EXPECT_THAT(set, ::testing::UnorderedElementsAre(v));
+}
+
+// _____________________________________________________________________________
+TEST(NonOwningTest, LiteralView) {
+  std::string s = "\"Hello\"@en";
+  LiteralView v = LiteralView::fromStringRepresentation(s);
+  static_assert(
+      std::is_same_v<decltype(v.toStringRepresentation()), std::string_view>);
+  EXPECT_EQ(v.toStringRepresentation(), s);
+  EXPECT_EQ(v.toStringRepresentation().data(), s.data());
+  EXPECT_TRUE(v.hasLanguageTag());
+  EXPECT_FALSE(v.hasDatatype());
+  EXPECT_THAT("Hello", asStringViewUnsafe(v.getContent()));
+  EXPECT_THAT("en", asStringViewUnsafe(v.getLanguageTag()));
+  EXPECT_THROW(v.getDatatype(), ad_utility::Exception);
+  v.removeDatatypeOrLanguageTag();
+  EXPECT_FALSE(v.hasLanguageTag());
+  EXPECT_EQ(v.toStringRepresentation(), "\"Hello\"");
+  // We have only stripped a suffix, so the begin pointer stays the same.
+  EXPECT_EQ(v.toStringRepresentation().data(), s.data());
+  EXPECT_TRUE(LiteralView::fromStringRepresentation("\"plain\"").isPlain());
+}
+
+// _____________________________________________________________________________
+TEST(NonOwningTest, LiteralOrIriView) {
+  std::string iriStr = "<http://example.org/>";
+  LiteralOrIriView iv = LiteralOrIriView::fromStringRepresentation(iriStr);
+  static_assert(
+      std::is_same_v<decltype(iv.toStringRepresentation()), std::string_view>);
+  EXPECT_TRUE(iv.isIri());
+  EXPECT_FALSE(iv.isLiteral());
+  EXPECT_THAT("http://example.org/", asStringViewUnsafe(iv.getIriContent()));
+  EXPECT_EQ(iv.toStringRepresentation(), iriStr);
+  EXPECT_EQ(iv.toStringRepresentation().data(), iriStr.data());
+
+  std::string litStr = "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+  LiteralOrIriView lv = LiteralOrIriView::fromStringRepresentation(litStr);
+  EXPECT_EQ(lv.toStringRepresentation(), litStr);
+  EXPECT_EQ(lv.toStringRepresentation().data(), litStr.data());
+  EXPECT_FALSE(lv.isIri());
+  EXPECT_TRUE(lv.isLiteral());
+  EXPECT_FALSE(lv.hasLanguageTag());
+  EXPECT_TRUE(lv.hasDatatype());
+  EXPECT_THAT("42", asStringViewUnsafe(lv.getLiteralContent()));
+  EXPECT_THAT("http://www.w3.org/2001/XMLSchema#integer",
+              asStringViewUnsafe(lv.getDatatype()));
+
+  ad_utility::HashSet<LiteralOrIriView> set{iv, lv};
+  EXPECT_THAT(set, ::testing::UnorderedElementsAre(iv, lv));
+}
+
+using LitTypes =
+    ::testing::Types<LiteralOrIri, LiteralOrIriView, Literal, LiteralView>;
 
 }  // namespace

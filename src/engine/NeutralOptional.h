@@ -10,6 +10,14 @@
 // Implement the case where an `OPTIONAL` clause is joined with the empty
 // pattern. Conceptually this is the same as an optional join with the neutral
 // element, but specialized and more efficient.
+//
+// Note: `NeutralOptional` does not override `makeTreeWithBindColumn`. When
+// `tree_` produces zero rows, `computeResult` fabricates a single all-`UNDEF`
+// row without evaluating any expression, so a `BIND` pushed into `tree_`
+// would silently lose its value (e.g. a constant `BIND` would become `UNDEF`)
+// instead of being evaluated on that fallback row like an un-pushed `BIND`
+// would be. There is no cheap way to tell whether `tree_` is guaranteed to be
+// non-empty, so the push down is disallowed entirely.
 class NeutralOptional : public Operation {
   std::shared_ptr<QueryExecutionTree> tree_;
 
@@ -20,6 +28,7 @@ class NeutralOptional : public Operation {
  private:
   std::string getCacheKeyImpl() const override;
   uint64_t getSizeEstimateBeforeLimit() override;
+  [[nodiscard]] bool isDeterministicImpl() const override { return true; }
   std::unique_ptr<Operation> cloneImpl() const override;
   Result computeResult(bool requestLaziness) override;
   VariableToColumnMap computeVariableToColumnMap() const override;
@@ -28,16 +37,17 @@ class NeutralOptional : public Operation {
   // neutral element from ever appearing in the result.
   bool singleRowCroppedByLimit() const;
 
+ private:
+  qlm::vector<QueryExecutionTree*> getChildrenImpl() const override;
+
  public:
-  std::vector<QueryExecutionTree*> getChildren() override;
   std::string getDescriptor() const override;
   size_t getResultWidth() const override;
   size_t getCostEstimate() override;
   float getMultiplicity(size_t col) override;
   bool knownEmptyResult() override;
-  bool supportsLimitOffset() const override;
-  void onLimitOffsetChanged(
-      const LimitOffsetClause& limitOffset) const override;
+  LimitOffsetHandling handlesLimitOffset() const override;
+  void onLimitOffsetChanged(const LimitOffsetClause& limitOffset) override;
 
  protected:
   std::vector<ColumnIndex> resultSortedOn() const override;
