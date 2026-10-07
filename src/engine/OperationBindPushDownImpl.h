@@ -53,7 +53,7 @@ CPP_template_def(typename MakeCloneWithNewChildren)(
             bindExpressionVars)) {
       continue;
     }
-    auto result = child->getRootOperation()->makeTreeWithBindColumn(bind);
+    auto result = child->makeTreeWithBindColumn(bind);
     if (result.has_value()) {
       child = result.value();
       anyChildRewritten = true;
