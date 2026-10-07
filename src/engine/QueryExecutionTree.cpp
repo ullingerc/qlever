@@ -167,12 +167,26 @@ QueryExecutionTree::makeTreeWithBindColumn(
                           })) {
     return std::nullopt;
   }
+  // The target of a `BIND` can't be bound before the `BIND`, but it might be a
+  // hidden variable of this tree, e.g. one that was not selected by a subquery.
+  if (rootOperation_->containsVariableInternally(bind._target)) {
+    return std::nullopt;
+  }
   auto result = rootOperation_->makeTreeWithBindColumn(bind);
   if (result.has_value()) {
     AD_CORRECTNESS_CHECK(result.value() != nullptr);
+    const auto& newRoot = result.value()->getRootOperation();
+    AD_CORRECTNESS_CHECK(
+        newRoot->getLimitOffset().isUnconstrained(),
+        "`LIMIT` and `OFFSET` are applied by "
+        "`QueryExecutionTree::makeTreeWithBindColumn`, not by the individual "
+        "implementations.");
+    // We cannot use `applyLimitOffset` here, for the same reason as in
+    // `makeTreeWithStrippedColumns` below.
+    newRoot->setLimitOffsetDirectlyWithoutTriggeringHooks(
+        rootOperation_->getLimitOffset());
     // Same as for the prefiltered tree above, but the `BIND` target is new.
-    result.value()->getRootOperation()->hideVariablesHiddenIn(*rootOperation_,
-                                                              {bind._target});
+    newRoot->hideVariablesHiddenIn(*rootOperation_, {bind._target});
   }
   return result;
 }
