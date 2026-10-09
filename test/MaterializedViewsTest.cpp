@@ -1825,6 +1825,110 @@ TEST_F(MaterializedViewsTest, BindRewrite) {
     EXPECT_THAT(actual, matchesIdTable(expected));
   }
 
+  // A `BIND` is pushed down through a `Join` that is the root of a subquery.
+  // The variable hidden by the subquery (here `?x`) stays hidden, so the `?x`
+  // of the outer query is a different variable.
+  {
+    constexpr std::string_view hiddenVarInJoin = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?bind {
+        { SELECT ?s ?o { ?s view:bindView-o ?o . ?s <p1> ?x } }
+        BIND(2 * ?o + 1 AS ?bind)
+      }
+    )";
+    qpExpect(qlv(), hiddenVarInJoin,
+             h::Join(h::IndexScanFromStrings("?s", "<p1>", "?x"),
+                     bindView(AC{{3, V{"?bind"}}})));
+    auto qet = qlv()
+                   .parseAndPlanQuery(std::string{hiddenVarInJoin})
+                   .sharedQueryExecutionTree();
+    EXPECT_FALSE(qet->getVariableColumns().contains(V{"?x"}));
+
+    constexpr std::string_view hiddenVarInJoinOuterUse = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?x ?bind {
+        { SELECT ?s ?o { ?s view:bindView-o ?o . ?s <p1> ?x } }
+        BIND(2 * ?o + 1 AS ?bind)
+        ?s <p2> ?x
+      }
+    )";
+    auto actual = getQueryResultAsIdTable(std::string{hiddenVarInJoinOuterUse});
+    auto expected =
+        getQueryResultAsIdTable("SELECT ?s ?x (3 AS ?bind) { ?s <p2> ?x }");
+    EXPECT_THAT(actual, matchesIdTable(expected));
+  }
+
+  // A `BIND` is pushed down into a view scan that is the root of a subquery.
+  // The variable hidden by the subquery (here `?x`) stays hidden.
+  {
+    constexpr std::string_view hiddenVarInScan = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?bind {
+        { SELECT ?s { ?s view:bindView-o ?x } }
+        BIND(15 AS ?bind)
+      }
+    )";
+    qpExpect(qlv(), hiddenVarInScan,
+             viewScan("bindView", "?s", "?x", "?bind", 3));
+    auto qet = qlv()
+                   .parseAndPlanQuery(std::string{hiddenVarInScan})
+                   .sharedQueryExecutionTree();
+    EXPECT_FALSE(qet->getVariableColumns().contains(V{"?x"}));
+    auto actual = getQueryResultAsIdTable(std::string{hiddenVarInScan});
+    auto expected =
+        getQueryResultAsIdTable("SELECT ?s (15 AS ?bind) { ?s <p2> ?o }");
+    EXPECT_THAT(actual, matchesIdTable(expected));
+  }
+
+  // A `BIND` is not pushed down into a view scan that already reads the target
+  // into a column hidden by a subquery, or stripped away (with `strip-columns`
+  // enabled).
+  {
+    constexpr std::string_view hiddenTargetInScan = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?bind {
+        { SELECT ?s { ?s view:bindView-o ?bind } }
+        BIND(15 AS ?bind)
+      }
+    )";
+    auto expected = getQueryResultAsIdTable("SELECT (15 AS ?bind) {}");
+    EXPECT_THAT(getQueryResultAsIdTable(std::string{hiddenTargetInScan}),
+                matchesIdTable(expected));
+    auto cleanup =
+        setRuntimeParameterForTest<&RuntimeParameters::stripColumns_>(true);
+    EXPECT_THAT(getQueryResultAsIdTable(std::string{hiddenTargetInScan}),
+                matchesIdTable(expected));
+  }
+
+  // A `BIND` is not pushed down if a variable of its expression (here `?o`) is
+  // hidden by a subquery. The `?o` of the `BIND` is then unbound.
+  {
+    constexpr std::string_view hiddenExprVarInScan = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?bind {
+        { SELECT ?s { ?s view:bindView-o ?o } }
+        BIND(2 * ?o + 1 AS ?bind)
+      }
+    )";
+    auto expected = getQueryResultAsIdTable(
+        "SELECT ?s ?bind { ?s <p2> ?o . BIND(2 * ?unbound + 1 AS ?bind) }");
+    EXPECT_THAT(getQueryResultAsIdTable(std::string{hiddenExprVarInScan}),
+                matchesIdTable(expected));
+
+    constexpr std::string_view hiddenExprVarInJoin = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?bind {
+        { SELECT ?s { ?s view:bindView-o ?o . ?s <p1> ?x } }
+        BIND(2 * ?o + 1 AS ?bind)
+      }
+    )";
+    auto expectedJoin = getQueryResultAsIdTable(
+        "SELECT ?s ?bind { ?s <p2> ?o . ?s <p1> ?x . "
+        "BIND(2 * ?unbound + 1 AS ?bind) }");
+    EXPECT_THAT(getQueryResultAsIdTable(std::string{hiddenExprVarInJoin}),
+                matchesIdTable(expectedJoin));
+  }
+
   // A `BIND` is pushed down through a `SpatialJoin` operation.
   {
     constexpr std::string_view bindThroughSpatialJoin = R"(
@@ -1854,6 +1958,35 @@ TEST_F(MaterializedViewsTest, BindRewrite) {
                  // Matcher for right child of `SpatialJoin`: Scan on
                  // view with `BIND` push down due to matching variables.
                  viewScanWithBind));
+  }
+
+  // A `BIND` is not pushed down through a `SpatialJoin` if a variable of its
+  // expression (here `?o2`) is hidden by a subquery.
+  {
+    constexpr std::string_view hiddenExprVarInSpatialJoin = R"(
+      PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?o ?bind {
+        {
+          SELECT ?s ?o {
+            ?s view:bindView-o ?o .
+            ?s2 view:bindView-o ?o2 .
+            FILTER(geof:metricDistance(?o, ?o2) <= 100)
+          }
+        }
+        BIND(2 * ?o2 + 1 AS ?bind)
+      }
+    )";
+    qpExpect(
+        qlv(), hiddenExprVarInSpatialJoin,
+        h::Bind(
+            h::spatialJoinFilterSubstitute(
+                100, -1, V{"?o"}, V{"?o2"}, std::nullopt,
+                PayloadVariables::all(), SpatialJoinAlgorithm::LIBSPATIALJOIN,
+                SpatialJoinType::WITHIN_DIST, std::nullopt, viewScanNoBind,
+                viewScan("bindView", "?s2", "?o2", "?_ql_materialized_view_o",
+                         2)),
+            "2 * ?o2 + 1", V{"?bind"}));
   }
 
   // The `2 * ?o + 1` expression.
