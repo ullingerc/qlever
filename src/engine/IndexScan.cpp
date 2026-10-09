@@ -1095,6 +1095,13 @@ IndexScan::makeTreeWithBindColumn(const parsedQuery::Bind& bind) const {
     return std::nullopt;
   }
 
+  // The variables of the `BIND` expression must be visible, not hidden by a
+  // subquery. Note that `computePermutationColumnIndices` below also contains
+  // the hidden variables.
+  if (!areVariablesAlwaysDefined(bind._expression.containedVariables())) {
+    return std::nullopt;
+  }
+
   // Check if all variables required for the `BIND` expression are covered by
   // this `IndexScan`.
   const auto& visibleVars = computePermutationColumnIndices();
@@ -1179,12 +1186,16 @@ IndexScan::makeTreeWithBindColumn(const parsedQuery::Bind& bind) const {
     newVariables.value().insert(bind._target);
   }
 
-  return ad_utility::makeExecutionTree<IndexScan>(
+  // The new scan is built from scratch, so the variables hidden by this scan
+  // (if it is the root of a subquery) must be hidden again.
+  auto newTree = ad_utility::makeExecutionTree<IndexScan>(
       _executionContext, permutation_, locatedTriplesSharedState_, subject_,
       newPredicate, newObject, std::move(newAdditionalColumns),
       std::move(newAdditionalVariables), graphsToFilter_, scanSpecAndBlocks_,
       scanSpecAndBlocksIsPrefiltered_, VarsToKeep{std::move(newVariables)},
       sizeEstimateIsExact_, sizeEstimate_);
+  keepHiddenVariablesHidden(*newTree->getRootOperation(), bind._target);
+  return newTree;
 }
 
 // _____________________________________________________________________________
