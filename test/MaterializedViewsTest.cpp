@@ -1921,6 +1921,30 @@ TEST_F(MaterializedViewsTest, BindRewrite) {
                 matchesIdTable(expectedJoin));
   }
 
+  // A `BIND` is pushed down if a variable of its expression (here `?b2`) is
+  // visible but may be UNDEF (`?b2` is itself the result of a `BIND`).
+  {
+    qlv().writeMaterializedView(
+        "chainView",
+        "SELECT ?s ?o ?b2 ?b3 { ?s <p2> ?o . BIND(2 * ?o + 1 AS ?b2) "
+        "BIND(?b2 + 1 AS ?b3) }");
+    constexpr std::string_view chainedBind = R"(
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?b2 ?b3 {
+        ?s view:chainView-b2 ?b2 .
+        BIND(?b2 + 1 AS ?b3)
+      }
+    )";
+    qpExpect(qlv(), chainedBind,
+             viewScan("chainView", "?s", "?_ql_materialized_view_p", "?b2", 3,
+                      AC{{3, V{"?b3"}}}));
+    auto expected = getQueryResultAsIdTable(
+        "SELECT ?s ?b2 ?b3 { ?s <p2> ?o . BIND(2 * ?o + 1 AS ?b2) "
+        "BIND(?b2 + 1 AS ?b3) }");
+    EXPECT_THAT(getQueryResultAsIdTable(std::string{chainedBind}),
+                matchesIdTable(expected));
+  }
+
   // A `BIND` is pushed down through a `SpatialJoin` operation.
   {
     constexpr std::string_view bindThroughSpatialJoin = R"(
@@ -1969,16 +1993,54 @@ TEST_F(MaterializedViewsTest, BindRewrite) {
         BIND(2 * ?o2 + 1 AS ?bind)
       }
     )";
+    auto spatialJoin = h::spatialJoinFilterSubstitute(
+        100, -1, V{"?o"}, V{"?o2"}, std::nullopt, PayloadVariables::all(),
+        SpatialJoinAlgorithm::LIBSPATIALJOIN, SpatialJoinType::WITHIN_DIST,
+        std::nullopt, viewScanNoBind,
+        viewScan("bindView", "?s2", "?o2", "?_ql_materialized_view_o", 2));
+    qpExpect(qlv(), hiddenExprVarInSpatialJoin,
+             h::Bind(spatialJoin, "2 * ?o2 + 1", V{"?bind"}));
+
+    // With `strip-columns` enabled, the subquery strips `?o2` away in a
+    // `StripColumns` operation on top of the `SpatialJoin`.
+    auto cleanup =
+        setRuntimeParameterForTest<&RuntimeParameters::stripColumns_>(true);
     qpExpect(
         qlv(), hiddenExprVarInSpatialJoin,
-        h::Bind(
-            h::spatialJoinFilterSubstitute(
-                100, -1, V{"?o"}, V{"?o2"}, std::nullopt,
-                PayloadVariables::all(), SpatialJoinAlgorithm::LIBSPATIALJOIN,
-                SpatialJoinType::WITHIN_DIST, std::nullopt, viewScanNoBind,
-                viewScan("bindView", "?s2", "?o2", "?_ql_materialized_view_o",
-                         2)),
-            "2 * ?o2 + 1", V{"?bind"}));
+        h::Bind(h::MatchTypeAndOrderedChildren<::StripColumns>(spatialJoin),
+                "2 * ?o2 + 1", V{"?bind"}));
+  }
+
+  // A `BIND` is not pushed down through a `SpatialJoin` if its target (here
+  // `?d`) is the hidden distance variable of the `SpatialJoin` itself.
+  {
+    constexpr std::string_view hiddenTargetInSpatialJoin = R"(
+      PREFIX spatialSearch: <https://qlever.cs.uni-freiburg.de/spatialSearch/>
+      PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+      SELECT ?s ?o ?d {
+        {
+          SELECT ?s ?o {
+            ?s view:bindView-o ?o .
+            SERVICE spatialSearch: {
+              _:config spatialSearch:algorithm spatialSearch:libspatialjoin ;
+                       spatialSearch:left ?o ;
+                       spatialSearch:right ?o2 ;
+                       spatialSearch:joinType spatialSearch:within-dist ;
+                       spatialSearch:maxDistance 100 ;
+                       spatialSearch:bindDistance ?d .
+              { ?s2 view:bindView-o ?o2 }
+            }
+          }
+        }
+        BIND(2 * ?o + 1 AS ?d)
+      }
+    )";
+    qpExpect(
+        qlv(), hiddenTargetInSpatialJoin,
+        h::Bind(h::MatchTypeAndOrderedChildren<::SpatialJoin>(
+                    viewScanNoBind, viewScan("bindView", "?s2", "?o2",
+                                             "?_ql_materialized_view_o", 2)),
+                "2 * ?o + 1", V{"?d"}));
   }
 
   // The `2 * ?o + 1` expression.
