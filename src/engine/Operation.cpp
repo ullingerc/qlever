@@ -13,7 +13,6 @@
 #include <absl/container/inlined_vector.h>
 
 #include "engine/NamedResultCache.h"
-#include "engine/OperationBindPushDownImpl.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/SpatialJoinCachedIndex.h"
 #include "engine/VariableToColumnMap.h"
@@ -780,23 +779,6 @@ uint64_t Operation::getSizeEstimate() {
 }
 
 // _____________________________________________________________________________
-void Operation::keepHiddenVariablesHidden(
-    Operation& replacement,
-    std::optional<Variable> additionalVisibleVariable) const {
-  // Nothing is hidden if the externally visible variables were never set.
-  if (!variableToColumnMap_ || !externallyVisibleVariableToColumnMap_) {
-    return;
-  }
-  std::vector<Variable> visibleVariables;
-  ql::ranges::copy(getExternallyVisibleVariableColumns() | ql::views::keys,
-                   std::back_inserter(visibleVariables));
-  if (additionalVisibleVariable.has_value()) {
-    visibleVariables.push_back(std::move(additionalVisibleVariable).value());
-  }
-  replacement.setSelectedVariablesForSubquery(visibleVariables);
-}
-
-// _____________________________________________________________________________
 std::unique_ptr<Operation> Operation::clone() const {
   auto result = cloneImpl();
   result->hideVariablesHiddenIn(*this);
@@ -922,12 +904,64 @@ bool Operation::areVariablesAlwaysDefined(
 }
 
 // _____________________________________________________________________________
-bool Operation::areVariablesVisible(
-    const std::vector<const Variable*>& variables) const {
-  const auto& visibleVariables = getExternallyVisibleVariableColumns();
-  return ql::ranges::all_of(variables, [&visibleVariables](const auto v) {
-    return visibleVariables.contains(*v);
-  });
+std::unique_ptr<Operation> Operation::cloneWithNewChildren(
+    std::vector<std::shared_ptr<QueryExecutionTree>>) const {
+  AD_THROW(absl::StrCat("`cloneWithNewChildren` is not implemented for ",
+                        getDescriptor()));
+}
+
+// _____________________________________________________________________________
+std::optional<std::shared_ptr<QueryExecutionTree>>
+Operation::pushDownBindToChild(
+    const parsedQuery::Bind& bind,
+    std::vector<std::shared_ptr<QueryExecutionTree>> children,
+    size_t childIndex) const {
+  auto& child = children.at(childIndex);
+  AD_CORRECTNESS_CHECK(child != nullptr);
+  auto isOther = [&child](const auto& other) {
+    return other != nullptr && other != child;
+  };
+  auto otherContains = [&](const Variable& var) {
+    return ql::ranges::any_of(children, [&](const auto& other) {
+      return isOther(other) && other->containsVariable(var);
+    });
+  };
+  if (otherContains(bind._target)) {
+    return std::nullopt;
+  }
+  auto canComputeExpression = ql::ranges::all_of(
+      bind._expression.containedVariables(), [&](const Variable* var) {
+        return child->getRootOperation()->isVariableAlwaysDefined(*var) ||
+               (child->containsVariable(*var) && !otherContains(*var));
+      });
+  if (!canComputeExpression) {
+    return std::nullopt;
+  }
+  auto newChild = child->makeTreeWithBindColumn(bind);
+  if (!newChild.has_value()) {
+    return std::nullopt;
+  }
+  child = std::move(newChild.value());
+  return _executionContext->makeShared<QueryExecutionTree>(
+      _executionContext, cloneWithNewChildren(std::move(children)));
+}
+
+// _____________________________________________________________________________
+std::optional<std::shared_ptr<QueryExecutionTree>>
+Operation::pushDownBindToAnyChild(
+    const parsedQuery::Bind& bind,
+    std::vector<std::shared_ptr<QueryExecutionTree>> children) const {
+  for (size_t i = 0; i < children.size(); ++i) {
+    // A child can be `nullptr` for a `SpatialJoin` that doesn't have all of its
+    // children attached yet.
+    if (children.at(i) == nullptr) {
+      continue;
+    }
+    if (auto result = pushDownBindToChild(bind, children, i)) {
+      return result;
+    }
+  }
+  return std::nullopt;
 }
 
 // _____________________________________________________________________________
