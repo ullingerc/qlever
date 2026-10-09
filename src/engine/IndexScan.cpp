@@ -1105,9 +1105,16 @@ IndexScan::makeTreeWithBindColumn(const parsedQuery::Bind& bind) const {
     return std::nullopt;
   }
 
-  // Check that the target variable of the `BIND` is not used already by this
-  // `IndexScan`.
-  if (visibleVars.contains(bind._target)) {
+  // Check that the target variable of the `BIND` is not read already by this
+  // `IndexScan`, not even into a column that is stripped away or hidden by a
+  // subquery.
+  auto isTarget = [&bind](const auto& var) { return var == bind._target; };
+  if (ql::ranges::any_of(getPermutedTriple(),
+                         [&isTarget](const TripleComponent* component) {
+                           return component->isVariable() &&
+                                  isTarget(component->getVariable());
+                         }) ||
+      ql::ranges::any_of(additionalVariables_, isTarget)) {
     return std::nullopt;
   }
 
