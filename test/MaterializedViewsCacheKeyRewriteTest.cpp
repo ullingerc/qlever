@@ -12,6 +12,7 @@
 
 #include "./MaterializedViewsTestHelpers.h"
 #include "./QueryPlannerTestHelpers.h"
+#include "./util/IdTableHelpers.h"
 #include "./util/RuntimeParametersTestHelpers.h"
 
 namespace {
@@ -172,4 +173,135 @@ TEST_F(MaterializedViewsCacheKeyRewriteTest, CacheKeyRewrite) {
                   h::Bind(viewScan("testView4", "?s", "?m", "?o1", 5,
                                    {{3, V{"?o2"}}, {4, V{"?b1"}}}),
                           "?o2 + 2", V{"?b2"}));
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsCacheKeyRewriteTest, isFunctional) {
+  using materializedViewsQueryAnalysis::isFunctional;
+  auto qec = getQec();
+  auto check = [&qec](std::string predicate, bool inputIsSubject) {
+    return isFunctional(
+        *qec, {V{"?in"}, std::move(predicate), V{"?out"}, inputIsSubject});
+  };
+  // `<s1>` has three objects for `<p3>`, but each object has one subject.
+  EXPECT_FALSE(check("<p3>", true));
+  EXPECT_TRUE(check("<p3>", false));
+  EXPECT_TRUE(check("<p4>", true));
+  // `<s3>` has two objects for `<p2>`.
+  EXPECT_FALSE(check("<p2>", true));
+  // Unknown and QLever-internal predicates.
+  EXPECT_FALSE(check("<doesNotExist>", true));
+  EXPECT_FALSE(check(std::string{HAS_PREDICATE_PREDICATE}, true));
+}
+
+// _____________________________________________________________________________
+TEST_F(MaterializedViewsCacheKeyRewriteTest, FunctionalOptionalRewrite) {
+  // Compare the result of `query` with the result without query rewriting.
+  auto expectSameResult = [this](const std::string& query,
+                                 source_location sourceLocation =
+                                     AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(sourceLocation);
+    auto actual = getQueryResultAsIdTable(query);
+    auto cleanup = setRuntimeParameterForTest<
+        &RuntimeParameters::enableMaterializedViewQueryRewrite_>(false);
+    qlv().clearQueryResultCache();
+    EXPECT_THAT(actual, matchesIdTable(getQueryResultAsIdTable(query)));
+  };
+
+  // `<p4>` is functional, so the `OPTIONAL` only adds the column `?x`.
+  const std::string viewQuery = R"(
+    SELECT ?s ?m ?o1 ?x {
+      ?s <p1> ?o1 .
+      ?s <p3> ?m .
+      OPTIONAL { ?m <p4> ?x }
+    }
+  )";
+  EXPECT_EQ(getQueryResultAsIdTable(viewQuery).numRows(), 5);
+  qlv().writeMaterializedView("optView", viewQuery);
+  qpExpect<false>(qlv(), viewQuery,
+                  viewScan("optView", "?s", "?m", "?o1", 4, {{3, V{"?x"}}}));
+
+  // The view can be used for a query without the `OPTIONAL`.
+  const std::string withoutOptional = R"(
+    SELECT * { ?s <p1> ?o1 . ?s <p3> ?m . }
+  )";
+  qpExpect<false>(qlv(), withoutOptional,
+                  viewScan("optView", "?s", "?m", "?o1", 3));
+  expectSameResult(withoutOptional);
+
+  // The `OPTIONAL` is pushed down into the view through a `Join`.
+  const std::string throughJoin = R"(
+    PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+    SELECT * {
+      ?s view:optView-m ?m . ?s <p1> ?o1 .
+      OPTIONAL { ?m <p4> ?y }
+    }
+  )";
+  qpExpect(qlv(), throughJoin,
+           h::Join(h::IndexScanFromStrings("?s", "<p1>", "?o1"),
+                   viewScan("optView", "?s", "?m", "?_ql_materialized_view_o",
+                            3, {{3, V{"?y"}}})));
+  expectSameResult(throughJoin);
+
+  // The `OPTIONAL` is pushed down into an explicit scan of the view.
+  const std::string explicitScan = R"(
+    PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+    SELECT * {
+      ?s view:optView-m ?m .
+      OPTIONAL { ?m <p4> ?y }
+    }
+  )";
+  qpExpect(qlv(), explicitScan,
+           viewScan("optView", "?s", "?m", "?_ql_materialized_view_o", 3,
+                    {{3, V{"?y"}}}));
+  expectSameResult(explicitScan);
+
+  // The view only contains the `OPTIONAL` with the input `?m`.
+  const std::string otherInput = R"(
+    PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+    SELECT * {
+      ?s view:optView-m ?m .
+      OPTIONAL { ?s <p4> ?y }
+    }
+  )";
+  qpExpect(qlv(), otherInput,
+           h::OptionalJoin(::testing::A<const QueryExecutionTree&>(),
+                           h::IndexScanFromStrings("?s", "<p4>", "?y")));
+  expectSameResult(otherInput);
+
+  // `<p3>` is not functional, so the `OPTIONAL` adds rows.
+  const std::string nonFunctionalQuery = R"(
+    SELECT ?s ?o1 ?m {
+      ?s <p1> ?o1 .
+      OPTIONAL { ?s <p3> ?m }
+    }
+  )";
+  EXPECT_EQ(getQueryResultAsIdTable(nonFunctionalQuery).numRows(), 5);
+  qlv().writeMaterializedView("nonFunctionalView", nonFunctionalQuery);
+
+  // The view can't be used for a query without the `OPTIONAL`.
+  const std::string singleTriple = "SELECT * { ?s <p1> ?o1 }";
+  EXPECT_EQ(getQueryResultAsIdTable(singleTriple).numRows(), 2);
+  expectSameResult(singleTriple);
+
+  // The `OPTIONAL` is not pushed down into the view.
+  const std::string nonFunctionalPushDown = R"(
+    PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+    SELECT * {
+      ?s view:nonFunctionalView-o1 ?o1 .
+      OPTIONAL { ?s <p3> ?z }
+    }
+  )";
+  EXPECT_EQ(getQueryResultAsIdTable(nonFunctionalPushDown).numRows(), 13);
+  expectSameResult(nonFunctionalPushDown);
+
+  // No push down with a `FROM` clause, the `OPTIONAL` finds no match then.
+  const std::string withFrom = R"(
+    PREFIX view: <https://qlever.cs.uni-freiburg.de/materializedView/>
+    SELECT * FROM <doesNotExist> {
+      ?s view:optView-m ?m .
+      OPTIONAL { ?m <p4> ?y }
+    }
+  )";
+  expectSameResult(withFrom);
 }

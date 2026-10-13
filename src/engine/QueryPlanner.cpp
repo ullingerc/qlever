@@ -40,6 +40,7 @@
 #include "engine/Join.h"
 #include "engine/Load.h"
 #include "engine/MaterializedViews.h"
+#include "engine/MaterializedViewsQueryAnalysis.h"
 #include "engine/Minus.h"
 #include "engine/MultiColumnJoin.h"
 #include "engine/NamedResultCache.h"
@@ -3062,7 +3063,9 @@ bool QueryPlanner::GraphPatternPlanner::handleUnconnectedMinusOrOptional(
 
 // _____________________________________________________________________________
 void QueryPlanner::GraphPatternPlanner::visitGroupOptionalOrMinus(
-    std::vector<SubtreePlan>&& candidates) {
+    std::vector<SubtreePlan>&& candidates,
+    const std::optional<graphPatternAnalysis::SingleTripleOptional>&
+        singleTripleOptional) {
   // Empty group graph patterns should have been handled previously.
   AD_CORRECTNESS_CHECK(!candidates.empty());
 
@@ -3105,10 +3108,32 @@ void QueryPlanner::GraphPatternPlanner::visitGroupOptionalOrMinus(
   optimizeCommutatively();
   AD_CORRECTNESS_CHECK(candidatePlans_.size() == 1);
   std::vector<SubtreePlan> nextCandidates;
+  std::optional<parsedQuery::Bind> optionalAsBind;
+  std::optional<bool> isFunctional;
+  if (singleTripleOptional.has_value()) {
+    optionalAsBind = materializedViewsQueryAnalysis::makeBindForOptional(
+        singleTripleOptional.value());
+  }
   // For each candidate plan, and each plan from the OPTIONAL or MINUS, create
   // a new plan with an optional join. Note that `createJoinCandidates` will
   // whether `b` is from an OPTIONAL or MINUS.
   for (auto& a : candidatePlans_.at(0)) {
+    // Read the column of the OPTIONAL from a materialized view instead, like
+    // in `visitBind`.
+    if (optionalAsBind.has_value()) {
+      auto pushedDownPlan = a._qet->makeTreeWithBindColumn(*optionalAsBind);
+      if (pushedDownPlan.has_value() && !isFunctional.has_value()) {
+        isFunctional = materializedViewsQueryAnalysis::isFunctional(
+            *qec_, singleTripleOptional.value());
+      }
+      if (pushedDownPlan.has_value() && isFunctional.value()) {
+        auto plan = a;
+        plan._qet = std::move(pushedDownPlan.value());
+        plan.containsBindSubstitute_ = true;
+        nextCandidates.push_back(std::move(plan));
+        continue;
+      }
+    }
     for (auto& b : candidates) {
       a._idsOfIncludedNodes = 1;
       b._idsOfIncludedNodes = 2;
@@ -3210,12 +3235,15 @@ void QueryPlanner::GraphPatternPlanner::graphPatternOperationVisitor(Arg& arg) {
       }
     }
 
+    std::optional<graphPatternAnalysis::SingleTripleOptional>
+        singleTripleOptional;
     if constexpr (std::is_same_v<T, p::Optional>) {
       for (auto& c : candidates) {
         c.type = SubtreePlan::OPTIONAL;
       }
+      singleTripleOptional = singleTripleOptionalForPushDown(arg);
     }
-    visitGroupOptionalOrMinus(std::move(candidates));
+    visitGroupOptionalOrMinus(std::move(candidates), singleTripleOptional);
     if (datasetBackup.has_value()) {
       planner_.activeDatasetClauses_ = std::move(datasetBackup.value());
     }
@@ -3299,6 +3327,25 @@ void QueryPlanner::GraphPatternPlanner::visitBasicGraphPattern(
     }
     planner_.checkCancellation();
   }
+}
+
+// _______________________________________________________________
+std::optional<graphPatternAnalysis::SingleTripleOptional>
+QueryPlanner::GraphPatternPlanner::singleTripleOptionalForPushDown(
+    const parsedQuery::Optional& optional) const {
+  if (qec_ == nullptr ||
+      !getRuntimeParameter<
+          &RuntimeParameters::enableMaterializedViewQueryRewrite_>()) {
+    return std::nullopt;
+  }
+  // The column of the view was computed on the default graph, see
+  // `createMaterializedViewJoinReplacements`.
+  if (planner_.activeGraphVariable_.has_value() ||
+      planner_.activeDatasetClauses_.activeDefaultGraphs().has_value()) {
+    return std::nullopt;
+  }
+  return graphPatternAnalysis::getSingleTripleOptional(optional,
+                                                       boundVariables_);
 }
 
 // _______________________________________________________________

@@ -380,6 +380,23 @@ TEST(MaterializedViewsPatternRewriteRejectionTest,
                           ::testing::HasSubstr("query body is empty")));
 }
 
+// _____________________________________________________________________________
+TEST(MaterializedViewsPatternRewriteRejectionTest, functionalOptionalIgnored) {
+  using namespace materializedViewsQueryAnalysis;
+  EncodedIriManager encodedIriManager;
+  auto parsed = SparqlParser::parseQuery(
+      &encodedIriManager,
+      "SELECT * { ?s <p1> ?m . ?m <p2> ?o OPTIONAL { ?m <p3> ?x } }");
+  // Without knowing that `<p3>` is functional, the `OPTIONAL` can't be ignored.
+  EXPECT_THAT(getTriplesForPatternRewrite(parsed),
+              ::testing::VariantWith<RewriteIgnoreReason>(
+                  ::testing::HasSubstr("more than one graph pattern")));
+  EXPECT_THAT(
+      getTriplesForPatternRewrite(
+          parsed, [](const SingleTripleOptional&) { return true; }),
+      ::testing::VariantWith<std::vector<SparqlTriple>>(::testing::SizeIs(2)));
+}
+
 // Example queries for testing the rewriting of chain-shaped patterns.
 constexpr std::string_view simpleChain = "SELECT * { ?s <p1> ?m . ?m <p2> ?o }";
 constexpr std::string_view simpleChainRenamed =

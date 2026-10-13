@@ -22,6 +22,7 @@
 #include "engine/QueryExecutionTree.h"
 #include "engine/RuntimeInformation.h"
 #include "parser/GraphPattern.h"
+#include "parser/GraphPatternAnalysis.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/ParsedQuery.h"
 #include "parser/data/Types.h"
@@ -743,8 +744,21 @@ class QueryPlanner {
     // braces. This leads to all of those clauses currently being an
     // optimization border (The braces are planned individually).
     // The distinction between "normal" groups, OPTIONALs and MINUS clauses
-    // is made via the type member of the `SubtreePlan`s.
-    void visitGroupOptionalOrMinus(std::vector<SubtreePlan>&& candidates);
+    // is made via the type member of the `SubtreePlan`s. For an OPTIONAL,
+    // `singleTripleOptional` (see `singleTripleOptionalForPushDown`) is pushed
+    // down like a `BIND` instead where possible, if its predicate is
+    // functional (see `materializedViewsQueryAnalysis::makeBindForOptional`).
+    void visitGroupOptionalOrMinus(
+        std::vector<SubtreePlan>&& candidates,
+        const std::optional<graphPatternAnalysis::SingleTripleOptional>&
+            singleTripleOptional = std::nullopt);
+
+    // Return the `SingleTripleOptional` for `optional` if it might be pushed
+    // down into a materialized view. Whether its predicate is functional is
+    // checked only once a push down succeeded, as it requires an index lookup.
+    std::optional<graphPatternAnalysis::SingleTripleOptional>
+    singleTripleOptionalForPushDown(
+        const parsedQuery::Optional& optional) const;
 
     // Helper function for `graphPatternOperationVisitor`. For a
     // `GRAPH ?graphVar {...}` clause, make sure that `graphVar` is bound in

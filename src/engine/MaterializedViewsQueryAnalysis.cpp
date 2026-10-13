@@ -18,8 +18,11 @@
 #include "engine/MaterializedViews.h"
 #include "engine/MaterializedViewsPatternMatcher.h"
 #include "engine/VariableToColumnMap.h"
+#include "engine/sparqlExpressions/LiteralExpression.h"
 #include "global/Constants.h"
 #include "global/RuntimeParameters.h"
+#include "index/IndexImpl.h"
+#include "index/TripleComponentConversions.h"
 #include "parser/GraphPatternOperation.h"
 #include "util/Algorithm.h"
 #include "util/Exception.h"
@@ -68,7 +71,76 @@ std::optional<std::vector<size_t>> connectedOrder(
   return order;
 }
 
+// The expression of `makeBindForOptional`. Its only child is the input
+// variable.
+class FunctionalOptionalExpression : public sparqlExpression::SparqlExpression {
+  SingleTripleOptional optional_;
+  Ptr child_;
+
+ public:
+  explicit FunctionalOptionalExpression(SingleTripleOptional optional)
+      : optional_{std::move(optional)},
+        child_{std::make_unique<sparqlExpression::VariableExpression>(
+            optional_.input_)} {}
+
+  sparqlExpression::ExpressionResult evaluate(
+      sparqlExpression::EvaluationContext*) const override {
+    AD_FAIL();
+  }
+
+  std::string getCacheKey(const VariableToColumnMap& varColMap) const override {
+    return absl::StrCat(
+        "FUNCTIONAL OPTIONAL ", optional_.predicate_,
+        optional_.inputIsSubject_ ? " FROM SUBJECT " : " FROM OBJECT ",
+        child_->getCacheKey(varColMap));
+  }
+
+  bool isDeterministic() const override { return true; }
+
+ private:
+  ql::span<Ptr> childrenImpl() override { return {&child_, 1}; }
+};
+
 }  // namespace
+
+// _____________________________________________________________________________
+bool isFunctional(const QueryExecutionContext& qec,
+                  const SingleTripleOptional& optional) {
+  // QLever-internal predicates (e.g. for the text index) are not stored as
+  // ordinary triples.
+  if (optional.predicate_.starts_with(
+          QLEVER_INTERNAL_PREFIX_IRI_WITHOUT_CLOSING_BRACKET)) {
+    return false;
+  }
+  const auto& index = qec.getIndex().getImpl();
+  auto predicateId = toValueId(
+      TripleComponent{TripleComponent::Iri::fromIriref(optional.predicate_)},
+      index);
+  if (!predicateId.has_value()) {
+    return false;
+  }
+  const auto& permutation = index.getPermutation(
+      optional.inputIsSubject_ ? Permutation::PSO : Permutation::POS);
+  const auto& locatedTriplesState = qec.locatedTriplesState();
+  // With updates, the metadata of large relations is outdated, and the one of
+  // small relations is only approximate (see `getMetadataForSmallRelation`).
+  // ponytail: any update disables this; per-relation check if that matters.
+  if (!permutation.getLocatedTriplesForPermutation(locatedTriplesState)
+           .isEmpty()) {
+    return false;
+  }
+  auto metadata =
+      permutation.getMetadata(predicateId.value(), locatedTriplesState);
+  return metadata.has_value() && metadata.value().isFunctional();
+}
+
+// _____________________________________________________________________________
+parsedQuery::Bind makeBindForOptional(const SingleTripleOptional& optional) {
+  return {sparqlExpression::SparqlExpressionPimpl{
+              std::make_unique<FunctionalOptionalExpression>(optional),
+              absl::StrCat("OPTIONAL { ", optional.predicate_, " }")},
+          optional.output_};
+}
 
 // _____________________________________________________________________________
 PatternMatcherLimits PatternMatcherLimits::requestBounded(
@@ -300,7 +372,14 @@ bool QueryPatternCache::analyzeView(ViewPtr view,
   bool cacheKeyAdded = insert(full);
   cacheKeyAdded = insert(withoutInvariant) || cacheKeyAdded;
 
-  auto triplesForRewrite = getTriplesForPatternRewrite(parsed.value());
+  BasicGraphPatternsInvariantTo::IsFunctional isFunctionalInIndex;
+  if (qec != nullptr) {
+    isFunctionalInIndex = [qec](const SingleTripleOptional& optional) {
+      return isFunctional(*qec, optional);
+    };
+  }
+  auto triplesForRewrite =
+      getTriplesForPatternRewrite(parsed.value(), isFunctionalInIndex);
   if (std::holds_alternative<RewriteIgnoreReason>(triplesForRewrite)) {
     explainIgnore(std::get<RewriteIgnoreReason>(triplesForRewrite));
     return cacheKeyAdded;
@@ -339,8 +418,10 @@ bool QueryPatternCache::analyzeView(ViewPtr view,
 
 // _____________________________________________________________________________
 std::vector<parsedQuery::GraphPatternOperation> graphPatternInvariantFilter(
-    const ParsedQuery& parsed) {
-  BasicGraphPatternsInvariantTo invariantCheck{parsed._rootGraphPattern};
+    const ParsedQuery& parsed,
+    const BasicGraphPatternsInvariantTo::IsFunctional& isFunctional) {
+  BasicGraphPatternsInvariantTo invariantCheck{parsed._rootGraphPattern,
+                                               isFunctional};
 
   // Filter out graph patterns that do not change the result of the basic graph
   // pattern analyzed.
@@ -353,7 +434,9 @@ std::vector<parsedQuery::GraphPatternOperation> graphPatternInvariantFilter(
 
 // _____________________________________________________________________________
 std::variant<RewriteIgnoreReason, std::vector<SparqlTriple>>
-getTriplesForPatternRewrite(const ParsedQuery& parsed) {
+getTriplesForPatternRewrite(
+    const ParsedQuery& parsed,
+    const BasicGraphPatternsInvariantTo::IsFunctional& isFunctional) {
   if (parsed.isAggregatingQuery()) {
     return "The view's query aggregates (GROUP BY, either explicit or "
            "implicit via an aggregate expression in the SELECT clause)";
@@ -393,7 +476,8 @@ getTriplesForPatternRewrite(const ParsedQuery& parsed) {
     return "The view's query has a FROM or FROM NAMED clause";
   }
 
-  auto graphPatternsFiltered = graphPatternInvariantFilter(parsed);
+  auto graphPatternsFiltered =
+      graphPatternInvariantFilter(parsed, isFunctional);
   if (graphPatternsFiltered.size() != 1) {
     return "The view has more than one graph pattern (even after skipping "
            "ignored patterns)";
@@ -434,10 +518,22 @@ BindExpressionAndTargetCol extractBindExpressions(
     const ParsedQuery& parsed, const VariableToColumnMap& varToColMap) {
   BindExpressionAndTargetCol map;
 
+  std::vector<parsedQuery::Bind> binds =
+      ad_utility::filterRangeOfVariantsByType<parsedQuery::Bind>(
+          parsed._rootGraphPattern._graphPatterns) |
+      ::ranges::to<std::vector>();
+  // The view's `OPTIONAL` is evaluated on the view's dataset, which must be the
+  // default one, like for the queries it is pushed into (see
+  // `QueryPlanner::GraphPatternPlanner::singleTripleOptionalForPushDown`).
+  if (parsed.datasetClauses_.isUnconstrainedOrWithClause()) {
+    for (const auto& optional : graphPatternAnalysis::findColumnAddingOptionals(
+             parsed._rootGraphPattern)) {
+      binds.push_back(makeBindForOptional(optional.triple_));
+    }
+  }
+
   // Iterate over all `BIND`s in the parsed query and add them to the map.
-  for (const auto& bind :
-       ad_utility::filterRangeOfVariantsByType<parsedQuery::Bind>(
-           parsed._rootGraphPattern._graphPatterns)) {
+  for (const auto& bind : binds) {
     // Check that the `VariableToColumnMap` covers both all variables from the
     // `BIND` expression as well as the target variable.
     // IMPORTANT: This is not the `VariableToColumnMap` that we would get from

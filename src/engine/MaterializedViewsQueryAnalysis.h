@@ -22,12 +22,14 @@
 // Forward declarations to prevent cyclic dependencies.
 class MaterializedView;
 class IndexScan;
+class QueryExecutionContext;
 
 // _____________________________________________________________________________
 namespace materializedViewsQueryAnalysis {
 
 using ViewPtr = std::shared_ptr<const MaterializedView>;
 using graphPatternAnalysis::BasicGraphPatternsInvariantTo;
+using graphPatternAnalysis::SingleTripleOptional;
 
 // An edge of a view's join pattern graph: a triple whose predicate has
 // already been resolved to a simple IRI (see `buildPatternEdges`).
@@ -125,7 +127,23 @@ class QueryPatternCache {
 // `BasicGraphPatternInvariantTo`. For details, see the documentation for this
 // helper.
 std::vector<parsedQuery::GraphPatternOperation> graphPatternInvariantFilter(
-    const ParsedQuery& parsed);
+    const ParsedQuery& parsed,
+    const BasicGraphPatternsInvariantTo::IsFunctional& isFunctional = {});
+
+// Return true iff the predicate of `optional` is functional in the direction
+// from its input to its output in the index of `qec`. This is only checked if
+// the index has no updates for the relevant permutation, otherwise `false` is
+// returned.
+bool isFunctional(const QueryExecutionContext& qec,
+                  const SingleTripleOptional& optional);
+
+// A `BIND` that stands for the `optional`, if its predicate is functional:
+// The expression of the `BIND` contains only the input of `optional`, its
+// target is the output, and its cache key is unique for `optional`. This way,
+// the column added by the `optional` can be pushed down into a materialized
+// view like a `BIND` (see `Operation::makeTreeWithBindColumn`). The expression
+// can't be evaluated.
+parsedQuery::Bind makeBindForOptional(const SingleTripleOptional& optional);
 
 // Human-readable explanation why a query is not eligible for pattern-based
 // rewriting, as returned by `getTriplesForPatternRewrite`.
@@ -135,13 +153,18 @@ using RewriteIgnoreReason = std::string;
 // view's defining query for pattern analysis, or a `RewriteIgnoreReason` if
 // the query's shape doesn't support pattern-based rewriting.
 std::variant<RewriteIgnoreReason, std::vector<SparqlTriple>>
-getTriplesForPatternRewrite(const ParsedQuery& parsed);
+getTriplesForPatternRewrite(
+    const ParsedQuery& parsed,
+    const BasicGraphPatternsInvariantTo::IsFunctional& isFunctional = {});
 
 // Hash map for the `BIND`-to-column map.
 using BindExpressionAndTargetCol = ad_utility::HashMap<std::string, size_t>;
 
 // Extract all `BIND` statements from a `ParsedQuery` and create a hash map
-// mapping `BIND` expression cache keys to target variable column index.
+// mapping `BIND` expression cache keys to target variable column index. The
+// top-level `ColumnAddingOptional`s are included as `makeBindForOptional`
+// (whether their predicate is functional is checked by the caller of
+// `Operation::makeTreeWithBindColumn`).
 BindExpressionAndTargetCol extractBindExpressions(
     const ParsedQuery& parsed, const VariableToColumnMap& varToColMap);
 
