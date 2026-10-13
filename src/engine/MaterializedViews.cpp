@@ -1022,9 +1022,12 @@ MaterializedView::computeCacheKey(
   // query.
   auto keyWithBinds = planAndComputeMapping(parsedQuery);
 
-  // Remove all `BIND`s that are invariant to the query.
+  // Remove all `BIND`s (and other patterns) that are invariant to the query.
   graphPatternAnalysis::BasicGraphPatternsInvariantTo invariantCheck{
-      parsedQuery._rootGraphPattern};
+      parsedQuery._rootGraphPattern,
+      [&qec](const graphPatternAnalysis::SingleTripleOptional& optional) {
+        return materializedViewsQueryAnalysis::isFunctional(qec, optional);
+      }};
   ql::erase_if(parsedQuery.children(), [&invariantCheck](const auto& child) {
     return child.visit(invariantCheck);
   });
