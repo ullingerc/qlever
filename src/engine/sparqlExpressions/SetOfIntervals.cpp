@@ -8,13 +8,17 @@
 
 namespace ad_utility {
 // ___________________________________________________________________________
-SetOfIntervals::SetOfIntervals(Vec intervals, size_t size)
-    : _intervals{std::move(intervals)}, size_{size} {
-  AD_CONTRACT_CHECK(
-      ql::ranges::all_of(
-          _intervals,
-          [size](const auto& interval) { return interval.second <= size; }),
-      "An interval of a `SetOfIntervals` ends after the size of the set.");
+SetOfIntervals::SetOfIntervals(Vec intervals, size_t size, Vec undefIntervals)
+    : _intervals{std::move(intervals)},
+      size_{size},
+      undefIntervals_{std::move(undefIntervals)} {
+  auto endsInRange = [size](const auto& interval) {
+    return interval.second <= size;
+  };
+  AD_CONTRACT_CHECK(ql::ranges::all_of(_intervals, endsInRange) &&
+                        ql::ranges::all_of(undefIntervals_, endsInRange),
+                    "An interval of a `SetOfIntervals` ends after the size of "
+                    "the set.");
 }
 
 // ___________________________________________________________________________
@@ -34,13 +38,14 @@ SetOfIntervals SetOfIntervals::SortAndCheckDisjointAndNonempty(
   return input;
 }
 
-// ___________________________________________________________________________
-SetOfIntervals SetOfIntervals::Intersection::operator()(
-    SetOfIntervals A, SetOfIntervals B) const {
+namespace {
+// The intersection of the `_intervals` of `A` and `B`, ignoring their
+// `undefIntervals()`.
+SetOfIntervals intersectionIgnoringUndef(SetOfIntervals A, SetOfIntervals B) {
   AD_CONTRACT_CHECK(A.size() == B.size());
   // First sort by the beginning of the interval
-  A = SortAndCheckDisjointAndNonempty(std::move(A));
-  B = SortAndCheckDisjointAndNonempty(std::move(B));
+  A = SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(A));
+  B = SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(B));
 
   SetOfIntervals result{{}, A.size()};
   auto itA = A._intervals.begin();
@@ -82,17 +87,17 @@ SetOfIntervals SetOfIntervals::Intersection::operator()(
     }
   }
 
-  return CheckSortedAndDisjointAndSimplify(
-      SortAndCheckDisjointAndNonempty(std::move(result)));
+  return SetOfIntervals::CheckSortedAndDisjointAndSimplify(
+      SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(result)));
 }
 
-// __________________________________________________________________________
-SetOfIntervals SetOfIntervals::Union::operator()(SetOfIntervals A,
-                                                 SetOfIntervals B) const {
+// The union of the `_intervals` of `A` and `B`, ignoring their
+// `undefIntervals()`.
+SetOfIntervals unionIgnoringUndef(SetOfIntervals A, SetOfIntervals B) {
   AD_CONTRACT_CHECK(A.size() == B.size());
   // First sort by the beginning of the interval
-  A = SortAndCheckDisjointAndNonempty(std::move(A));
-  B = SortAndCheckDisjointAndNonempty(std::move(B));
+  A = SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(A));
+  B = SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(B));
   SetOfIntervals result{{}, A.size()};
   auto itA = A._intervals.begin();
   auto itB = B._intervals.begin();
@@ -142,15 +147,81 @@ SetOfIntervals SetOfIntervals::Union::operator()(SetOfIntervals A,
   std::for_each(itA, A._intervals.end(), truncateAndAppendInterval);
   std::for_each(itB, B._intervals.end(), truncateAndAppendInterval);
 
-  return CheckSortedAndDisjointAndSimplify(
-      SortAndCheckDisjointAndNonempty(std::move(result)));
+  return SetOfIntervals::CheckSortedAndDisjointAndSimplify(
+      SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(result)));
+}
+
+// The complement of the `_intervals` of `s`, ignoring its `undefIntervals()`.
+SetOfIntervals complementIgnoringUndef(SetOfIntervals s) {
+  s = SetOfIntervals::SortAndCheckDisjointAndNonempty(std::move(s));
+  SetOfIntervals result{{}, s.size()};
+  auto& intervals = result._intervals;
+
+  size_t lastElement = 0;
+  for (auto [begin, end] : s._intervals) {
+    // The range that was previously false (not part of the set), now becomes
+    // true.
+    if (lastElement < begin) {
+      intervals.emplace_back(lastElement, begin);
+    }
+    lastElement = end;
+  }
+  if (lastElement < s.size()) {
+    intervals.emplace_back(lastElement, s.size());
+  }
+  return result;
+}
+
+// The rows of `s` that are `true` resp. `undef` resp. `false`, each as a
+// `SetOfIntervals` without `undefIntervals()`.
+SetOfIntervals trueRows(const SetOfIntervals& s) {
+  return {s._intervals, s.size()};
+}
+SetOfIntervals undefRows(const SetOfIntervals& s) {
+  return {s.undefIntervals(), s.size()};
+}
+SetOfIntervals falseRows(const SetOfIntervals& s) {
+  return complementIgnoringUndef(unionIgnoringUndef(trueRows(s), undefRows(s)));
+}
+
+// Combine the `trueRows` and `falseRows` of a result, all other rows are
+// `undef`.
+SetOfIntervals fromTrueAndFalseRows(SetOfIntervals trueRows,
+                                    const SetOfIntervals& falseRows) {
+  auto undef = complementIgnoringUndef(unionIgnoringUndef(trueRows, falseRows));
+  return {std::move(trueRows._intervals), trueRows.size(),
+          std::move(undef._intervals)};
+}
+}  // namespace
+
+// ___________________________________________________________________________
+SetOfIntervals SetOfIntervals::Intersection::operator()(
+    SetOfIntervals A, SetOfIntervals B) const {
+  if (A.undefIntervals_.empty() && B.undefIntervals_.empty()) {
+    return intersectionIgnoringUndef(std::move(A), std::move(B));
+  }
+  // `false && undef` is `false`, `true && undef` is `undef`.
+  return fromTrueAndFalseRows(intersectionIgnoringUndef(A, B),
+                              unionIgnoringUndef(falseRows(A), falseRows(B)));
+}
+
+// ___________________________________________________________________________
+SetOfIntervals SetOfIntervals::Union::operator()(SetOfIntervals A,
+                                                 SetOfIntervals B) const {
+  if (A.undefIntervals_.empty() && B.undefIntervals_.empty()) {
+    return unionIgnoringUndef(std::move(A), std::move(B));
+  }
+  // `true || undef` is `true`, `false || undef` is `undef`.
+  return fromTrueAndFalseRows(
+      unionIgnoringUndef(A, B),
+      intersectionIgnoringUndef(falseRows(A), falseRows(B)));
 }
 
 // ___________________________________________________________________________
 SetOfIntervals SetOfIntervals::CheckSortedAndDisjointAndSimplify(
     const SetOfIntervals& inputSet) {
   auto& inputVec = inputSet._intervals;
-  SetOfIntervals result{{}, inputSet.size()};
+  SetOfIntervals result{{}, inputSet.size(), inputSet.undefIntervals_};
   if (inputVec.empty()) {
     return result;
   }
@@ -170,22 +241,12 @@ SetOfIntervals SetOfIntervals::CheckSortedAndDisjointAndSimplify(
 
 // ____________________________________________________________________________
 SetOfIntervals SetOfIntervals::Complement::operator()(SetOfIntervals s) const {
-  s = SortAndCheckDisjointAndNonempty(s);
-  SetOfIntervals result{{}, s.size()};
-  auto& intervals = result._intervals;
-
-  size_t lastElement = 0;
-  for (auto [begin, end] : s._intervals) {
-    // The range that was previously false (not part of the set), now becomes
-    // true.
-    if (lastElement < begin) {
-      intervals.emplace_back(lastElement, begin);
-    }
-    lastElement = end;
+  if (s.undefIntervals_.empty()) {
+    return complementIgnoringUndef(std::move(s));
   }
-  if (lastElement < s.size()) {
-    intervals.emplace_back(lastElement, s.size());
-  }
+  // `!undef` is `undef`, so the `false` rows become `true`.
+  auto result = falseRows(s);
+  result.undefIntervals_ = std::move(s.undefIntervals_);
   return result;
 }
 

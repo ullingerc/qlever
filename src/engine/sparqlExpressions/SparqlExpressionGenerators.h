@@ -59,6 +59,23 @@ inline ConstIdColumnRef getIdsFromVariable(const ::Variable& variable,
 /// `SingleExpressionResult`s after applying a `Transformation` to them.
 /// Typically, this transformation is one of the value getters from
 /// `SparqlExpressionValueGetters` with an already bound `EvaluationContext`.
+// The `true` and the `undef` intervals of `set` (see `SetOfIntervals`), sorted
+// by their beginning, together with the value (`true` or `undef`) of their
+// rows. All other rows are `false`.
+inline std::vector<std::tuple<size_t, size_t, Id>> trueAndUndefRanges(
+    const ad_utility::SetOfIntervals& set) {
+  std::vector<std::tuple<size_t, size_t, Id>> result;
+  for (const auto& [begin, end] : set._intervals) {
+    result.emplace_back(begin, end, Id::makeFromBool(true));
+  }
+  for (const auto& [begin, end] : set.undefIntervals()) {
+    result.emplace_back(begin, end, Id::makeUndefined());
+  }
+  ql::ranges::sort(result, std::less<>{},
+                   [](const auto& range) { return std::get<0>(range); });
+  return result;
+}
+
 #ifdef QLEVER_EXPRESSION_GENERATOR_BACKPORTS_FOR_CPP17
 // Use range-based implementation for C++17 compatibility.
 CPP_template(typename T, typename Transformation = ql::identity)(
@@ -102,31 +119,30 @@ inline auto resultGeneratorImpl(const ad_utility::SetOfIntervals& set,
                                 Transformation transformation = {}) {
   struct Bounds {
     size_t num_;
-    bool value_;
+    Id value_;
   };
   absl::InlinedVector<Bounds, 10> bounds;
-  bounds.reserve(set._intervals.size() * 2 + 1);
   AD_CONTRACT_CHECK(set.size() == targetSize,
                     "The size of a `SetOfIntervals` does not match the size "
                     "of the evaluation context.");
   size_t last = 0;
-  for (const auto& [lower, upper] : set._intervals) {
+  for (const auto& [lower, upper, value] : trueAndUndefRanges(set)) {
     if (lower != last) {
-      bounds.push_back(Bounds{lower - last, false});
+      bounds.push_back(Bounds{lower - last, Id::makeFromBool(false)});
     }
     if (lower != upper) {
-      bounds.push_back(Bounds{upper - lower, true});
+      bounds.push_back(Bounds{upper - lower, value});
     }
     last = upper;
   }
   if (last < targetSize) {
-    bounds.push_back(Bounds{targetSize - last, false});
+    bounds.push_back(Bounds{targetSize - last, Id::makeFromBool(false)});
   }
   // We have to use `range-v3` as `views::repeat` is a C++23 feature.
   return std::move(bounds) |
          ::ranges::views::transform([transformation](const auto& bound) {
-           return ::ranges::views::repeat_n(
-               transformation(Id::makeFromBool(bound.value_)), bound.num_);
+           return ::ranges::views::repeat_n(transformation(bound.value_),
+                                            bound.num_);
          }) |
          ::ranges::views::join;
 }
@@ -140,16 +156,19 @@ resultGeneratorImpl(ad_utility::SetOfIntervals set, size_t targetSize,
   size_t i = 0;
   const auto trueTransformed = transformation(Id::makeFromBool(true));
   const auto falseTransformed = transformation(Id::makeFromBool(false));
+  const auto undefTransformed = transformation(Id::makeUndefined());
   AD_CONTRACT_CHECK(set.size() == targetSize,
                     "The size of a `SetOfIntervals` does not match the size "
                     "of the evaluation context.");
-  for (const auto& [begin, end] : set._intervals) {
+  for (const auto& [begin, end, value] : trueAndUndefRanges(set)) {
     while (i < begin) {
       co_yield falseTransformed;
       ++i;
     }
+    const auto& transformed =
+        value.isUndefined() ? undefTransformed : trueTransformed;
     while (i < end) {
-      co_yield trueTransformed;
+      co_yield transformed;
       ++i;
     }
   }

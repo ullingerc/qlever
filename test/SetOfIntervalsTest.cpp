@@ -216,3 +216,59 @@ TEST(SetOfIntervals, toIdVector) {
 
   ASSERT_EQ(result, expected);
 }
+
+// _____________________________________________________________________________
+TEST(SetOfIntervals, ThreeValuedLogic) {
+  // Compare `Complement`, `Intersection`, and `Union` with the three-valued
+  // logic of `!`, `&&`, and `||` from the SPARQL standard for all sets of size
+  // three. A row is `F` (false), `T` (true), or `U` (undef).
+  enum V { F, T, U };
+  auto toId = [](V v) {
+    return v == U ? Id::makeUndefined() : Id::makeFromBool(v == T);
+  };
+  auto makeSet = [](const std::array<V, 3>& values) {
+    SetOfIntervals::Vec intervals, undefIntervals;
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (values[i] == T) intervals.emplace_back(i, i + 1);
+      if (values[i] == U) undefIntervals.emplace_back(i, i + 1);
+    }
+    return SetOfIntervals::CheckSortedAndDisjointAndSimplify(
+        {std::move(intervals), values.size(), std::move(undefIntervals)});
+  };
+  auto allocator = makeUnlimitedAllocator<Id>();
+  auto expectRows = [&](const SetOfIntervals& set, auto expected) {
+    std::vector<Id> expectedIds;
+    for (size_t i = 0; i < 3; ++i) {
+      expectedIds.push_back(toId(expected(i)));
+    }
+    EXPECT_THAT(SetOfIntervals::toIdVector(set, allocator),
+                ::testing::ElementsAreArray(expectedIds));
+  };
+  std::vector<std::array<V, 3>> all;
+  for (V a : {F, T, U}) {
+    for (V b : {F, T, U}) {
+      for (V c : {F, T, U}) {
+        all.push_back({a, b, c});
+      }
+    }
+  }
+  for (const auto& a : all) {
+    expectRows(SetOfIntervals::Complement{}(makeSet(a)), [&](size_t i) {
+      return a[i] == U ? U : a[i] == T ? F : T;
+    });
+    for (const auto& b : all) {
+      expectRows(SetOfIntervals::Intersection{}(makeSet(a), makeSet(b)),
+                 [&](size_t i) {
+                   return (a[i] == F || b[i] == F)   ? F
+                          : (a[i] == T && b[i] == T) ? T
+                                                     : U;
+                 });
+      expectRows(SetOfIntervals::Union{}(makeSet(a), makeSet(b)),
+                 [&](size_t i) {
+                   return (a[i] == T || b[i] == T)   ? T
+                          : (a[i] == F && b[i] == F) ? F
+                                                     : U;
+                 });
+    }
+  }
+}

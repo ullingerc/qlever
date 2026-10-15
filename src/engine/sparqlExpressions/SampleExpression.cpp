@@ -20,8 +20,15 @@ ExpressionResult SampleExpression::evaluate(EvaluationContext* context) const {
       return Id::makeUndefined();
     }
     if constexpr (std::is_same_v<T, ad_utility::SetOfIntervals>) {
-      // If there exists an element that is true, return true.
-      return Id::makeFromBool(!childResult._intervals.empty());
+      // If there exists an element that is true, return true. Else return
+      // false if there is one that is false, and undefined otherwise.
+      if (!childResult._intervals.empty()) {
+        return Id::makeFromBool(true);
+      }
+      return ad_utility::SetOfIntervals::Complement{}(childResult)
+                     ._intervals.empty()
+                 ? Id::makeUndefined()
+                 : Id::makeFromBool(false);
     } else if constexpr (isVectorResult<T>) {
       AD_CORRECTNESS_CHECK(!childResult.empty());
       return childResult[0];

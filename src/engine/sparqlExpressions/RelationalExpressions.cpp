@@ -115,7 +115,31 @@ ad_utility::SetOfIntervals evaluateWithBinarySearch(
   for (const auto& [rangeBegin, rangeEnd] : resultRanges) {
     intervals.emplace_back(rangeBegin - begin, rangeEnd - begin);
   }
-  return {std::move(intervals), context->size()};
+
+  // The comparison is an expression error (`UNDEF`) for the rows whose
+  // datatype is incompatible with the one of `valueId`, as in the row-by-row
+  // evaluation (see `compareIds`). In the sorted input, the rows of each
+  // datatype are contiguous, and all string types share one range.
+  ad_utility::SetOfIntervals::Vec undefIntervals;
+  for (size_t i = 0; i <= static_cast<size_t>(Datatype::MaxValue); ++i) {
+    auto datatype = static_cast<Datatype>(i);
+    if (valueIdComparators::detail::areTypesCompatible(datatype,
+                                                       valueId.getDatatype())) {
+      continue;
+    }
+    auto [rangeBegin, rangeEnd] =
+        valueIdComparators::getRangeForDatatype(begin, end, datatype);
+    if (rangeBegin != rangeEnd) {
+      undefIntervals.emplace_back(rangeBegin - begin, rangeEnd - begin);
+    }
+  }
+  ql::ranges::sort(undefIntervals);
+  undefIntervals.erase(
+      std::unique(undefIntervals.begin(), undefIntervals.end()),
+      undefIntervals.end());
+  auto undef = ad_utility::SetOfIntervals::CheckSortedAndDisjointAndSimplify(
+      {std::move(undefIntervals), context->size()});
+  return {std::move(intervals), context->size(), std::move(undef._intervals)};
 }
 
 // The actual comparison function for the `SingleExpressionResult`'s which are

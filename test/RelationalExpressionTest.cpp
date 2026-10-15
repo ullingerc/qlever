@@ -857,9 +857,9 @@ TEST(RelationalExpression, VariableAndConstantBinarySearch) {
   testSortedVariableAndConstant<LT>(ints, int64_t{-1}, {{}, 3});
   testSortedVariableAndConstant<GE>(ints, int64_t{-1}, {{{0, 3}}, 3});
   testSortedVariableAndConstant<LE>(ints, 0.3, {{{0, 1}, {2, 3}}, 3});
-  // ints and strings are always incompatible.
+  // ints and strings are always incompatible, so the comparison is undefined.
   testSortedVariableAndConstant<NE>(ints, IdOrLocalVocabEntry{lve("a string")},
-                                    {{}, 3});
+                                    {{}, 3, {{0, 3}}});
 
   testSortedVariableAndConstant<GT>(doubles, int64_t{0}, {{{0, 2}}, 3});
   testSortedVariableAndConstant<EQ>(doubles, 2.8, {{{1, 2}}, 3});
@@ -877,20 +877,99 @@ TEST(RelationalExpression, VariableAndConstantBinarySearch) {
                                     {{{0, 2}}, 3});
   testSortedVariableAndConstant<NE>(
       vocab, IdOrLocalVocabEntry{lve("\"älpha\"")}, {{{0, 1}, {2, 3}}, 3});
-  testSortedVariableAndConstant<LE>(vocab, inf, {{}, 3});
-
   // Note: vocab entries and numeric values are not compatible, so every
-  // comparison returns false.
-  testSortedVariableAndConstant<NE>(vocab, 3.2, {{}, 3});
+  // comparison is undefined.
+  testSortedVariableAndConstant<LE>(vocab, inf, {{}, 3, {{0, 3}}});
+  testSortedVariableAndConstant<NE>(vocab, 3.2, {{}, 3, {{0, 3}}});
 
-  // Note: only *numeric* values that are not equal to 1.0 are considered here.
-  testSortedVariableAndConstant<NE>(mixed, 1.0, {{{1, 2}}, 3});
-  testSortedVariableAndConstant<GT>(mixed, -inf, {{{0, 2}}, 3});
+  // Note: only *numeric* values that are not equal to 1.0 are considered here,
+  // the comparison with `A` is undefined.
+  testSortedVariableAndConstant<NE>(mixed, 1.0, {{{1, 2}}, 3, {{2, 3}}});
+  testSortedVariableAndConstant<GT>(mixed, -inf, {{{0, 2}}, 3, {{2, 3}}});
   testSortedVariableAndConstant<LE>(
       mixed,
       IdOrLocalVocabEntry{
           LocalVocabEntry::fromIriref("<z>", qec->getLocalVocabContext())},
-      {{{2, 3}}, 3});
+      {{{2, 3}}, 3, {{0, 2}}});
+}
+
+// Check that the evaluation of `variable Comp constant` (and its negation)
+// using binary search on the input sorted by `variable` yields the same `Id`s
+// as the row-by-row evaluation, in particular `UNDEF` for the rows for which
+// the comparison is an expression error.
+template <Comparison Comp, typename T>
+void testBinarySearchMatchesRowByRow(
+    const Variable& variable, const T& constant,
+    source_location l = AD_CURRENT_SOURCE_LOC()) {
+  auto trace = generateLocationTrace(l);
+  TestContext sorted = TestContext::sortedBy(variable);
+  TestContext unsorted = TestContext::sortedBy(variable);
+  unsorted.context._columnsByWhichResultIsSorted.clear();
+  auto evaluate = [&](TestContext& ctx, bool negate) {
+    SparqlExpression::Ptr expression =
+        std::make_unique<relational::RelationalExpression<Comp>>(
+            std::array<SparqlExpression::Ptr, 2>{
+                std::make_unique<VariableExpression>(variable),
+                std::make_unique<SingleUseExpression>(
+                    liftToValueId(constant))});
+    if (negate) {
+      expression = makeUnaryNegateExpression(std::move(expression));
+    }
+    auto result = expression->evaluate(&ctx.context);
+    // The type-erased expressions don't use the optimization for the negation
+    // of a `SetOfIntervals`.
+    if (!negate) {
+      EXPECT_EQ(std::holds_alternative<ad_utility::SetOfIntervals>(result),
+                &ctx == &sorted);
+    }
+    return std::visit(
+        [](const auto& r) -> std::vector<Id> {
+          using R = std::decay_t<decltype(r)>;
+          if constexpr (std::is_same_v<R, ad_utility::SetOfIntervals>) {
+            auto ids =
+                ad_utility::SetOfIntervals::toIdVector(r, makeAllocator());
+            return {ids.begin(), ids.end()};
+          } else if constexpr (std::is_same_v<R, VectorWithMemoryLimit<Id>>) {
+            return {r.begin(), r.end()};
+          } else {
+            ADD_FAILURE() << "Unexpected expression result type";
+            return {};
+          }
+        },
+        result);
+  };
+  for (bool negate : {false, true}) {
+    EXPECT_THAT(evaluate(sorted, negate),
+                ::testing::ElementsAreArray(evaluate(unsorted, negate)))
+        << "negate: " << negate;
+  }
+}
+
+TEST(RelationalExpression, BinarySearchMatchesRowByRow) {
+  auto* qec = testContext().qec;
+  auto lve = [qec](std::string_view literal) {
+    return IdOrLocalVocabEntry{
+        LocalVocabEntry{lit(literal), qec->getLocalVocabContext()}};
+  };
+  for (std::string_view name : {"?ints", "?doubles", "?numeric", "?vocab",
+                                "?mixed", "?localVocab", "?everything"}) {
+    Variable variable{std::string{name}};
+    auto testAllComparisons = [&](const auto& constant) {
+      testBinarySearchMatchesRowByRow<LT>(variable, constant);
+      testBinarySearchMatchesRowByRow<LE>(variable, constant);
+      testBinarySearchMatchesRowByRow<EQ>(variable, constant);
+      testBinarySearchMatchesRowByRow<NE>(variable, constant);
+      testBinarySearchMatchesRowByRow<GE>(variable, constant);
+      testBinarySearchMatchesRowByRow<GT>(variable, constant);
+    };
+    testAllComparisons(IntId(0));
+    testAllComparisons(DoubleId(0.1));
+    testAllComparisons(DoubleId(NaN));
+    testAllComparisons(BoolId(true));
+    testAllComparisons(Id::makeUndefined());
+    testAllComparisons(testContext().x);
+    testAllComparisons(lve("\"alpha\""));
+  }
 }
 
 TEST(RelationalExpression, InExpressionSimpleMemberVariables) {
