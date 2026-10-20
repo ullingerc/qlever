@@ -78,18 +78,35 @@ void Operation::forAllDescendants(F f) const {
 
 // _____________________________________________________________________________
 std::vector<std::string> Operation::collectWarnings() const {
-  // TODO<ullingerc> Warnings of the original computation of a result that was
-  // read from the cache are only part of the runtime information (see
-  // `addWarning`) and are thus missing here.
-  std::vector<std::string> res{*getWarnings().rlock()};
-  for (auto child : getChildren()) {
-    if (!child) {
-      continue;
+  std::vector<std::string> res;
+  auto fromOperations = [&res](const Operation& op, const auto& self) -> void {
+    auto warnings = *op.getWarnings().rlock();
+    res.insert(res.end(), ql::make_move_iterator(warnings.begin()),
+               ql::make_move_iterator(warnings.end()));
+    for (auto child : op.getChildren()) {
+      if (child) {
+        self(*child->getRootOperation(), self);
+      }
     }
-    auto recursive = child->collectWarnings();
-    res.insert(res.end(), ql::make_move_iterator(recursive.begin()),
-               ql::make_move_iterator(recursive.end()));
-  }
+  };
+  fromOperations(*this, fromOperations);
+
+  // Add the warnings that are only part of the runtime information, e.g. the
+  // ones of the original computation of a result that was read from the cache.
+  auto fromRuntimeInfo = [&res](const RuntimeInformation& rti,
+                                const auto& self) -> void {
+    if (rti.details_.contains("warnings")) {
+      for (const auto& warning : rti.details_["warnings"]) {
+        if (ql::ranges::find(res, warning.get<std::string>()) == res.end()) {
+          res.push_back(warning.get<std::string>());
+        }
+      }
+    }
+    for (const auto& child : rti.children_) {
+      self(*child, self);
+    }
+  };
+  fromRuntimeInfo(runtimeInfo(), fromRuntimeInfo);
 
   return res;
 }

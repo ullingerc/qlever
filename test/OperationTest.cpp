@@ -334,9 +334,10 @@ TEST_F(OperationTestFixture, warningsArePartOfRuntimeInformation) {
     EXPECT_EQ(warningsOfUpdate(jsonHistory.size() - 1),
               nlohmann::json(std::vector{"before computation",
                                          "during computation", "other"}));
-    // TODO<ullingerc> `collectWarnings` (used for the `warnings` of the
-    // result) should also include the warnings of the original computation.
-    EXPECT_THAT(op.collectWarnings(), ElementsAre("other"));
+    // `collectWarnings` (used for the `warnings` of the result) also includes
+    // the warnings of the original computation.
+    EXPECT_THAT(op.collectWarnings(), ElementsAre("other", "before computation",
+                                                  "during computation"));
   }
 }
 
