@@ -1226,6 +1226,24 @@ TEST(QueryPlanner, SpatialJoinFromGeofDistanceFilter) {
                                      std::nullopt, scan("?x", "<p>", "?y"),
                                      scan("?a", "<p>", "?b")));
 
+  // Strict and reversed comparisons
+  for (std::string_view filter :
+       {"geof:distance(?y, ?b) < 0.5", "0.5 >= geof:distance(?y, ?b)",
+        "0.5 > geof:distance(?y, ?b)"}) {
+    h::expect(
+        absl::StrCat(
+            "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+            "SELECT * WHERE {"
+            "?a <p> ?b ."
+            "?x <p> ?y ."
+            "FILTER(",
+            filter, ") }"),
+        h::spatialJoinFilterSubstitute(500, -1, V{"?y"}, V{"?b"}, std::nullopt,
+                                       PayloadVariables::all(), algo, type,
+                                       std::nullopt, scan("?x", "<p>", "?y"),
+                                       scan("?a", "<p>", "?b")));
+  }
+
   // Metric distance function
   h::expect(
       "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "

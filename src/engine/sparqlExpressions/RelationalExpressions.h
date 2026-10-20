@@ -128,7 +128,10 @@ using InExpression = relational::InExpression;
 // * `geof:distance(?variable1, ?variable2) <= constant`
 // * `geof:distance(?variable1, ?variable2, unit-constant) <= constant`
 // * `geof:metricDistance(?variable1, ?variable2) <= constant`
-// for rewriting filters to spatial joins.
+// The comparison may also be `<`, or the reversed `constant >= distance` and
+// `constant > distance`. For the strict comparisons, the returned maximum
+// distance is the largest `double` smaller than the constant.
+// This is used for rewriting filters to spatial joins.
 std::optional<std::pair<sparqlExpression::GeoFunctionCall, double>>
 getGeoDistanceFilter(const SparqlExpression& expr);
 

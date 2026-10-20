@@ -71,10 +71,47 @@ TEST(QueryRewriteUtilTest, GetGeoDistanceFilter) {
   auto expr4 = leSprql(std::move(dExpr4), D(10));
   checkGeoDistanceFilter(getGeoDistanceFilter(*expr4), dExp4, 10);
 
-  // "<" relation is unsupported
+  // "<" uses the next smaller `double` as the maximum distance.
   auto [dExpr5, dExp5] = makeMetricDist();
   auto expr5 = ltSprql(std::move(dExpr5), D(10));
-  checkGeoDistanceFilter(getGeoDistanceFilter(*expr5), std::nullopt, 10);
+  auto res5 = getGeoDistanceFilter(*expr5);
+  checkGeoDistanceFilter(res5, dExp5, 10);
+  EXPECT_EQ(res5.value().second, std::nextafter(10.0, 0.0));
+
+  // Reversed ">=": The constant is on the left.
+  auto [dExpr7, dExp7] = makeMetricDist();
+  auto expr7 = geSprql(D(10), std::move(dExpr7));
+  auto res7 = getGeoDistanceFilter(*expr7);
+  checkGeoDistanceFilter(res7, dExp7, 10);
+  EXPECT_EQ(res7.value().second, 10.0);
+
+  // Reversed ">".
+  auto [dExpr8, dExp8] = makeMetricDist();
+  auto expr8 = gtSprql(ValueId::makeFromInt(10), std::move(dExpr8));
+  auto res8 = getGeoDistanceFilter(*expr8);
+  checkGeoDistanceFilter(res8, dExp8, 10);
+  EXPECT_EQ(res8.value().second, std::nextafter(10.0, 0.0));
+
+  // The distance on the wrong side of the comparison is unsupported.
+  auto [dExpr9, dExp9] = makeMetricDist();
+  auto expr9 = geSprql(std::move(dExpr9), D(10));
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr9), std::nullopt, 10);
+  auto [dExpr10, dExp10] = makeMetricDist();
+  auto expr10 = leSprql(D(10), std::move(dExpr10));
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr10), std::nullopt, 10);
+
+  // A strict comparison with a non-positive constant is not rewritten.
+  auto [dExpr11, dExp11] = makeMetricDist();
+  auto expr11 = ltSprql(std::move(dExpr11), D(0));
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr11), std::nullopt, 10);
+  auto [dExpr12, dExp12] = makeMetricDist();
+  auto expr12 = leSprql(std::move(dExpr12), D(0));
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr12), dExp12, 0);
+
+  // Other comparisons are unsupported.
+  auto [dExpr13, dExp13] = makeMetricDist();
+  auto expr13 = eqSprql(std::move(dExpr13), D(10));
+  checkGeoDistanceFilter(getGeoDistanceFilter(*expr13), std::nullopt, 10);
 
   // Non-numeric comparison is unsupported
   auto [dExpr6, dExp6] = makeMetricDist();

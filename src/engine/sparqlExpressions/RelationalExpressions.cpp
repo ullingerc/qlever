@@ -6,6 +6,8 @@
 
 #include "engine/sparqlExpressions/RelationalExpressions.h"
 
+#include <cmath>
+
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/RelationalExpressionHelpers.h"
@@ -642,27 +644,24 @@ namespace sparqlExpression {
 // _____________________________________________________________________________
 std::optional<std::pair<sparqlExpression::GeoFunctionCall, double>>
 getGeoDistanceFilter(const SparqlExpression& expr) {
-  // TODO<ullingerc> Add support for more optimizable filters:
-  // * `geof:distance() < constant`
-  // * `constant > geof:distance()`
-  // * `constant >= geof:distance()`
-  // The supported patterns are documented in the header declaration of this
-  // function.
-
-  // Supported comparison operator
-  auto compareExpr = dynamic_cast<const LessEqualExpression*>(&expr);
-  if (compareExpr == nullptr) {
+  // Supported comparison operators: The distance function may be on either
+  // side, the constant on the other one. `isStrict` is true for `<` / `>`.
+  bool isLt = dynamic_cast<const LessThanExpression*>(&expr) != nullptr;
+  bool isLe = dynamic_cast<const LessEqualExpression*>(&expr) != nullptr;
+  bool isGt = dynamic_cast<const GreaterThanExpression*>(&expr) != nullptr;
+  bool isGe = dynamic_cast<const GreaterEqualExpression*>(&expr) != nullptr;
+  if (!isLt && !isLe && !isGt && !isGe) {
     return std::nullopt;
   }
+  bool distanceIsLeft = isLt || isLe;
+  bool isStrict = isLt || isGt;
 
-  // Left child must be distance function
-  auto children = compareExpr->children();
-  const auto& leftChild = *children[0];
+  auto children = expr.children();
+  const auto& distanceChild = *children[distanceIsLeft ? 0 : 1];
 
-  // Right child must be constant
-  auto rightChild = children[1].get();
-  auto literalExpr =
-      dynamic_cast<detail::LiteralExpression<ValueId>*>(rightChild);
+  // The other child must be constant
+  auto literalExpr = dynamic_cast<const detail::LiteralExpression<ValueId>*>(
+      children[distanceIsLeft ? 1 : 0].get());
   if (literalExpr == nullptr) {
     return std::nullopt;
   }
@@ -679,7 +678,7 @@ getGeoDistanceFilter(const SparqlExpression& expr) {
   }
 
   // Extract variables and distance unit from function call
-  auto geoFuncCall = getGeoDistanceExpressionParameters(leftChild);
+  auto geoFuncCall = getGeoDistanceExpressionParameters(distanceChild);
   if (!geoFuncCall.has_value()) {
     return std::nullopt;
   }
@@ -688,6 +687,17 @@ getGeoDistanceFilter(const SparqlExpression& expr) {
   double maxDist = ad_utility::detail::valueInUnitToKilometer(
                        maxDistAnyUnit, geoFuncCall.value().unit_) *
                    1000;
+
+  // The spatial join includes pairs with a distance exactly equal to the
+  // maximum distance. For a strict comparison, use the next smaller `double`.
+  // A non-positive strict maximum distance can't be represented (a negative
+  // maximum distance disables the distance search), so don't rewrite it.
+  if (isStrict) {
+    if (maxDist <= 0) {
+      return std::nullopt;
+    }
+    maxDist = std::nextafter(maxDist, 0.0);
+  }
 
   return std::pair<GeoFunctionCall, double>{geoFuncCall.value(), maxDist};
 }
