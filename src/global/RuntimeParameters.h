@@ -280,6 +280,13 @@ struct RuntimeParameters {
   DeduplicationModeParameter constructDeduplication_{
       DeduplicationMode{DeduplicationMode::None{}}, "construct-deduplication"};
 
+  // Experimental: derive typed facts (e.g. a maximum distance between two
+  // geometries) from the FILTERs of a group graph pattern, also through `BIND`
+  // and inline `VALUES`, and use them for rewrites like `SpatialJoin`. The
+  // original FILTERs always stay in the query plan. See
+  // `docs/experimental/filter-fact-recognition.md`.
+  Bool enableFilterFactRecognition_{false, "enable-filter-fact-recognition"};
+
   // ___________________________________________________________________________
   // IMPORTANT NOTE: IF YOU ADD PARAMETERS ABOVE, ALSO REGISTER THEM IN THE
   // CONSTRUCTOR, S.T. THEY CAN ALSO BE ACCESSED VIA THE RUNTIME INTERFACE.
