@@ -731,8 +731,10 @@ class QueryPlanner {
                                                          distanceBounds_)} {}
 
     // If `enable-filter-fact-recognition` is set, recognize the facts implied
-    // by the FILTERs of `group` (see `engine/filterFacts`) and return the
-    // `DistanceBound` facts, which become filter substitutes in `fillDpTab`.
+    // by the FILTERs of `group` (see `engine/filterFacts`). Apply the `LangIn`
+    // facts to `group` right away (via `addLanguageFilter`, before its triples
+    // are planned) and return the `DistanceBound` facts, which become filter
+    // substitutes in `fillDpTab`.
     static std::vector<filterFacts::DistanceBound> applyFilterFacts(
         ParsedQuery::GraphPattern& group);
 

@@ -3717,6 +3717,10 @@ QueryPlanner::GraphPatternPlanner::applyFilterFacts(
   for (auto& fact : filterFacts::recognizeFacts(group)) {
     if (auto* bound = std::get_if<filterFacts::DistanceBound>(&fact)) {
       distanceBounds.push_back(std::move(*bound));
+    } else if (auto* lang = std::get_if<filterFacts::LangIn>(&fact)) {
+      // The FILTER stays in `group`, so it doesn't matter whether the language
+      // filter can be applied.
+      group.addLanguageFilter(lang->var_, lang->langs_);
     }
   }
   return distanceBounds;

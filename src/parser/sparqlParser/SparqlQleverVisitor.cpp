@@ -1260,10 +1260,14 @@ GraphPattern Visitor::visit(Parser::GroupGraphPatternContext* ctx) {
   }
   auto [subOps, filters] = visit(ctx->groupGraphPatternSub());
   pattern._graphPatterns = std::move(subOps);
+  // With the filter fact recognition, the `QueryPlanner` applies the language
+  // filters instead, and keeps the FILTER (see `engine/filterFacts`).
+  bool rewriteLanguageFilters =
+      !getRuntimeParameter<&RuntimeParameters::enableFilterFactRecognition_>();
   for (auto& filter : filters) {
     selectExistsVariables(filter);
     if (auto langFilterData = filter.expression_.getLanguageFilterExpression();
-        langFilterData.has_value()) {
+        rewriteLanguageFilters && langFilterData.has_value()) {
       const auto& [variable, language] = langFilterData.value();
       if (pattern.addLanguageFilter(variable, language)) {
         continue;

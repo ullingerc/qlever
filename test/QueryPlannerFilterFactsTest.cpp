@@ -13,6 +13,7 @@
 #include "./util/RuntimeParametersTestHelpers.h"
 #include "engine/ExportQueryExecutionTrees.h"
 #include "engine/Filter.h"
+#include "engine/IndexScan.h"
 #include "engine/SpatialJoin.h"
 
 // Tests for the consumers of the filter fact recognition in the
@@ -202,10 +203,11 @@ TEST(QueryPlannerFilterFacts, NoRewrite) {
   EXPECT_THAT(spatialJoins, IsEmpty());
 }
 
-// Run `q` on the small index from above and return the rows of the result in
-// TSV format, sorted.
-std::vector<std::string> run(const std::string& q) {
-  auto* qec = ad_utility::testing::getQec(std::string{turtle});
+// Run `q` on a small index with the given `turtle` and return the rows of the
+// result in TSV format, sorted.
+std::vector<std::string> run(const std::string& q,
+                             std::string_view kg = turtle) {
+  auto* qec = ad_utility::testing::getQec(std::string{kg});
   qec->clearCacheUnpinnedOnly();
   auto cancellationHandle =
       std::make_shared<ad_utility::CancellationHandle<>>();
@@ -244,6 +246,12 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
        0},
       {absl::StrCat(geoms, "VALUES ?r { 500 UNDEF } FILTER(", dist, " <= ?r)"),
        8},
+      // `?gb` is never bound, so the `SpatialJoin` can never be completed.
+      {absl::StrCat("?a <p> ?ga . FILTER(", dist, " <= 500)"), 0},
+      // The FILTER inside the `OPTIONAL` cannot see `?ga`.
+      {absl::StrCat("?a <p> ?ga . OPTIONAL { ?b <p> ?gb . BIND(", dist,
+                    " AS ?d) FILTER(?d <= 500) }"),
+       4},
   };
   for (const auto& [body, numRows] : queries) {
     auto q = query(body);
@@ -257,6 +265,91 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
     }();
     EXPECT_EQ(withFacts, withoutFacts) << body;
     // The header and the empty line after the last row.
+    EXPECT_EQ(withFacts.size(), numRows + 2) << body;
+  }
+}
+
+// Labels with different language tags.
+constexpr std::string_view langTurtle =
+    "<x1> <label> \"a\"@en . <x1> <label> \"b\"@de . <x2> <label> \"c\"@fr . "
+    "<x3> <label> \"d\" . <x3> <other> \"e\"@en .";
+
+// Plan `body` on the index with the labels from above and return the
+// predicates of all its `IndexScan`s, and the descriptors of all its
+// `Filter`s.
+std::pair<std::vector<std::string>, std::vector<std::string>> planLang(
+    std::string_view body) {
+  auto qet = h::parseAndPlan(
+      query(body), ad_utility::testing::getQec(std::string{langTurtle}));
+  std::vector<const IndexScan*> scans;
+  collect(*qet, scans);
+  std::vector<const Filter*> filters;
+  collect(*qet, filters);
+  std::vector<std::string> predicates;
+  for (const auto* scan : scans) {
+    predicates.push_back(scan->predicate().toString());
+  }
+  std::vector<std::string> descriptors;
+  for (const auto* filter : filters) {
+    descriptors.push_back(filter->getDescriptor());
+  }
+  return {predicates, descriptors};
+}
+
+// _____________________________________________________________________________
+TEST(QueryPlannerFilterFacts, LanguageFilters) {
+  using ::testing::HasSubstr;
+  using ::testing::UnorderedElementsAre;
+  std::string_view direct = "?x <label> ?y FILTER(LANG(?y) = \"en\")";
+  std::string_view bind =
+      "?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")";
+  std::string_view in =
+      "?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))";
+  {
+    // The triple is rewritten, and the FILTER is kept.
+    auto cleanup = factsEnabled(true);
+    for (auto body : {direct, bind}) {
+      auto [predicates, filters] = planLang(body);
+      EXPECT_THAT(predicates, ElementsAre("@en@<label>")) << body;
+      EXPECT_THAT(filters, ElementsAre(HasSubstr("\"en\""))) << body;
+    }
+    auto [predicates, filters] = planLang(in);
+    EXPECT_THAT(predicates, UnorderedElementsAre("@en@<label>", "@de@<label>"));
+    EXPECT_THAT(filters, ElementsAre(HasSubstr("IN")));
+  }
+  // Without the filter fact recognition, only the direct shape is rewritten
+  // (by the parser, which removes the FILTER).
+  auto cleanup = factsEnabled(false);
+  auto [predicates, filters] = planLang(direct);
+  EXPECT_THAT(predicates, ElementsAre("@en@<label>"));
+  EXPECT_THAT(filters, IsEmpty());
+  std::tie(predicates, filters) = planLang(bind);
+  EXPECT_THAT(predicates, ElementsAre("<label>"));
+  EXPECT_THAT(filters, ElementsAre(HasSubstr("?l = \"en\"")));
+}
+
+// _____________________________________________________________________________
+TEST(QueryPlannerFilterFacts, LanguageFilterResultsAreEqual) {
+  std::vector<std::pair<std::string, size_t>> queries{
+      {"?x <label> ?y FILTER(LANG(?y) = \"en\")", 1},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", 1},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))", 2},
+      {"?x <label> ?y FILTER(LANG(?y) = \"en\" || LANG(?y) = \"fr\")", 2},
+      {"?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)", 2},
+      {"?x ?p ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", 2},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"\")", 1},
+  };
+  for (const auto& [body, numRows] : queries) {
+    auto q = query(body);
+    auto withFacts = [&q] {
+      auto cleanup = factsEnabled(true);
+      return run(q, langTurtle);
+    }();
+    auto withoutFacts = [&q] {
+      auto cleanup = factsEnabled(false);
+      return run(q, langTurtle);
+    }();
+    EXPECT_EQ(withFacts, withoutFacts) << body;
     EXPECT_EQ(withFacts.size(), numRows + 2) << body;
   }
 }
