@@ -10,6 +10,7 @@
 #include "./util/ParsedQueryTestHelpers.h"
 #include "./util/TripleComponentTestHelpers.h"
 #include "engine/filterFacts/Canonicalizer.h"
+#include "engine/filterFacts/Recognizers.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 
 namespace {
@@ -26,7 +27,8 @@ constexpr auto iri = ad_utility::testing::iri;
 
 constexpr std::string_view prefixes =
     "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
-    "PREFIX unit: <http://qudt.org/vocab/unit/> ";
+    "PREFIX unit: <http://qudt.org/vocab/unit/> "
+    "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
 
 // The two geometries used by most queries below.
 constexpr std::string_view geoms = "?a <p> ?ga . ?b <p> ?gb . ";
@@ -357,6 +359,141 @@ TEST(FilterFactsDefinitions, CollectDefinitions) {
   EXPECT_THAT(
       collectDefinitions(groupBy._rootGraphPattern._graphPatterns).constants_,
       IsEmpty());
+}
+
+// Recognize the facts of the root group of `SELECT * { <body> }`.
+std::vector<Fact> facts(std::string_view body) {
+  auto query = ad_utility::testing::parseQuery(
+      absl::StrCat(prefixes, "SELECT * { ", body, " }"));
+  return recognizeFacts(query._rootGraphPattern);
+}
+
+// _____________________________________________________________________________
+TEST(FilterFactsRecognizers, DistanceBound) {
+  auto expectBound = [](std::string_view body, double maxMeters,
+                        ad_utility::source_location l =
+                            AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(l);
+    EXPECT_THAT(facts(absl::StrCat(geoms, body)),
+                ElementsAre(VariantWith<DistanceBound>(
+                    DistanceBound{V{"?ga"}, V{"?gb"}, maxMeters})));
+  };
+  // The three shapes from the motivation, and some more.
+  expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)", 500);
+  expectBound("BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)",
+              500);
+  expectBound("VALUES ?r { 500 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
+              500);
+  expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) < 500)", 500);
+  expectBound("FILTER(0.5 >= geof:distance(?ga, ?gb))", 500);
+  expectBound("FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)", 500);
+  // Several values: the largest one is used (over-approximation).
+  expectBound(
+      "VALUES ?r { 500 1000 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
+      1000);
+  expectBound(
+      "VALUES ?r { 500 1000.5 250 } "
+      "FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
+      1000.5);
+
+  // A constant geometry from a single-row `VALUES` clause is substituted (it
+  // is parsed as a `GeoPoint`).
+  auto withPoint =
+      facts(absl::StrCat(geoms,
+                         "VALUES ?p { \"POINT(7.8 47.9)\"^^"
+                         "<http://www.opengis.net/ont/geosparql#wktLiteral> } "
+                         "FILTER(geof:metricDistance(?ga, ?p) <= 500)"));
+  ASSERT_EQ(withPoint.size(), 1);
+  const auto& bound = std::get<DistanceBound>(withPoint[0]);
+  EXPECT_EQ(bound.a_, TripleComponent{V{"?ga"}});
+  EXPECT_FALSE(bound.b_.isVariable());
+  EXPECT_FALSE(bound.b_.isUndef());
+  EXPECT_EQ(bound.maxMeters_, 500);
+}
+
+// _____________________________________________________________________________
+TEST(FilterFactsRecognizers, DistanceBoundNegative) {
+  for (std::string_view body : {
+           // The bound must be numeric.
+           "FILTER(geof:metricDistance(?ga, ?gb) <= \"500\")",
+           "VALUES ?r { \"500\" } FILTER(geof:metricDistance(?ga, ?gb) <= ?r)",
+           "VALUES ?r { 500 \"1000\" } "
+           "FILTER(geof:metricDistance(?ga, ?gb) <= ?r)",
+           "FILTER(geof:metricDistance(?ga, ?gb) <= <x>)",
+           "FILTER(geof:metricDistance(?ga, ?gb) <= -1)",
+           // Wrong comparisons.
+           "FILTER(geof:metricDistance(?ga, ?gb) = 500)",
+           "FILTER(geof:metricDistance(?ga, ?gb) >= 500)",
+           "FILTER(geof:metricDistance(?ga, ?gb) != 500)",
+           "FILTER(500 <= geof:metricDistance(?ga, ?gb))",
+           // A unit which is not a constant, or not a length.
+           "VALUES ?u { unit:M } FILTER(geof:distance(?ga, ?gb, ?u) <= 500)",
+           "FILTER(geof:distance(?ga, ?gb, \"x\") <= 500)",
+           // No variable, or the same variable on both sides.
+           "FILTER(geof:metricDistance(?ga, ?ga) <= 500)",
+           "VALUES (?p ?q) { (\"POINT(1 1)\" \"POINT(2 2)\") } "
+           "FILTER(geof:metricDistance(?p, ?q) <= 500)",
+           // A disjunction.
+           "FILTER(geof:metricDistance(?ga, ?gb) <= 500 || ?a = ?b)",
+           // The `BIND` cannot be substituted.
+           "BIND(geof:metricDistance(?ga, ?gb) + RAND() AS ?d) "
+           "FILTER(?d <= 500)",
+           "VALUES ?r { 500 UNDEF } "
+           "FILTER(geof:metricDistance(?ga, ?gb) <= ?r)",
+       }) {
+    EXPECT_THAT(facts(absl::StrCat(geoms, body)), IsEmpty()) << body;
+  }
+  // The `BIND` is evaluated before `?gb` is bound.
+  EXPECT_THAT(facts("?a <p> ?ga . BIND(geof:metricDistance(?ga, ?gb) AS ?d) "
+                    "?b <p> ?gb . FILTER(?d <= 500)"),
+              IsEmpty());
+}
+
+// _____________________________________________________________________________
+TEST(FilterFactsRecognizers, LangIn) {
+  auto expectLangs =
+      [](std::string_view body, ad_utility::HashSet<std::string> langs,
+         ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
+        auto trace = generateLocationTrace(l);
+        EXPECT_THAT(facts(absl::StrCat("VALUES ?y { \"a\"@en } ", body)),
+                    ElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, langs})));
+      };
+  expectLangs("FILTER(LANG(?y) = \"en\")", {"en"});
+  expectLangs("FILTER(LANG(?y) = \"en\"^^xsd:string)", {"en"});
+  expectLangs("BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", {"en"});
+  expectLangs("BIND(LANG(?y) AS ?l) FILTER(\"en\" = ?l)", {"en"});
+  expectLangs("BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))",
+              {"en", "de"});
+  expectLangs("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")", {"en", "de"});
+  expectLangs("VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)",
+              {"en", "de"});
+
+  for (std::string_view body : {
+           "FILTER(LANG(?y) = \"en\"@de)",
+           "FILTER(LANG(?y) = \"en\"^^<x>)",
+           "FILTER(LANG(?y) = <en>)",
+           "FILTER(LANG(?y) = 1)",
+           "FILTER(LANG(?y) != \"en\")",
+           "FILTER(LANG(?y) IN (\"en\", 1))",
+           "FILTER(LANG(?y) IN ())",
+           "FILTER(LANG(?y) = \"en\" || LANG(?y) != \"de\")",
+           "FILTER(LANGMATCHES(LANG(?y), \"en\"))",
+       }) {
+    EXPECT_THAT(facts(absl::StrCat("VALUES ?y { \"a\"@en } ", body)), IsEmpty())
+        << body;
+  }
+}
+
+// _____________________________________________________________________________
+TEST(FilterFactsRecognizers, SeveralFacts) {
+  EXPECT_THAT(facts(absl::StrCat(geoms,
+                                 "?a <label> ?y . "
+                                 "FILTER(LANG(?y) = \"en\" && "
+                                 "geof:metricDistance(?ga, ?gb) <= 500) "
+                                 "FILTER(?a != ?b)")),
+              UnorderedElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, {"en"}}),
+                                   VariantWith<DistanceBound>(DistanceBound{
+                                       V{"?ga"}, V{"?gb"}, 500})));
 }
 
 }  // namespace
