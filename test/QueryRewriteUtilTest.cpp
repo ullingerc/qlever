@@ -6,6 +6,7 @@
 
 #include "./QueryRewriteUtilTestHelpers.h"
 #include "./util/IndexTestHelpers.h"
+#include "./util/RuntimeParametersTestHelpers.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/QueryRewriteUtils.h"
 #include "engine/SpatialJoin.h"
@@ -255,6 +256,32 @@ TEST(QueryRewriteUtilTest, GetGeoFunctionExpressionParametersWithFixedValue) {
       makePowExpression(getExpr(V{"?a"}), getExpr(V{"?c"})), getExpr(V{"?b"}));
   checkGeoFunctionCall(getGeoFunctionExpressionParameters(*unsupportedArgPtr),
                        std::nullopt);
+}
+
+// _____________________________________________________________________________
+TEST(QueryRewriteUtilTest, GetBinaryOperator) {
+  using BO = sparqlExpression::BinaryExpressionOperator;
+  auto check = [](auto makeFunction, std::optional<BO> expected,
+                  Loc loc = AD_CURRENT_SOURCE_LOC()) {
+    auto l = generateLocationTrace(loc);
+    auto expr = makeFunction(getExpr(V{"?a"}), getExpr(V{"?b"}));
+    EXPECT_EQ(getBinaryOperator(*expr), expected);
+  };
+  check(&makeAndExpression, BO::And);
+  check(&makeOrExpression, BO::Or);
+  check(&makeAddExpression, BO::Add);
+  check(&makeSubtractExpression, BO::Subtract);
+  check(&makeMultiplyExpression, BO::Multiply);
+  check(&makePowExpression, std::nullopt);
+  check(&makeMetricDistExpression, std::nullopt);
+  // Both implementations of the division.
+  for (bool divisionByZeroIsUndef : {true, false}) {
+    auto cleanup =
+        setRuntimeParameterForTest<&RuntimeParameters::divisionByZeroIsUndef_>(
+            divisionByZeroIsUndef);
+    check(&makeDivideExpression, BO::Divide);
+  }
+  EXPECT_EQ(getBinaryOperator(*getExpr(V{"?a"})), std::nullopt);
 }
 
 }  // namespace

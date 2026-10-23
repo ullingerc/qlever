@@ -61,6 +61,23 @@ struct De9imRelationCall : public GeoFunctionCall {
 std::optional<De9imRelationCall> getDe9imRelationExpressionParameters(
     const SparqlExpression& expr);
 
+// The binary operators that `getBinaryOperator` can identify.
+enum class BinaryExpressionOperator {
+  And,
+  Or,
+  Add,
+  Subtract,
+  Multiply,
+  Divide
+};
+
+// Return the operator if `expr` is one of the binary expressions `&&`, `||`,
+// `+`, `-`, `*`, or `/`, and `std::nullopt` otherwise. The operands are
+// `expr.children()`. Implemented in `NumericBinaryExpressions.cpp`, because the
+// classes of these expressions are hidden in that file.
+std::optional<BinaryExpressionOperator> getBinaryOperator(
+    const SparqlExpression& expr);
+
 }  // namespace sparqlExpression
 
 #endif  // QLEVER_SRC_ENGINE_SPARQLEXPRESSIONS_QUERYREWRITEEXPRESSIONHELPERS_H

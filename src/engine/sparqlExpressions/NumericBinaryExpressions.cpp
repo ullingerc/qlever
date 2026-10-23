@@ -3,6 +3,7 @@
 //  Author: Johannes Kalmbach <kalmbacj@cs.uni-freiburg.de>
 #include "engine/sparqlExpressions/BinaryExpression.h"
 #include "engine/sparqlExpressions/NaryExpressionImpl.h"
+#include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/SparqlExpressionValueGetters.h"
 #include "global/RuntimeParameters.h"
 
@@ -521,6 +522,31 @@ SparqlExpression::Ptr makeAndExpression(SparqlExpression::Ptr child1,
 SparqlExpression::Ptr makeOrExpression(SparqlExpression::Ptr child1,
                                        SparqlExpression::Ptr child2) {
   return std::make_unique<OrExpression>(std::move(child1), std::move(child2));
+}
+
+// _____________________________________________________________________________
+std::optional<BinaryExpressionOperator> getBinaryOperator(
+    const SparqlExpression& expr) {
+  auto is = [&expr](auto ti) {
+    using T = typename decltype(ti)::type;
+    return dynamic_cast<const T*>(&expr) != nullptr;
+  };
+  using namespace ad_utility::use_type_identity;
+  if (is(ti<AndExpression>)) {
+    return BinaryExpressionOperator::And;
+  } else if (is(ti<OrExpression>)) {
+    return BinaryExpressionOperator::Or;
+  } else if (is(ti<AddExpression>)) {
+    return BinaryExpressionOperator::Add;
+  } else if (is(ti<SubtractExpression>)) {
+    return BinaryExpressionOperator::Subtract;
+  } else if (is(ti<MultiplyExpression>)) {
+    return BinaryExpressionOperator::Multiply;
+  } else if (is(ti<DivideExpressionByZeroIsUndef>) ||
+             is(ti<DivideExpressionByZeroIsNan>)) {
+    return BinaryExpressionOperator::Divide;
+  }
+  return std::nullopt;
 }
 
 SparqlExpression::Ptr makePowExpression(SparqlExpression::Ptr child1,
