@@ -1,0 +1,2 @@
+add_library(filterFacts Canonicalizer.cpp)
+qlever_target_link_libraries(filterFacts sparqlParser sparqlExpressions)

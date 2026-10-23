@@ -1,4 +1,5 @@
 add_subdirectory(sparqlExpressions)
+add_subdirectory(filterFacts)
 add_library(sortPerformanceEstimator SortPerformanceEstimator.cpp)
 qlever_target_link_libraries(sortPerformanceEstimator index)
 add_library(engine
