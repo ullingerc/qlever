@@ -1457,6 +1457,12 @@ void QueryPlanner::applyFiltersIfPossible(
         continue;
       }
 
+      // An implied entry only offers its substitute, see
+      // `FilterAndOptionalSubstitute::isImplied_`.
+      if (filterAndSubst.isImplied_) {
+        continue;
+      }
+
       constexpr bool applyAll =
           mode == FilterMode::ApplyAllFiltersAndReplaceUnfiltered;
       if constexpr (mode == FilterMode::SeedSubstitutesOnly) {
@@ -1810,8 +1816,12 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
   for (const auto& [i, filterExpression] :
        ::ranges::views::enumerate(filters)) {
     // Check if the filter expression is suitable for spatial join rewriting.
+    // With the filter fact recognition, `geof:distance` filters are handled by
+    // `seedFactSubstitutes`.
     auto sj = rewriteFilterToSpatialJoin(
-        filterExpression, _qec, [this] { return generateUniqueVarName(); });
+        filterExpression, _qec, [this] { return generateUniqueVarName(); },
+        !getRuntimeParameter<
+            &RuntimeParameters::enableFilterFactRecognition_>());
     if (!sj) {
       plans.push_back({filterExpression, std::nullopt});
     } else {
@@ -1829,11 +1839,39 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
 }
 
 // _____________________________________________________________________________
+QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFactSubstitutes(
+    const std::vector<filterFacts::DistanceBound>& distanceBounds) {
+  FiltersAndOptionalSubstitutes plans;
+  plans.reserve(distanceBounds.size());
+  for (const auto& [i, bound] : ::ranges::views::enumerate(distanceBounds)) {
+    FilterAndOptionalSubstitute entry{distanceBoundToFilter(bound),
+                                      std::nullopt};
+    entry.isImplied_ = true;
+    if (auto sj = rewriteDistanceBoundToSpatialJoin(
+            bound, _qec, [this] { return generateUniqueVarName(); })) {
+      // See `seedFilterSubstitutes`.
+      entry.forceSubstitution_ = sj->getChildren().size() == 1;
+      auto plan = makeSubtreePlan(std::move(sj));
+      plan._idsOfIncludedFilters |= 1ULL << i;
+      plan.containsFilterSubstitute_ = true;
+      entry.substitute_ = std::move(plan);
+    }
+    plans.push_back(std::move(entry));
+  }
+  return plans;
+}
+
+// _____________________________________________________________________________
 QueryPlanner::FiltersAndOptionalSubstitutes
 QueryPlanner::wrapFiltersWithoutSubstitutes(
-    const std::vector<SparqlFilter>& filters) {
+    const std::vector<SparqlFilter>& filters,
+    const std::vector<filterFacts::DistanceBound>& distanceBounds) {
   FiltersAndOptionalSubstitutes plans;
-  plans.reserve(filters.size());
+  plans.reserve(distanceBounds.size() + filters.size());
+  for (const auto& bound : distanceBounds) {
+    plans.push_back({distanceBoundToFilter(bound), std::nullopt});
+    plans.back().isImplied_ = true;
+  }
   for (const auto& filter : filters) {
     plans.push_back({filter, std::nullopt});
   }
@@ -1844,17 +1882,28 @@ QueryPlanner::wrapFiltersWithoutSubstitutes(
 std::vector<std::vector<SubtreePlan>> QueryPlanner::fillDpTab(
     const QueryPlanner::TripleGraph& tg, vector<SparqlFilter> filters,
     TextLimitMap& textLimits, const vector<vector<SubtreePlan>>& children,
-    ReplacementPlans replacementPlans) {
+    ReplacementPlans replacementPlans,
+    const std::vector<filterFacts::DistanceBound>& distanceBounds) {
   auto [initialPlans, additionalFilters] =
       seedWithScansAndText(tg, children, textLimits);
   ql::ranges::move(additionalFilters, std::back_inserter(filters));
 
-  // If we have FILTER statements that can also be answered by a special join,
-  // add the respective query plans as filter substitutes.
-  auto filtersAndOptSubstitutes = seedFilterSubstitutes(filters);
-
-  if (filters.size() > 64) {
+  if (distanceBounds.size() + filters.size() > 64) {
     AD_THROW("At most 64 filters allowed at the moment.");
+  }
+
+  // If we have FILTER statements that can also be answered by a special join,
+  // add the respective query plans as filter substitutes. The implied entries
+  // for the facts of the group come first, because their number is the same in
+  // all calls of `fillDpTab` for a group, whereas `filters` may grow (the bits
+  // of `_idsOfIncludedFilters` are the positions in this vector, and they are
+  // kept between these calls). With the switch off, there are no such entries.
+  auto filtersAndOptSubstitutes = seedFactSubstitutes(distanceBounds);
+  for (auto& entry : seedFilterSubstitutes(filters)) {
+    if (entry.substitute_.has_value()) {
+      entry.substitute_->_idsOfIncludedFilters <<= distanceBounds.size();
+    }
+    filtersAndOptSubstitutes.push_back(std::move(entry));
   }
 
   auto componentIndices = QueryGraph::computeConnectedComponents(
@@ -2939,7 +2988,7 @@ void QueryPlanner::QueryGraph::setupGraph(
         // Add additional edges to the graph representing the connections
         // between variables given by joins substituting cartesian product +
         // filter.
-        for (auto& [filter, substitute, forceSubstitution] :
+        for (auto& [filter, substitute, forceSubstitution, isImplied] :
              filtersAndOptionalSubstitutes) {
           if (!substitute.has_value()) {
             // This filter cannot be substituted: add no edges.
@@ -3657,15 +3706,32 @@ void QueryPlanner::GraphPatternPlanner::visitSubquery(
 // _______________________________________________________________
 
 // _______________________________________________________________
+std::vector<filterFacts::DistanceBound>
+QueryPlanner::GraphPatternPlanner::applyFilterFacts(
+    ParsedQuery::GraphPattern& group) {
+  std::vector<filterFacts::DistanceBound> distanceBounds;
+  if (!getRuntimeParameter<
+          &RuntimeParameters::enableFilterFactRecognition_>()) {
+    return distanceBounds;
+  }
+  for (auto& fact : filterFacts::recognizeFacts(group)) {
+    if (auto* bound = std::get_if<filterFacts::DistanceBound>(&fact)) {
+      distanceBounds.push_back(std::move(*bound));
+    }
+  }
+  return distanceBounds;
+}
+
+// _______________________________________________________________
 void QueryPlanner::GraphPatternPlanner::optimizeCommutatively() {
   auto replacementPlans =
       planner_.createMaterializedViewJoinReplacements(candidateTriples_);
   auto tg = planner_.createTripleGraph(&candidateTriples_);
-  auto lastRow =
-      planner_
-          .fillDpTab(tg, rootPattern_->_filters, rootPattern_->textLimits_,
-                     candidatePlans_, std::move(replacementPlans))
-          .back();
+  auto lastRow = planner_
+                     .fillDpTab(tg, rootPattern_->_filters,
+                                rootPattern_->textLimits_, candidatePlans_,
+                                std::move(replacementPlans), distanceBounds_)
+                     .back();
   candidateTriples_._triples.clear();
   candidatePlans_.clear();
   candidatePlans_.push_back(std::move(lastRow));

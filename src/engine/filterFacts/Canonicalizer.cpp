@@ -250,13 +250,17 @@ class Canonicalizer {
     return {Opaque{&expr}, 1};
   }
 
-  // Replace a variable argument of a function by its value, if it has a
-  // single one.
+  // Replace a geometry argument of a function by its value, if it has a single
+  // one which can be a geometry (a literal, or a `GeoPoint` from `VALUES`).
   TripleComponent resolve(const TripleComponent& tc) {
     if (tc.isVariable()) {
       if (auto it = defs_.constants_.find(tc.getVariable());
           it != defs_.constants_.end() && it->second.size() == 1) {
-        return it->second.front();
+        const auto& value = it->second.front();
+        if (value.isLiteral() ||
+            std::holds_alternative<GeoPoint>(value.getVariant())) {
+          return value;
+        }
       }
     }
     return tc;

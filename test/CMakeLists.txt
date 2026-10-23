@@ -636,6 +636,8 @@ addLinkAndDiscoverTest(QueryRewriteUtilTest engine)
 
 addLinkAndDiscoverTest(FilterFactsTest filterFacts)
 
+addLinkAndDiscoverTest(QueryPlannerFilterFactsTest engine)
+
 addLinkAndDiscoverTest(HttpErrorTest engine)
 
 addLinkAndDiscoverTest(TimeTracerTest)

@@ -21,6 +21,7 @@
 #include "engine/CheckUsePatternTrick.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/RuntimeInformation.h"
+#include "engine/filterFacts/Recognizers.h"
 #include "parser/GraphPattern.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/ParsedQuery.h"
@@ -189,6 +190,12 @@ class QueryPlanner {
     // it will otherwise never have its second child attached.
     bool forceSubstitution_ = false;
 
+    // This entry was derived from a fact that is implied by the FILTERs of the
+    // group (see `engine/filterFacts`). It only offers its substitute, and is
+    // never applied as a regular filter: the original FILTERs stay in the plan
+    // via their own entries.
+    bool isImplied_ = false;
+
     bool hasSubstitute() const { return substitute_.has_value(); }
   };
 
@@ -351,12 +358,21 @@ class QueryPlanner {
   virtual FiltersAndOptionalSubstitutes seedFilterSubstitutes(
       const std::vector<SparqlFilter>& filters);
 
+  // The implied filter substitutes (see `FilterAndOptionalSubstitute`) for the
+  // `DistanceBound` facts of a group: one entry per fact, with a `SpatialJoin`
+  // substitute.
+  FiltersAndOptionalSubstitutes seedFactSubstitutes(
+      const std::vector<filterFacts::DistanceBound>& distanceBounds);
+
   // Wrap `filters` as `FiltersAndOptionalSubstitutes` without computing any
   // substitutes. This is sufficient for the filter modes that never apply
   // substitutes and avoids constructing throwaway substitute plans (which
-  // would also consume internal variable names).
+  // would also consume internal variable names). The `distanceBounds` get
+  // implied entries without a substitute in front of the `filters`, such that
+  // the positions of the entries are the same as in `fillDpTab`.
   static FiltersAndOptionalSubstitutes wrapFiltersWithoutSubstitutes(
-      const std::vector<SparqlFilter>& filters);
+      const std::vector<SparqlFilter>& filters,
+      const std::vector<filterFacts::DistanceBound>& distanceBounds = {});
 
   // TODO<RobinTF> Extract to dedicated module, this has little to do with
   // actual query planning.
@@ -623,7 +639,8 @@ class QueryPlanner {
   vector<vector<SubtreePlan>> fillDpTab(
       const TripleGraph& graph, std::vector<SparqlFilter> fs,
       TextLimitMap& textLimits, const vector<vector<SubtreePlan>>& children,
-      ReplacementPlans replacementPlans);
+      ReplacementPlans replacementPlans,
+      const std::vector<filterFacts::DistanceBound>& distanceBounds = {});
 
   // Internal subroutine of `fillDpTab` that  only works on a single connected
   // component of the input. Throws if the subtrees in the `connectedComponent`
@@ -693,6 +710,9 @@ class QueryPlanner {
     // of the result, see `getVariablesOfPreviousPatterns` for those.
     ad_utility::HashSet<Variable> boundVariables_{};
 
+    // The `DistanceBound` facts of the `rootPattern_`, see `applyFilterFacts`.
+    std::vector<filterFacts::DistanceBound> distanceBounds_;
+
     // The filters of the `rootPattern_`, wrapped for `applyFiltersIfPossible`.
     // No substitutes are computed here: this member is only used with
     // `FilterMode::ApplyAllFiltersAndReplaceUnfiltered`, which never applies
@@ -706,8 +726,15 @@ class QueryPlanner {
         : planner_{planner},
           rootPattern_{rootPattern},
           qec_{planner._qec},
-          filtersAndSubst_{
-              wrapFiltersWithoutSubstitutes(rootPattern->_filters)} {}
+          distanceBounds_{applyFilterFacts(*rootPattern)},
+          filtersAndSubst_{wrapFiltersWithoutSubstitutes(rootPattern->_filters,
+                                                         distanceBounds_)} {}
+
+    // If `enable-filter-fact-recognition` is set, recognize the facts implied
+    // by the FILTERs of `group` (see `engine/filterFacts`) and return the
+    // `DistanceBound` facts, which become filter substitutes in `fillDpTab`.
+    static std::vector<filterFacts::DistanceBound> applyFilterFacts(
+        ParsedQuery::GraphPattern& group);
 
     // This function is called for each of the graph patterns that are contained
     // in the `rootPattern_`. It dispatches to the various `visit...`functions
