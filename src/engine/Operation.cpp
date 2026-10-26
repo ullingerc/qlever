@@ -196,10 +196,22 @@ Result Operation::runComputation(const ad_utility::Timer& timer,
     rti.totalTime_ = timer.msecs();
     rti.originalTotalTime_ = rti.totalTime_;
     rti.originalOperationTime_ = rti.getOperationTime();
+    // The lazy result may outlive the derived parts of this operation, e.g. if
+    // it is a precomputed result for the sibling of a `Service` that was never
+    // consumed and is destroyed by `~Operation`. Then the callbacks must not
+    // call any virtual methods ("pure virtual method called"). If this
+    // operation is not owned by a `shared_ptr`, the callbacks always run.
+    auto isDestroyed = [weak = weak_from_this(),
+                        isOwned = !weak_from_this().expired()]() {
+      return isOwned && weak.expired();
+    };
     result.runOnNewChunkComputed(
-        [this, vocabStats = LocalVocabTracking{}, ker = knownEmptyResult()](
-            const Result::IdTableVocabPair& pair,
-            std::chrono::microseconds duration) mutable {
+        [this, isDestroyed, vocabStats = LocalVocabTracking{},
+         ker = knownEmptyResult()](const Result::IdTableVocabPair& pair,
+                                   std::chrono::microseconds duration) mutable {
+          if (isDestroyed()) {
+            return;
+          }
           const IdTable& idTable = pair.idTable_;
           AD_CORRECTNESS_CHECK(idTable.empty() || !ker,
                                "Operation returned non-empty result, but "
@@ -220,8 +232,11 @@ Result Operation::runComputation(const ad_utility::Timer& timer,
           }
           signalQueryUpdate(RuntimeInformation::SendPriority::IfDue);
         },
-        [this](Result::GeneratorState state,
-               std::chrono::microseconds duration) {
+        [this, isDestroyed](Result::GeneratorState state,
+                            std::chrono::microseconds duration) {
+          if (isDestroyed()) {
+            return;
+          }
           // The call that exhausted the generator did not yield a chunk, but
           // its time still belongs to this operation.
           updateRuntimeStats(false, 0, getResultWidth(), duration);

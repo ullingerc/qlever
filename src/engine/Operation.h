@@ -54,7 +54,9 @@ enum class LimitOffsetHandling {
   FULL
 };
 
-class Operation {
+// `enable_shared_from_this` lets the callbacks of lazy results detect that this
+// operation is already being destroyed, see `runComputation`.
+class Operation : public std::enable_shared_from_this<Operation> {
  private:
   using SharedCancellationHandle = ad_utility::SharedCancellationHandle;
   using Milliseconds = std::chrono::milliseconds;

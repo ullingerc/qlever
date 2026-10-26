@@ -10,6 +10,7 @@
 #include <regex>
 
 #include "backports/StartsWithAndEndsWith.h"
+#include "engine/Join.h"
 #include "engine/Service.h"
 #include "engine/Sort.h"
 #include "engine/StripColumns.h"
@@ -928,6 +929,39 @@ TEST_F(ServiceTest, precomputeSiblingResultDoesNotWorkWithLimit) {
   }
 }
 
+namespace {
+// Adaptation of the `Values` class that computes lazy results (one row per
+// chunk) when laziness is requested.
+class MockValues : public Values {
+ public:
+  MockValues(QueryExecutionContext* qec, parsedQuery::SparqlValues parsedValues)
+      : Operation{qec}, Values(qec, parsedValues) {}
+
+  Result computeResult([[maybe_unused]] bool requestLaziness) override {
+    Result res = Values::computeResult(false);
+
+    if (!requestLaziness) {
+      return Result(Result::IdTableVocabPair(res.cloneIdTable(),
+                                             res.localVocab().clone()),
+                    res.sortedBy());
+    }
+
+    // yield each row individually
+    return {[&](IdTable clone) -> Result::Generator {
+              IdTable idt{clone.numColumns(),
+                          ad_utility::makeUnlimitedAllocator<IdTable>()};
+              for (size_t i = 0; i < clone.size(); ++i) {
+                idt.push_back(clone[i]);
+                Result::IdTableVocabPair pair{std::move(idt), LocalVocab{}};
+                co_yield pair;
+                idt.clear();
+              }
+            }(res.cloneIdTable()),
+            res.sortedBy()};
+  }
+};
+}  // namespace
+
 // ____________________________________________________________________________
 TEST_F(ServiceTest, precomputeSiblingResult) {
   auto service = std::make_shared<Service>(
@@ -945,37 +979,6 @@ TEST_F(ServiceTest, precomputeSiblingResult) {
           boost::beast::http::status::ok, "application/sparql-results+json"));
 
   auto service2 = std::make_shared<Service>(*service);
-
-  // Adaptation of the Values class, allowing to compute lazy Results.
-  class MockValues : public Values {
-   public:
-    MockValues(QueryExecutionContext* qec,
-               parsedQuery::SparqlValues parsedValues)
-        : Operation{qec}, Values(qec, parsedValues) {}
-
-    Result computeResult([[maybe_unused]] bool requestLaziness) override {
-      Result res = Values::computeResult(false);
-
-      if (!requestLaziness) {
-        return Result(Result::IdTableVocabPair(res.cloneIdTable(),
-                                               res.localVocab().clone()),
-                      res.sortedBy());
-      }
-
-      // yield each row individually
-      return {[&](IdTable clone) -> Result::Generator {
-                IdTable idt{clone.numColumns(),
-                            ad_utility::makeUnlimitedAllocator<IdTable>()};
-                for (size_t i = 0; i < clone.size(); ++i) {
-                  idt.push_back(clone[i]);
-                  Result::IdTableVocabPair pair{std::move(idt), LocalVocab{}};
-                  co_yield pair;
-                  idt.clear();
-                }
-              }(res.cloneIdTable()),
-              res.sortedBy()};
-    }
-  };
 
   auto iri = ad_utility::testing::iri;
   using TC = TripleComponent;
@@ -1342,4 +1345,38 @@ TEST_F(ServiceTest, redirectsIntegration) {
                         boost::beast::http::status::ok, matchers)};
     EXPECT_NO_THROW(service.computeResultOnlyForTesting());
   }
+}
+
+// ____________________________________________________________________________
+TEST_F(ServiceTest, unconsumedLazySiblingResultDoesNotCrash) {
+  auto cleanup =
+      setRuntimeParameterForTest<&RuntimeParameters::serviceMaxValueRows_>(0);
+  auto service = std::make_shared<Service>(
+      testQec,
+      parsedQuery::Service{
+          {Variable{"?x"}, Variable{"?y"}},
+          TripleComponent::Iri::fromIriref("<http://localhorst/api>"),
+          "PREFIX doof: <http://doof.org>",
+          "{ }",
+          false},
+      getResultFunctionFactory(
+          "http://localhorst:80/api",
+          "PREFIX doof: <http://doof.org> SELECT ?x ?y { }", "service failed",
+          boost::beast::http::status::internal_server_error, "text/plain"));
+  auto iri = ad_utility::testing::iri;
+  using TC = TripleComponent;
+  auto sibling = std::make_shared<MockValues>(
+      testQec, parsedQuery::SparqlValues{{Variable{"?x"}, Variable{"?z"}},
+                                         {{TC(iri("<x>")), TC(iri("<y>"))},
+                                          {TC(iri("<z>")), TC(iri("<a>"))}}});
+  // The `Service` is the left child, so it is computed (and fails) before the
+  // sibling on the right consumes its precomputed result.
+  auto join = std::make_shared<Join>(
+      testQec, std::make_shared<QueryExecutionTree>(testQec, service),
+      std::make_shared<QueryExecutionTree>(testQec, sibling), 0, 0, true,
+      false);
+  EXPECT_ANY_THROW(join->computeResult(true));
+  // Used to terminate the program.
+  join.reset();
+  sibling.reset();
 }
