@@ -15,6 +15,7 @@
 #include "engine/Sort.h"
 #include "engine/StripColumns.h"
 #include "engine/Values.h"
+#include "engine/ValuesForTesting.h"
 #include "global/Constants.h"
 #include "global/IndexTypes.h"
 #include "global/RuntimeParameters.h"
@@ -929,39 +930,6 @@ TEST_F(ServiceTest, precomputeSiblingResultDoesNotWorkWithLimit) {
   }
 }
 
-namespace {
-// Adaptation of the `Values` class that computes lazy results (one row per
-// chunk) when laziness is requested.
-class MockValues : public Values {
- public:
-  MockValues(QueryExecutionContext* qec, parsedQuery::SparqlValues parsedValues)
-      : Operation{qec}, Values(qec, parsedValues) {}
-
-  Result computeResult([[maybe_unused]] bool requestLaziness) override {
-    Result res = Values::computeResult(false);
-
-    if (!requestLaziness) {
-      return Result(Result::IdTableVocabPair(res.cloneIdTable(),
-                                             res.localVocab().clone()),
-                    res.sortedBy());
-    }
-
-    // yield each row individually
-    return {[&](IdTable clone) -> Result::Generator {
-              IdTable idt{clone.numColumns(),
-                          ad_utility::makeUnlimitedAllocator<IdTable>()};
-              for (size_t i = 0; i < clone.size(); ++i) {
-                idt.push_back(clone[i]);
-                Result::IdTableVocabPair pair{std::move(idt), LocalVocab{}};
-                co_yield pair;
-                idt.clear();
-              }
-            }(res.cloneIdTable()),
-            res.sortedBy()};
-  }
-};
-}  // namespace
-
 // ____________________________________________________________________________
 TEST_F(ServiceTest, precomputeSiblingResult) {
   auto service = std::make_shared<Service>(
@@ -979,6 +947,37 @@ TEST_F(ServiceTest, precomputeSiblingResult) {
           boost::beast::http::status::ok, "application/sparql-results+json"));
 
   auto service2 = std::make_shared<Service>(*service);
+
+  // Adaptation of the Values class, allowing to compute lazy Results.
+  class MockValues : public Values {
+   public:
+    MockValues(QueryExecutionContext* qec,
+               parsedQuery::SparqlValues parsedValues)
+        : Operation{qec}, Values(qec, parsedValues) {}
+
+    Result computeResult([[maybe_unused]] bool requestLaziness) override {
+      Result res = Values::computeResult(false);
+
+      if (!requestLaziness) {
+        return Result(Result::IdTableVocabPair(res.cloneIdTable(),
+                                               res.localVocab().clone()),
+                      res.sortedBy());
+      }
+
+      // yield each row individually
+      return {[&](IdTable clone) -> Result::Generator {
+                IdTable idt{clone.numColumns(),
+                            ad_utility::makeUnlimitedAllocator<IdTable>()};
+                for (size_t i = 0; i < clone.size(); ++i) {
+                  idt.push_back(clone[i]);
+                  Result::IdTableVocabPair pair{std::move(idt), LocalVocab{}};
+                  co_yield pair;
+                  idt.clear();
+                }
+              }(res.cloneIdTable()),
+              res.sortedBy()};
+    }
+  };
 
   auto iri = ad_utility::testing::iri;
   using TC = TripleComponent;
@@ -1363,14 +1362,11 @@ TEST_F(ServiceTest, unconsumedLazySiblingResultDoesNotCrash) {
           "http://localhorst:80/api",
           "PREFIX doof: <http://doof.org> SELECT ?x ?y { }", "service failed",
           boost::beast::http::status::internal_server_error, "text/plain"));
-  auto iri = ad_utility::testing::iri;
-  using TC = TripleComponent;
-  auto sibling = std::make_shared<MockValues>(
-      testQec, parsedQuery::SparqlValues{{Variable{"?x"}, Variable{"?z"}},
-                                         {{TC(iri("<x>")), TC(iri("<y>"))},
-                                          {TC(iri("<z>")), TC(iri("<a>"))}}});
+  auto sibling = std::make_shared<ValuesForTesting>(
+      testQec, makeIdTableFromVector({{1, 2}, {3, 4}}),
+      std::vector<std::optional<Variable>>{Variable{"?x"}, Variable{"?z"}});
   // The `Service` is the left child, so it is computed (and fails) before the
-  // sibling on the right consumes its precomputed result.
+  // sibling on the right consumes its precomputed (lazy) result.
   auto join = std::make_shared<Join>(
       testQec, std::make_shared<QueryExecutionTree>(testQec, service),
       std::make_shared<QueryExecutionTree>(testQec, sibling), 0, 0, true,
