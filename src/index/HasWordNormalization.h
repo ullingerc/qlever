@@ -1,6 +1,6 @@
 // Copyright 2026 The QLever Authors, in particular:
 //
-// 2026 Christoph Ullinger <ullingec@informatik.uni-freiburg.de>, UFR
+// 2026 Christoph Ullinger <ullingec@cs.uni-freiburg.de>, UFR
 //
 // UFR = University of Freiburg, Chair of Algorithms and Data Structures
 //
@@ -24,7 +24,11 @@ enum class HasWordNormalizationEnum : uint8_t { Lowercase, LowercaseNoAccents };
 // (option `--has-word-normalization` of `qlever-index`). In all modes, literals
 // are split at non-alphanumeric characters and the words are lowercased. With
 // `LowercaseNoAccents`, additionally all combining accents are removed from the
-// words (e.g. "Café" becomes "cafe").
+// words (e.g. "Café" becomes "cafe"). The SPARQL function `ql:normalize`
+// applies the same normalization to words in queries.
+//
+// NOTE: The accents are all nonspacing marks (see `removeAccentsUtf8`), which
+// in some scripts (e.g. Devanagari or Thai) also include vowel signs.
 class HasWordNormalization
     : public EnumWithStrings<HasWordNormalization, HasWordNormalizationEnum> {
  public:
@@ -48,6 +52,11 @@ const inline HasWordNormalization HasWordNormalization::Lowercase{
     HasWordNormalization::Enum::Lowercase};
 const inline HasWordNormalization HasWordNormalization::LowercaseNoAccents{
     HasWordNormalization::Enum::LowercaseNoAccents};
+
+// The key under which the normalization is stored in the configuration of an
+// index.
+inline constexpr std::string_view HAS_WORD_NORMALIZATION_KEY =
+    "has-word-normalization";
 
 }  // namespace ad_utility
 
