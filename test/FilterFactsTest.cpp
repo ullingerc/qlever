@@ -7,6 +7,9 @@
 #include <absl/strings/str_cat.h>
 #include <gmock/gmock.h>
 
+#include <cmath>
+#include <limits>
+
 #include "./util/ParsedQueryTestHelpers.h"
 #include "./util/TripleComponentTestHelpers.h"
 #include "engine/filterFacts/Canonicalizer.h"
@@ -77,9 +80,10 @@ auto numericConstraint(Term lhs, Comparison op, std::vector<double> rhs) {
 }
 
 // Matcher for a `Constraint` with arbitrary constants on the right side.
-auto constraint(Term lhs, Comparison op, std::vector<TripleComponent> rhs) {
+auto constraint(Term lhs, Comparison op, std::vector<TripleComponent> rhs,
+                bool exact = true) {
   return VariantWith<Constraint>(
-      Constraint{std::move(lhs), op, std::move(rhs)});
+      Constraint{std::move(lhs), op, std::move(rhs), exact});
 }
 
 // Matcher for an `Opaque` conjunct whose expression contains exactly the
@@ -273,7 +277,12 @@ TEST(FilterFactsCanonicalizer, Lang) {
   expectLang("FILTER(LANG(?y) IN (\"en\", \"de\"))", {en, de});
   expectLang("BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))", {en, de});
   expectLang("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")", {en, de});
-  expectLang("VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)", {en, de});
+
+  // A variable with several values from `VALUES` makes the constraint inexact.
+  EXPECT_THAT(canonical("VALUES ?y { \"a\"@en } VALUES ?l { \"en\" \"de\" } "
+                        "FILTER(LANG(?y) = ?l)")
+                  .conjuncts_,
+              ElementsAre(constraint(lang, Comparison::EQ, {en, de}, false)));
 
   // Different variables or operators are not merged.
   EXPECT_THAT(canonical("VALUES (?y ?z) { (\"a\"@en \"b\"@de) } "
@@ -377,40 +386,47 @@ TEST(FilterFactsDefinitions, CollectDefinitions) {
       IsEmpty());
 }
 
-// Recognize the facts of the root group of `SELECT * { <body> }`.
+// Recognize the facts of all FILTERs of the root group of
+// `SELECT * { <body> }`.
 std::vector<Fact> facts(std::string_view body) {
   auto query = ad_utility::testing::parseQuery(
       absl::StrCat(prefixes, "SELECT * { ", body, " }"));
-  return recognizeFacts(query._rootGraphPattern);
+  std::vector<Fact> result;
+  for (auto& filterFacts : recognizeFacts(query._rootGraphPattern)) {
+    ql::ranges::move(filterFacts.facts_, std::back_inserter(result));
+  }
+  return result;
 }
 
 // _____________________________________________________________________________
 TEST(FilterFactsRecognizers, DistanceBound) {
-  auto expectBound = [](std::string_view body, double maxMeters,
-                        ad_utility::source_location l =
-                            AD_CURRENT_SOURCE_LOC()) {
-    auto trace = generateLocationTrace(l);
-    EXPECT_THAT(facts(absl::StrCat(geoms, body)),
-                ElementsAre(VariantWith<DistanceBound>(
-                    DistanceBound{V{"?ga"}, V{"?gb"}, maxMeters})));
-  };
+  auto expectBound =
+      [](std::string_view body, double maxMeters, bool exact = true,
+         ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
+        auto trace = generateLocationTrace(l);
+        EXPECT_THAT(facts(absl::StrCat(geoms, body)),
+                    ElementsAre(VariantWith<DistanceBound>(
+                        DistanceBound{V{"?ga"}, V{"?gb"}, maxMeters, exact})));
+      };
   // The three shapes from the motivation, and some more.
   expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)", 500);
   expectBound("BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)",
               500);
   expectBound("VALUES ?r { 500 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
               500);
-  expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) < 500)", 500);
+  // For `<`, the largest double below the constant is used.
+  expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) < 500)",
+              std::nextafter(500.0, -std::numeric_limits<double>::infinity()));
   expectBound("FILTER(0.5 >= geof:distance(?ga, ?gb))", 500);
   expectBound("FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)", 500);
   // Several values: the largest one is used (over-approximation).
   expectBound(
       "VALUES ?r { 500 1000 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-      1000);
+      1000, false);
   expectBound(
       "VALUES ?r { 500 1000.5 250 } "
       "FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-      1000.5);
+      1000.5, false);
 
   // A constant geometry from a single-row `VALUES` clause is substituted (it
   // is parsed as a `GeoPoint`).
@@ -469,10 +485,12 @@ TEST(FilterFactsRecognizers, DistanceBoundNegative) {
 TEST(FilterFactsRecognizers, LangIn) {
   auto expectLangs =
       [](std::string_view body, ad_utility::HashSet<std::string> langs,
+         bool exact = true,
          ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
         auto trace = generateLocationTrace(l);
-        EXPECT_THAT(facts(absl::StrCat("VALUES ?y { \"a\"@en } ", body)),
-                    ElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, langs})));
+        EXPECT_THAT(
+            facts(absl::StrCat("VALUES ?y { \"a\"@en } ", body)),
+            ElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, langs, exact})));
       };
   expectLangs("FILTER(LANG(?y) = \"en\")", {"en"});
   expectLangs("FILTER(LANG(?y) = \"en\"^^xsd:string)", {"en"});
@@ -481,8 +499,8 @@ TEST(FilterFactsRecognizers, LangIn) {
   expectLangs("BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))",
               {"en", "de"});
   expectLangs("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")", {"en", "de"});
-  expectLangs("VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)",
-              {"en", "de"});
+  expectLangs("VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)", {"en", "de"},
+              false);
 
   for (std::string_view body : {
            "FILTER(LANG(?y) = \"en\"@de)",
@@ -510,6 +528,31 @@ TEST(FilterFactsRecognizers, SeveralFacts) {
               UnorderedElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, {"en"}}),
                                    VariantWith<DistanceBound>(DistanceBound{
                                        V{"?ga"}, V{"?gb"}, 500})));
+}
+
+// Test that a FILTER is exact iff each of its conjuncts is an exact fact.
+TEST(FilterFactsRecognizers, ExactFilters) {
+  auto isExact = [](std::string_view filter) {
+    auto query = ad_utility::testing::parseQuery(
+        absl::StrCat(prefixes, "SELECT * { ", geoms, "VALUES ?y { \"a\"@en } ",
+                     filter, " }"));
+    auto factsPerFilter = recognizeFacts(query._rootGraphPattern);
+    AD_CORRECTNESS_CHECK(factsPerFilter.size() == 1);
+    return factsPerFilter[0].exact_;
+  };
+
+  // Exact facts, also several of them.
+  EXPECT_TRUE(isExact("FILTER(geof:metricDistance(?ga, ?gb) <= 500)"));
+  EXPECT_TRUE(isExact("FILTER(geof:metricDistance(?ga, ?gb) < 500)"));
+  EXPECT_TRUE(isExact("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")"));
+  EXPECT_TRUE(isExact(
+      "FILTER(LANG(?y) = \"en\" && geof:metricDistance(?ga, ?gb) <= 500)"));
+
+  // A conjunct that is not a fact, or a fact from several values.
+  EXPECT_FALSE(
+      isExact("FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)"));
+  EXPECT_FALSE(isExact(
+      "VALUES ?r { 500 1000 } FILTER(geof:metricDistance(?ga, ?gb) <= ?r)"));
 }
 
 }  // namespace

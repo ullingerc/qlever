@@ -1840,10 +1840,12 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
 
 // _____________________________________________________________________________
 QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFactSubstitutes(
-    const std::vector<filterFacts::DistanceBound>& distanceBounds) {
+    const std::vector<DistanceBoundAndFilter>& distanceBounds) {
   FiltersAndOptionalSubstitutes plans;
   plans.reserve(distanceBounds.size());
-  for (const auto& [i, bound] : ::ranges::views::enumerate(distanceBounds)) {
+  for (const auto& [i, boundAndFilter] :
+       ::ranges::views::enumerate(distanceBounds)) {
+    const auto& [bound, replacedFilter] = boundAndFilter;
     FilterAndOptionalSubstitute entry{distanceBoundToFilter(bound),
                                       std::nullopt};
     entry.isImplied_ = true;
@@ -1853,6 +1855,10 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFactSubstitutes(
       entry.forceSubstitution_ = sj->getChildren().size() == 1;
       auto plan = makeSubtreePlan(std::move(sj));
       plan._idsOfIncludedFilters |= 1ULL << i;
+      if (replacedFilter.has_value()) {
+        plan._idsOfIncludedFilters |=
+            1ULL << (distanceBounds.size() + replacedFilter.value());
+      }
       plan.containsFilterSubstitute_ = true;
       entry.substitute_ = std::move(plan);
     }
@@ -1865,10 +1871,10 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFactSubstitutes(
 QueryPlanner::FiltersAndOptionalSubstitutes
 QueryPlanner::wrapFiltersWithoutSubstitutes(
     const std::vector<SparqlFilter>& filters,
-    const std::vector<filterFacts::DistanceBound>& distanceBounds) {
+    const std::vector<DistanceBoundAndFilter>& distanceBounds) {
   FiltersAndOptionalSubstitutes plans;
   plans.reserve(distanceBounds.size() + filters.size());
-  for (const auto& bound : distanceBounds) {
+  for (const auto& [bound, replacedFilter] : distanceBounds) {
     plans.push_back({distanceBoundToFilter(bound), std::nullopt});
     plans.back().isImplied_ = true;
   }
@@ -1883,7 +1889,7 @@ std::vector<std::vector<SubtreePlan>> QueryPlanner::fillDpTab(
     const QueryPlanner::TripleGraph& tg, vector<SparqlFilter> filters,
     TextLimitMap& textLimits, const vector<vector<SubtreePlan>>& children,
     ReplacementPlans replacementPlans,
-    const std::vector<filterFacts::DistanceBound>& distanceBounds) {
+    const std::vector<DistanceBoundAndFilter>& distanceBounds) {
   auto [initialPlans, additionalFilters] =
       seedWithScansAndText(tg, children, textLimits);
   ql::ranges::move(additionalFilters, std::back_inserter(filters));
@@ -3706,23 +3712,45 @@ void QueryPlanner::GraphPatternPlanner::visitSubquery(
 // _______________________________________________________________
 
 // _______________________________________________________________
-std::vector<filterFacts::DistanceBound>
+std::vector<QueryPlanner::DistanceBoundAndFilter>
 QueryPlanner::GraphPatternPlanner::applyFilterFacts(
     ParsedQuery::GraphPattern& group) {
-  std::vector<filterFacts::DistanceBound> distanceBounds;
+  std::vector<DistanceBoundAndFilter> distanceBounds;
   if (!getRuntimeParameter<
           &RuntimeParameters::enableFilterFactRecognition_>()) {
     return distanceBounds;
   }
-  for (auto& fact : filterFacts::recognizeFacts(group)) {
-    if (auto* bound = std::get_if<filterFacts::DistanceBound>(&fact)) {
-      distanceBounds.push_back(std::move(*bound));
-    } else if (auto* lang = std::get_if<filterFacts::LangIn>(&fact)) {
-      // The FILTER stays in `group`, so it doesn't matter whether the language
-      // filter can be applied.
-      group.addLanguageFilter(lang->var_, lang->langs_);
+  auto factsPerFilter = filterFacts::recognizeFacts(group);
+  std::vector<SparqlFilter> remainingFilters;
+  for (auto&& [filter, facts] :
+       ::ranges::views::zip(group._filters, factsPerFilter)) {
+    // Apply the language filters and collect the distance bounds.
+    bool isReplaced = facts.exact_;
+    std::vector<filterFacts::DistanceBound> bounds;
+    for (auto& fact : facts.facts_) {
+      if (auto* bound = std::get_if<filterFacts::DistanceBound>(&fact)) {
+        bounds.push_back(std::move(*bound));
+      } else if (auto* lang = std::get_if<filterFacts::LangIn>(&fact)) {
+        isReplaced &= group.addLanguageFilter(lang->var_, lang->langs_);
+      }
+    }
+    isReplaced &= bounds.size() <= 1;
+
+    // Remove the FILTER if it is replaced by the language filters alone, else
+    // keep it and remember its position for the `SpatialJoin` that replaces
+    // it.
+    if (isReplaced && bounds.empty()) {
+      continue;
+    }
+    remainingFilters.push_back(std::move(filter));
+    for (auto& bound : bounds) {
+      distanceBounds.push_back(
+          {std::move(bound), isReplaced
+                                 ? std::optional{remainingFilters.size() - 1}
+                                 : std::nullopt});
     }
   }
+  group._filters = std::move(remainingFilters);
   return distanceBounds;
 }
 

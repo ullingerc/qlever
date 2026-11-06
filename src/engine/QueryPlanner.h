@@ -199,6 +199,14 @@ class QueryPlanner {
     bool hasSubstitute() const { return substitute_.has_value(); }
   };
 
+  // A `DistanceBound` fact of a group graph pattern (see `engine/filterFacts`),
+  // and the position of the FILTER of the group that it replaces (if it is
+  // equivalent to this FILTER).
+  struct DistanceBoundAndFilter {
+    filterFacts::DistanceBound bound_;
+    std::optional<size_t> replacedFilter_;
+  };
+
   using FiltersAndOptionalSubstitutes =
       std::vector<FilterAndOptionalSubstitute>;
 
@@ -360,9 +368,12 @@ class QueryPlanner {
 
   // The implied filter substitutes (see `FilterAndOptionalSubstitute`) for the
   // `DistanceBound` facts of a group: one entry per fact, with a `SpatialJoin`
-  // substitute.
+  // substitute. If the fact replaces a FILTER, the `SpatialJoin` also includes
+  // the entry of this FILTER, which comes after the implied entries (see
+  // `fillDpTab`), so the FILTER is not applied to a plan with the
+  // `SpatialJoin`.
   FiltersAndOptionalSubstitutes seedFactSubstitutes(
-      const std::vector<filterFacts::DistanceBound>& distanceBounds);
+      const std::vector<DistanceBoundAndFilter>& distanceBounds);
 
   // Wrap `filters` as `FiltersAndOptionalSubstitutes` without computing any
   // substitutes. This is sufficient for the filter modes that never apply
@@ -372,7 +383,7 @@ class QueryPlanner {
   // the positions of the entries are the same as in `fillDpTab`.
   static FiltersAndOptionalSubstitutes wrapFiltersWithoutSubstitutes(
       const std::vector<SparqlFilter>& filters,
-      const std::vector<filterFacts::DistanceBound>& distanceBounds = {});
+      const std::vector<DistanceBoundAndFilter>& distanceBounds = {});
 
   // TODO<RobinTF> Extract to dedicated module, this has little to do with
   // actual query planning.
@@ -640,7 +651,7 @@ class QueryPlanner {
       const TripleGraph& graph, std::vector<SparqlFilter> fs,
       TextLimitMap& textLimits, const vector<vector<SubtreePlan>>& children,
       ReplacementPlans replacementPlans,
-      const std::vector<filterFacts::DistanceBound>& distanceBounds = {});
+      const std::vector<DistanceBoundAndFilter>& distanceBounds = {});
 
   // Internal subroutine of `fillDpTab` that  only works on a single connected
   // component of the input. Throws if the subtrees in the `connectedComponent`
@@ -711,7 +722,7 @@ class QueryPlanner {
     ad_utility::HashSet<Variable> boundVariables_{};
 
     // The `DistanceBound` facts of the `rootPattern_`, see `applyFilterFacts`.
-    std::vector<filterFacts::DistanceBound> distanceBounds_;
+    std::vector<DistanceBoundAndFilter> distanceBounds_;
 
     // The filters of the `rootPattern_`, wrapped for `applyFiltersIfPossible`.
     // No substitutes are computed here: this member is only used with
@@ -734,8 +745,13 @@ class QueryPlanner {
     // by the FILTERs of `group` (see `engine/filterFacts`). Apply the `LangIn`
     // facts to `group` right away (via `addLanguageFilter`, before its triples
     // are planned) and return the `DistanceBound` facts, which become filter
-    // substitutes in `fillDpTab`.
-    static std::vector<filterFacts::DistanceBound> applyFilterFacts(
+    // substitutes in `fillDpTab`. Remove each FILTER that is replaced by the
+    // `LangIn` facts alone.
+    //
+    // NOTE: A FILTER is replaced if its facts are exact, its language filters
+    // could be applied, and it has at most one `DistanceBound` (a plan may
+    // contain only one of several `SpatialJoin`s).
+    static std::vector<DistanceBoundAndFilter> applyFilterFacts(
         ParsedQuery::GraphPattern& group);
 
     // This function is called for each of the graph patterns that are contained

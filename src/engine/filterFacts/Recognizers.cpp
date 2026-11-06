@@ -7,6 +7,7 @@
 #include "engine/filterFacts/Recognizers.h"
 
 #include <cmath>
+#include <limits>
 
 namespace filterFacts {
 
@@ -36,7 +37,12 @@ std::optional<DistanceBound> recognizeDistanceBound(const Conjunct& conjunct) {
   if (maxMeters < 0) {
     return std::nullopt;
   }
-  return DistanceBound{distance->a_, distance->b_, maxMeters};
+  if (constraint->op_ == Comparison::LT) {
+    maxMeters =
+        std::nextafter(maxMeters, -std::numeric_limits<double>::infinity());
+  }
+  return DistanceBound{distance->a_, distance->b_, maxMeters,
+                       constraint->exact_};
 }
 
 // _____________________________________________________________________________
@@ -58,7 +64,7 @@ std::optional<LangIn> recognizeLangIn(const Conjunct& conjunct) {
     }
     langs.emplace(c.getLiteral().getContent());
   }
-  return LangIn{lang->var_, std::move(langs)};
+  return LangIn{lang->var_, std::move(langs), constraint->exact_};
 }
 
 // _____________________________________________________________________________
@@ -73,18 +79,26 @@ std::optional<Fact> recognize(const Conjunct& conjunct) {
 }
 
 // _____________________________________________________________________________
-std::vector<Fact> recognizeFacts(const parsedQuery::GraphPattern& group) {
+std::vector<FilterFacts> recognizeFacts(
+    const parsedQuery::GraphPattern& group) {
   auto defs = collectDefinitions(group._graphPatterns);
-  std::vector<Fact> facts;
+  std::vector<FilterFacts> result;
   for (const auto& filter : group._filters) {
+    // The FILTER is exact iff each of its conjuncts is an exact fact.
+    FilterFacts& facts = result.emplace_back();
+    facts.exact_ = true;
     for (const auto& conjunct :
          canonicalize(*filter.expression_.getPimpl(), defs)) {
-      if (auto fact = recognize(conjunct)) {
-        facts.push_back(std::move(fact).value());
+      auto fact = recognize(conjunct);
+      facts.exact_ &=
+          fact.has_value() &&
+          std::visit([](const auto& f) { return f.exact_; }, fact.value());
+      if (fact.has_value()) {
+        facts.facts_.push_back(std::move(fact).value());
       }
     }
   }
-  return facts;
+  return result;
 }
 
 }  // namespace filterFacts

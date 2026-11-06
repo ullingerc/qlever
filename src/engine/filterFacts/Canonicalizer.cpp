@@ -206,6 +206,9 @@ Comparison flip(Comparison op) {
 // The recursive implementation of `canonicalize`.
 class Canonicalizer {
   const Definitions& defs_;
+  // A variable with several values was substituted in the current top-level
+  // conjunct, see `Constraint::exact_`.
+  bool isCorrelated_ = false;
 
  public:
   explicit Canonicalizer(const Definitions& defs) : defs_{defs} {}
@@ -217,6 +220,7 @@ class Canonicalizer {
       split(*expr.children()[0], result);
       split(*expr.children()[1], result);
     } else {
+      isCorrelated_ = false;
       result.push_back(toConjunct(expr));
     }
   }
@@ -230,6 +234,7 @@ class Canonicalizer {
     if (auto var = expr.getVariableOrNullopt()) {
       if (auto it = defs_.constants_.find(var.value());
           it != defs_.constants_.end()) {
+        isCorrelated_ |= it->second.size() > 1;
         return it->second;
       }
       if (auto it = defs_.expressions_.find(var.value());
@@ -332,7 +337,7 @@ class Canonicalizer {
         }
       }
     }
-    return Constraint{std::move(term), op, std::move(rhs)};
+    return Constraint{std::move(term), op, std::move(rhs), !isCorrelated_};
   }
 
   // Bring a single conjunct into canonical form.

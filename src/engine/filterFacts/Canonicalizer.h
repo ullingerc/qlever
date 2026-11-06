@@ -75,7 +75,12 @@ struct Constraint {
   Term lhs_;
   valueIdComparators::Comparison op_;
   std::vector<TripleComponent> rhs_;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_)
+  // True iff the conjunct holds exactly when the `Constraint` holds. This is
+  // false if a variable with several values from a multi-row `VALUES` clause
+  // was substituted (in each row, the conjunct only holds for the value of
+  // this row, not for any of the values).
+  bool exact_ = true;
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_, exact_)
 };
 
 // A single conjunct of a FILTER: if the FILTER holds, each of its conjuncts

@@ -98,23 +98,25 @@ PlanSummary plan(std::string_view body) {
 // _____________________________________________________________________________
 TEST(QueryPlannerFilterFacts, DistanceShapes) {
   // Each shape with the maximum distance of the resulting `SpatialJoin` and
-  // the original FILTER, which must stay in the plan.
+  // the FILTER that stays in the plan (empty if the `SpatialJoin` replaces the
+  // FILTER exactly).
   std::vector<std::tuple<std::string, double, std::string>> shapes{
-      {"FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)", 500,
-       "geof:distance(?ga, ?gb, unit:M) <= 500"},
+      {"FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)", 500, ""},
       {"BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)", 500,
-       "?d <= 500"},
+       ""},
       {"VALUES ?r { 500 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)", 500,
-       "geof:distance(?ga, ?gb, unit:M) <= ?r"},
-      {"FILTER(500 >= geof:metricDistance(?ga, ?gb))", 500,
-       "500 >= geof:metricDistance(?ga, ?gb)"},
-      {"FILTER(geof:distance(?ga, ?gb) < 0.5)", 500,
-       "geof:distance(?ga, ?gb) < 0.5"},
-      {"VALUES ?r { 500 1000 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-       1000, "geof:distance(?ga, ?gb, unit:M) <= ?r"},
+       ""},
+      {"FILTER(500 >= geof:metricDistance(?ga, ?gb))", 500, ""},
+      {"FILTER(geof:distance(?ga, ?gb) < 0.5)", 500, ""},
       {"BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) VALUES ?r { 500 } "
        "FILTER(?d <= ?r)",
-       500, "?d <= ?r"},
+       500, ""},
+      // Several values (the `SpatialJoin` uses the largest one), and a
+      // conjunct that is not a fact.
+      {"VALUES ?r { 500 1000 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
+       1000, "geof:distance(?ga, ?gb, unit:M) <= ?r"},
+      {"FILTER(geof:distance(?ga, ?gb, unit:M) <= 500 && ?a != ?b)", 500,
+       "?a != ?b"},
   };
   for (const auto& [shape, maxDist, filter] : shapes) {
     auto body = absl::StrCat(geoms, shape);
@@ -124,8 +126,12 @@ TEST(QueryPlannerFilterFacts, DistanceShapes) {
       EXPECT_THAT(summary.spatialJoinMaxDists_,
                   ElementsAre(DoubleNear(maxDist, 1e-6)))
           << shape;
-      EXPECT_THAT(summary.filters_, ElementsAre(::testing::HasSubstr(filter)))
-          << shape;
+      if (filter.empty()) {
+        EXPECT_THAT(summary.filters_, IsEmpty()) << shape;
+      } else {
+        EXPECT_THAT(summary.filters_, ElementsAre(::testing::HasSubstr(filter)))
+            << shape;
+      }
     }
     // With the switch off, only the direct shape is rewritten (and then the
     // FILTER is replaced by the `SpatialJoin`).
@@ -146,16 +152,26 @@ TEST(QueryPlannerFilterFacts, DistanceShapes) {
 TEST(QueryPlannerFilterFacts, PlanMatchesExactly) {
   auto cleanup = factsEnabled(true);
   auto scan = h::IndexScanFromStrings;
-  // The original FILTER is applied on top of the `SpatialJoin`.
+  auto spatialJoin = [&scan](std::optional<Variable> distanceVariable) {
+    return h::spatialJoinFilterSubstitute(
+        500, -1, V{"?ga"}, V{"?gb"}, std::move(distanceVariable),
+        PayloadVariables::all(), SpatialJoinAlgorithm::LIBSPATIALJOIN,
+        SpatialJoinType::WITHIN_DIST, std::nullopt, scan("?a", "<p>", "?ga"),
+        scan("?b", "<p>", "?gb"));
+  };
+
+  // The `SpatialJoin` replaces the FILTER.
   h::expect(query(absl::StrCat(
                 geoms, "FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)")),
-            h::Filter("geof:distance(?ga, ?gb, unit:M) <= 500",
-                      h::spatialJoinFilterSubstitute(
-                          500, -1, V{"?ga"}, V{"?gb"}, std::nullopt,
-                          PayloadVariables::all(),
-                          SpatialJoinAlgorithm::LIBSPATIALJOIN,
-                          SpatialJoinType::WITHIN_DIST, std::nullopt,
-                          scan("?a", "<p>", "?ga"), scan("?b", "<p>", "?gb"))));
+            spatialJoin(std::nullopt));
+
+  // The `SpatialJoin` also replaces a FILTER on the target of a `BIND`.
+  h::expect(
+      query(absl::StrCat(
+          geoms,
+          "BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)")),
+      h::Bind(spatialJoin(std::nullopt), "geof:distance(?ga, ?gb, unit:M)",
+              V{"?d"}));
 }
 
 // _____________________________________________________________________________
@@ -333,16 +349,24 @@ TEST(QueryPlannerFilterFacts, LanguageFilters) {
   std::string_view in =
       "?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))";
   {
-    // The triple is rewritten, and the FILTER is kept.
+    // The triple is rewritten, and the FILTER is removed.
     auto cleanup = factsEnabled(true);
     for (auto body : {direct, bind}) {
       auto [predicates, filters] = planLang(body);
       EXPECT_THAT(predicates, ElementsAre("@en@<label>")) << body;
-      EXPECT_THAT(filters, ElementsAre(HasSubstr("\"en\""))) << body;
+      EXPECT_THAT(filters, IsEmpty()) << body;
     }
     auto [predicates, filters] = planLang(in);
     EXPECT_THAT(predicates, UnorderedElementsAre("@en@<label>", "@de@<label>"));
-    EXPECT_THAT(filters, ElementsAre(HasSubstr("IN")));
+    EXPECT_THAT(filters, IsEmpty());
+
+    // With several values from `VALUES`, the FILTER is kept (the language of
+    // each row must equal the value of `?l` of this row).
+    auto [predicatesValues, filtersValues] = planLang(
+        "?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)");
+    EXPECT_THAT(predicatesValues,
+                UnorderedElementsAre("@en@<label>", "@de@<label>"));
+    EXPECT_THAT(filtersValues, ElementsAre(HasSubstr("?l")));
   }
   // Without the filter fact recognition, only the direct shape is rewritten
   // (by the parser, which removes the FILTER).

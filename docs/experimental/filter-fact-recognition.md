@@ -89,11 +89,28 @@ All code lives in `src/engine/filterFacts/`.
    With the switch on, these consumers replace the old syntactic rewrites for
    the same shapes. The parser no longer applies its LANG rewrite, and
    `rewriteFilterToSpatialJoin` skips the distance shape.
-5. **Residual filter.** The original FILTER always stays in the plan, on top
-   of the rewritten operator. A recognizer therefore only has to be **sound**
-   (FILTER ⇒ fact), and it may over-approximate. For example,
+5. **Residual filter.** A recognizer only has to be **sound**
+   (FILTER ⇒ fact), and it may over-approximate. Then the original FILTER
+   stays in the plan, on top of the rewritten operator. For example,
    `VALUES ?r { 500 1000 } FILTER(dist <= ?r)` gives a `SpatialJoin` with a
    radius of 1000 m, and the residual FILTER does the rest.
+
+   The residual FILTER costs performance, so it is dropped where the rewrite
+   is **exact** (FILTER ⇔ facts):
+   - A `Constraint` is exact unless a variable with several values (from a
+     multi-row `VALUES` clause) was substituted: in each row, the conjunct
+     only holds for the value of this row. Each fact inherits this flag. For
+     `distance < c`, the largest double below `c` is the radius, so the fact
+     remains exact.
+   - A FILTER is exact if each of its conjuncts is an exact fact
+     (`FilterFacts::exact_`). It is replaced if, in addition, all its
+     `addLanguageFilter` calls succeed and it has at most one `DistanceBound`
+     (a plan may contain only one of several `SpatialJoin`s).
+   - A replaced FILTER without a `DistanceBound` is removed from the group (as
+     the parser does without the switch). Otherwise, the `SpatialJoin` of the
+     `DistanceBound` also includes the entry of the FILTER, so the FILTER is
+     not applied to plans with the `SpatialJoin`, and still applied to all
+     other plans.
 
    In the planner, every `DistanceBound` gets an entry with `isImplied_ = true`
    in the list of filters and substitutes. Such an entry only offers its
@@ -111,7 +128,7 @@ All code lives in `src/engine/filterFacts/`.
 | No substitution inside `BOUND(...)` or `EXISTS`. | The canonicalizer only descends into the shapes it models. All other expressions are `Opaque`. | `FilterFactsCanonicalizer.NoSubstitutionInsideBoundOrExists` |
 | Typed constants. | Recognizers check the type of every constant. `getNumericValue` accepts only `xsd:int` and `xsd:double`, so the string `"500"` is rejected. `LangIn` accepts only literals without language tag or datatype (other than `xsd:string`). | `FilterFactsRecognizers.*` |
 | No crossing of scopes. | Definitions come only from the direct children of the group, and facts only from the group's own FILTERs. | `FilterFactsDefinitions.CollectDefinitions`, `QueryPlannerFilterFacts.NoRewrite` |
-| Same results. | The residual filter is always applied. | `QueryPlannerFilterFacts.ResultsAreEqual`, `QueryPlannerFilterFacts.LanguageFilterResultsAreEqual` |
+| Same results. | The residual filter is applied unless the FILTER is exact. | `QueryPlannerFilterFacts.ResultsAreEqual`, `QueryPlannerFilterFacts.LanguageFilterResultsAreEqual` |
 
 ## How to add a recognizer
 
@@ -165,12 +182,13 @@ must have `operator==`, so `||` of equalities can be merged.
 
 ## How to add a consumer
 
-A consumer reads facts and changes the plan. It must keep the original FILTER.
+A consumer reads facts and changes the plan. It must keep the original
+FILTER, unless the FILTER is exact (see the residual filter above).
 
-- **Rewrite of the parsed group** (like `LangIn`). In the constructor of
-  `QueryPlanner::GraphPatternPlanner` (`QueryPlanner.cpp`), handle the new
-  fact type in the visitor over the result of `recognizeFacts`. Do not remove
-  the filter from `rootPattern->_filters`.
+- **Rewrite of the parsed group** (like `LangIn`). Handle the new fact type in
+  `QueryPlanner::GraphPatternPlanner::applyFilterFacts` (`QueryPlanner.cpp`).
+  If the rewrite can fail (like `addLanguageFilter`), the FILTER must not be
+  replaced then.
 - **Filter substitute** (like `DistanceBound`). Collect the facts in the
   `GraphPatternPlanner` constructor, and create one implied entry per fact in
   `QueryPlanner::seedFactSubstitutes`. The entry's `filter_` must contain
@@ -204,11 +222,10 @@ runs the query on a small index with the switch on and off
 - **Floating-point radius.** The distance in metres is computed from the unit
   argument in floating point, as in the existing rewrite. A geometry at almost
   exactly the maximum distance may be classified differently by the
-  `SpatialJoin` than by the residual FILTER.
-- **Plan changes with the switch on.** The plain shape
-  `FILTER(geof:distance(...) <= c)` now also keeps its residual FILTER, and
-  `LANG` filters are no longer removed. This costs one extra `Filter`
-  operation per rewritten FILTER.
+  `SpatialJoin` than by the FILTER (which the existing rewrite also drops).
+- **No splitting of `&&`.** A FILTER with a conjunct that is not an exact
+  fact (e.g. `dist <= 500 && ?a != ?b`) is kept completely, although only the
+  inexact conjuncts would have to stay.
 - **Facts per group, not per plan.** A fact is used as soon as its group is
   planned. Facts derived from a FILTER whose variables are never bound in the
   group still produce a substitute that is simply never completed. It is never
