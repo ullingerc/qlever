@@ -62,6 +62,7 @@
 #include "engine/TransitivePathBase.h"
 #include "engine/Union.h"
 #include "engine/Values.h"
+#include "engine/filterFacts/Canonicalizer.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
@@ -290,6 +291,10 @@ std::shared_ptr<QueryExecutionTree> QueryPlanner::createExecutionTree(
 
 // _____________________________________________________________________________
 SubtreePlanVec QueryPlanner::optimize(ParsedQuery::GraphPattern* rootPattern) {
+  // A conjunct of a FILTER that is a fact can then be rewritten on its own.
+  rewriteFiltersWithFacts(
+      rootPattern->_filters,
+      filterFacts::collectDefinitions(rootPattern->_graphPatterns));
   QueryPlanner::GraphPatternPlanner optimizer{*this, rootPattern};
   for (auto& child : rootPattern->_graphPatterns) {
     child.visit([&optimizer](auto& arg) {
@@ -1477,12 +1482,6 @@ void QueryPlanner::applyFiltersIfPossible(
         continue;
       }
 
-      // An implied entry only offers its substitute, see
-      // `FilterAndOptionalSubstitute::isImplied_`.
-      if (filterAndSubst.isImplied_) {
-        continue;
-      }
-
       constexpr bool applyAll =
           mode == FilterMode::ApplyAllFiltersAndReplaceUnfiltered;
       if constexpr (mode == FilterMode::SeedSubstitutesOnly) {
@@ -1831,12 +1830,8 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
   for (const auto& [i, filterExpression] :
        ::ranges::views::enumerate(filters)) {
     // Check if the filter expression is suitable for spatial join rewriting.
-    // With the filter fact recognition, `geof:distance` filters are handled by
-    // `seedFactSubstitutes`.
     auto sj = rewriteFilterToSpatialJoin(
-        filterExpression, _qec, [this] { return generateUniqueVarName(); },
-        !getRuntimeParameter<
-            &RuntimeParameters::enableFilterFactRecognition_>());
+        filterExpression, _qec, [this] { return generateUniqueVarName(); });
     if (!sj) {
       plans.push_back({filterExpression, std::nullopt});
     } else {
@@ -1854,45 +1849,11 @@ QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFilterSubstitutes(
 }
 
 // _____________________________________________________________________________
-QueryPlanner::FiltersAndOptionalSubstitutes QueryPlanner::seedFactSubstitutes(
-    const std::vector<DistanceBoundAndFilter>& distanceBounds) {
-  FiltersAndOptionalSubstitutes plans;
-  plans.reserve(distanceBounds.size());
-  for (const auto& [i, boundAndFilter] :
-       ::ranges::views::enumerate(distanceBounds)) {
-    const auto& [bound, replacedFilter] = boundAndFilter;
-    FilterAndOptionalSubstitute entry{distanceBoundToFilter(bound),
-                                      std::nullopt};
-    entry.isImplied_ = true;
-    if (auto sj = rewriteDistanceBoundToSpatialJoin(
-            bound, _qec, [this] { return generateUniqueVarName(); })) {
-      // See `seedFilterSubstitutes`.
-      entry.forceSubstitution_ = sj->getChildren().size() == 1;
-      auto plan = makeSubtreePlan(std::move(sj));
-      plan._idsOfIncludedFilters |= 1ULL << i;
-      if (replacedFilter.has_value()) {
-        plan._idsOfIncludedFilters |=
-            1ULL << (distanceBounds.size() + replacedFilter.value());
-      }
-      plan.containsFilterSubstitute_ = true;
-      entry.substitute_ = std::move(plan);
-    }
-    plans.push_back(std::move(entry));
-  }
-  return plans;
-}
-
-// _____________________________________________________________________________
 QueryPlanner::FiltersAndOptionalSubstitutes
 QueryPlanner::wrapFiltersWithoutSubstitutes(
-    const std::vector<SparqlFilter>& filters,
-    const std::vector<DistanceBoundAndFilter>& distanceBounds) {
+    const std::vector<SparqlFilter>& filters) {
   FiltersAndOptionalSubstitutes plans;
-  plans.reserve(distanceBounds.size() + filters.size());
-  for (const auto& [bound, replacedFilter] : distanceBounds) {
-    plans.push_back({distanceBoundToFilter(bound), std::nullopt});
-    plans.back().isImplied_ = true;
-  }
+  plans.reserve(filters.size());
   for (const auto& filter : filters) {
     plans.push_back({filter, std::nullopt});
   }
@@ -1900,31 +1861,21 @@ QueryPlanner::wrapFiltersWithoutSubstitutes(
 }
 
 // _____________________________________________________________________________
-SubtreePlanMatrix QueryPlanner::fillDpTab(
-    const QueryPlanner::TripleGraph& tg, std::vector<SparqlFilter> filters,
-    TextLimitMap& textLimits, const SubtreePlanMatrix& children,
-    ReplacementPlans replacementPlans,
-    const std::vector<DistanceBoundAndFilter>& distanceBounds) {
+SubtreePlanMatrix QueryPlanner::fillDpTab(const QueryPlanner::TripleGraph& tg,
+                                          std::vector<SparqlFilter> filters,
+                                          TextLimitMap& textLimits,
+                                          const SubtreePlanMatrix& children,
+                                          ReplacementPlans replacementPlans) {
   auto [initialPlans, additionalFilters] =
       seedWithScansAndText(tg, children, textLimits);
   ql::ranges::move(additionalFilters, std::back_inserter(filters));
 
-  if (distanceBounds.size() + filters.size() > 64) {
-    AD_THROW("At most 64 filters allowed at the moment.");
-  }
-
   // If we have FILTER statements that can also be answered by a special join,
-  // add the respective query plans as filter substitutes. The implied entries
-  // for the facts of the group come first, because their number is the same in
-  // all calls of `fillDpTab` for a group, whereas `filters` may grow (the bits
-  // of `_idsOfIncludedFilters` are the positions in this vector, and they are
-  // kept between these calls). With the switch off, there are no such entries.
-  auto filtersAndOptSubstitutes = seedFactSubstitutes(distanceBounds);
-  for (auto& entry : seedFilterSubstitutes(filters)) {
-    if (entry.substitute_.has_value()) {
-      entry.substitute_->_idsOfIncludedFilters <<= distanceBounds.size();
-    }
-    filtersAndOptSubstitutes.push_back(std::move(entry));
+  // add the respective query plans as filter substitutes.
+  auto filtersAndOptSubstitutes = seedFilterSubstitutes(filters);
+
+  if (filters.size() > 64) {
+    AD_THROW("At most 64 filters allowed at the moment.");
   }
 
   auto componentIndices = QueryGraph::computeConnectedComponents(
@@ -3001,7 +2952,7 @@ void QueryPlanner::QueryGraph::setupGraph(
         // Add additional edges to the graph representing the connections
         // between variables given by joins substituting cartesian product +
         // filter.
-        for (auto& [filter, substitute, forceSubstitution, isImplied] :
+        for (auto& [filter, substitute, forceSubstitution] :
              filtersAndOptionalSubstitutes) {
           if (!substitute.has_value()) {
             // This filter cannot be substituted: add no edges.
@@ -3754,70 +3705,15 @@ void QueryPlanner::GraphPatternPlanner::visitSubquery(
 // _______________________________________________________________
 
 // _______________________________________________________________
-std::vector<QueryPlanner::DistanceBoundAndFilter>
-QueryPlanner::GraphPatternPlanner::applyFilterFacts(
-    ParsedQuery::GraphPattern& group) {
-  std::vector<DistanceBoundAndFilter> distanceBounds;
-  if (!getRuntimeParameter<
-          &RuntimeParameters::enableFilterFactRecognition_>()) {
-    return distanceBounds;
-  }
-  auto factsPerFilter = filterFacts::recognizeFacts(group);
-  std::vector<SparqlFilter> remainingFilters;
-  for (auto&& [filter, facts] :
-       ::ranges::views::zip(group._filters, factsPerFilter)) {
-    // Apply the language filters, and find the conjuncts that are replaced
-    // exactly: by a language filter, or by the `SpatialJoin` of a distance
-    // bound.
-    std::vector<bool> isReplaced;
-    for (auto& fact : facts) {
-      bool replaced = filterFacts::isExact(fact);
-      if (auto* lang = fact ? std::get_if<filterFacts::LangIn>(&fact.value())
-                            : nullptr) {
-        replaced &= group.addLanguageFilter(lang->var_, lang->langs_);
-      }
-      isReplaced.push_back(replaced);
-    }
-
-    // If no conjunct is replaced, keep the FILTER as it is. Otherwise, split
-    // it into its conjuncts, and drop the conjuncts replaced by a language
-    // filter. Each `DistanceBound` remembers the position of its conjunct.
-    bool split = ql::ranges::any_of(isReplaced, std::identity{});
-    auto conjuncts =
-        split ? filter.expression_.splitConjunction()
-              : std::vector<sparqlExpression::SparqlExpressionPimpl>{};
-    if (!split) {
-      remainingFilters.push_back(std::move(filter));
-    }
-    for (auto&& [i, fact] : ::ranges::views::enumerate(facts)) {
-      auto* bound = fact
-                        ? std::get_if<filterFacts::DistanceBound>(&fact.value())
-                        : nullptr;
-      if (split && (bound != nullptr || !isReplaced[i])) {
-        remainingFilters.push_back(SparqlFilter{std::move(conjuncts[i])});
-      }
-      if (bound != nullptr) {
-        distanceBounds.push_back(
-            {std::move(*bound), split && isReplaced[i]
-                                    ? std::optional{remainingFilters.size() - 1}
-                                    : std::nullopt});
-      }
-    }
-  }
-  group._filters = std::move(remainingFilters);
-  return distanceBounds;
-}
-
-// _______________________________________________________________
 void QueryPlanner::GraphPatternPlanner::optimizeCommutatively() {
   auto replacementPlans =
       planner_.createMaterializedViewJoinReplacements(candidateTriples_);
   auto tg = planner_.createTripleGraph(&candidateTriples_);
-  auto lastRow = planner_
-                     .fillDpTab(tg, rootPattern_->_filters,
-                                rootPattern_->textLimits_, candidatePlans_,
-                                std::move(replacementPlans), distanceBounds_)
-                     .back();
+  auto lastRow =
+      planner_
+          .fillDpTab(tg, rootPattern_->_filters, rootPattern_->textLimits_,
+                     candidatePlans_, std::move(replacementPlans))
+          .back();
   candidateTriples_._triples.clear();
   candidatePlans_.clear();
   candidatePlans_.push_back(std::move(lastRow));

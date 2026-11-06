@@ -21,7 +21,6 @@
 #include "engine/CheckUsePatternTrick.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/RuntimeInformation.h"
-#include "engine/filterFacts/Recognizers.h"
 #include "parser/GraphPattern.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/ParsedQuery.h"
@@ -195,21 +194,7 @@ class QueryPlanner {
     // it will otherwise never have its second child attached.
     bool forceSubstitution_ = false;
 
-    // This entry was derived from a fact that is implied by the FILTERs of the
-    // group (see `engine/filterFacts`). It only offers its substitute, and is
-    // never applied as a regular filter: the original FILTERs stay in the plan
-    // via their own entries.
-    bool isImplied_ = false;
-
     bool hasSubstitute() const { return substitute_.has_value(); }
-  };
-
-  // A `DistanceBound` fact of a group graph pattern (see `engine/filterFacts`),
-  // and the position of the FILTER of the group that it replaces (if it is
-  // equivalent to this FILTER).
-  struct DistanceBoundAndFilter {
-    filterFacts::DistanceBound bound_;
-    std::optional<size_t> replacedFilter_;
   };
 
   using FiltersAndOptionalSubstitutes =
@@ -374,24 +359,12 @@ class QueryPlanner {
   virtual FiltersAndOptionalSubstitutes seedFilterSubstitutes(
       const std::vector<SparqlFilter>& filters);
 
-  // The implied filter substitutes (see `FilterAndOptionalSubstitute`) for the
-  // `DistanceBound` facts of a group: one entry per fact, with a `SpatialJoin`
-  // substitute. If the fact replaces a FILTER, the `SpatialJoin` also includes
-  // the entry of this FILTER, which comes after the implied entries (see
-  // `fillDpTab`), so the FILTER is not applied to a plan with the
-  // `SpatialJoin`.
-  FiltersAndOptionalSubstitutes seedFactSubstitutes(
-      const std::vector<DistanceBoundAndFilter>& distanceBounds);
-
   // Wrap `filters` as `FiltersAndOptionalSubstitutes` without computing any
   // substitutes. This is sufficient for the filter modes that never apply
   // substitutes and avoids constructing throwaway substitute plans (which
-  // would also consume internal variable names). The `distanceBounds` get
-  // implied entries without a substitute in front of the `filters`, such that
-  // the positions of the entries are the same as in `fillDpTab`.
+  // would also consume internal variable names).
   static FiltersAndOptionalSubstitutes wrapFiltersWithoutSubstitutes(
-      const std::vector<SparqlFilter>& filters,
-      const std::vector<DistanceBoundAndFilter>& distanceBounds = {});
+      const std::vector<SparqlFilter>& filters);
 
   // TODO<RobinTF> Extract to dedicated module, this has little to do with
   // actual query planning.
@@ -651,11 +624,11 @@ class QueryPlanner {
    * Cycles have to be avoided (by previously removing a triple and using
    * it as a filter later on).
    */
-  SubtreePlanMatrix fillDpTab(
-      const TripleGraph& graph, std::vector<SparqlFilter> fs,
-      TextLimitMap& textLimits, const SubtreePlanMatrix& children,
-      ReplacementPlans replacementPlans,
-      const std::vector<DistanceBoundAndFilter>& distanceBounds = {});
+  SubtreePlanMatrix fillDpTab(const TripleGraph& graph,
+                              std::vector<SparqlFilter> fs,
+                              TextLimitMap& textLimits,
+                              const SubtreePlanMatrix& children,
+                              ReplacementPlans replacementPlans);
 
   // Internal subroutine of `fillDpTab` that  only works on a single connected
   // component of the input. Throws if the subtrees in the `connectedComponent`
@@ -730,9 +703,6 @@ class QueryPlanner {
     // of the result, see `getVariablesOfPreviousPatterns` for those.
     ad_utility::HashSet<Variable> boundVariables_{};
 
-    // The `DistanceBound` facts of the `rootPattern_`, see `applyFilterFacts`.
-    std::vector<DistanceBoundAndFilter> distanceBounds_;
-
     // The filters of the `rootPattern_`, wrapped for `applyFiltersIfPossible`.
     // No substitutes are computed here: this member is only used with
     // `FilterMode::ApplyAllFiltersAndReplaceUnfiltered`, which never applies
@@ -747,24 +717,8 @@ class QueryPlanner {
           rootPattern_{rootPattern},
           qec_{planner._qec},
           candidatePlans_{allocator()},
-          distanceBounds_{applyFilterFacts(*rootPattern)},
-          filtersAndSubst_{wrapFiltersWithoutSubstitutes(rootPattern->_filters,
-                                                         distanceBounds_)} {}
-
-    // If `enable-filter-fact-recognition` is set, recognize the facts implied
-    // by the FILTERs of `group` (see `engine/filterFacts`). Apply the `LangIn`
-    // facts to `group` right away (via `addLanguageFilter`, before its triples
-    // are planned) and return the `DistanceBound` facts, which become filter
-    // substitutes in `fillDpTab`. Split each FILTER with a conjunct that is
-    // replaced exactly into its conjuncts, and remove the conjuncts that are
-    // replaced by a `LangIn` fact.
-    //
-    // NOTE: A conjunct is replaced exactly if its fact is exact and (for a
-    // `LangIn` fact) the language filter could be applied. The conjunct of an
-    // exact `DistanceBound` stays, it is replaced only in the plans with the
-    // `SpatialJoin` (see `seedFactSubstitutes`).
-    static std::vector<DistanceBoundAndFilter> applyFilterFacts(
-        ParsedQuery::GraphPattern& group);
+          filtersAndSubst_{
+              wrapFiltersWithoutSubstitutes(rootPattern->_filters)} {}
 
     // This function is called for each of the graph patterns that are contained
     // in the `rootPattern_`. It dispatches to the various `visit...`functions

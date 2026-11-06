@@ -15,7 +15,7 @@
 class QueryExecutionContext;
 class SpatialJoin;
 namespace filterFacts {
-struct DistanceBound;
+struct Definitions;
 }
 
 // This module contains utilities for query rewriting, e.g. optimizing cartesian
@@ -25,23 +25,21 @@ struct DistanceBound;
 // `filter` is a suitable GeoSPARQL filter with a variable on at least one side.
 // Returns `nullptr` if `filter` is not such a filter. A side of the filter that
 // was a fixed value is bound to a single-row `VALUES` child using an internal
-// variable from `generateUniqueVarName`. If `allowDistance` is false, filters
-// on `geof:distance` are not rewritten (they are handled via
-// `rewriteDistanceBoundToSpatialJoin` instead).
+// variable from `generateUniqueVarName`.
 std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
     const SparqlFilter& filter, QueryExecutionContext* qec,
-    absl::FunctionRef<Variable()> generateUniqueVarName,
-    bool allowDistance = true);
-
-// Create the `SpatialJoin` for a `DistanceBound` fact, see
-// `engine/filterFacts/Recognizers.h`. Like `rewriteFilterToSpatialJoin`, a
-// fixed geometry is bound to a single-row `VALUES` child.
-std::shared_ptr<SpatialJoin> rewriteDistanceBoundToSpatialJoin(
-    const filterFacts::DistanceBound& bound, QueryExecutionContext* qec,
     absl::FunctionRef<Variable()> generateUniqueVarName);
 
-// A FILTER that is equivalent to the `DistanceBound` fact, namely
-// `geof:metricDistance(a, b) <= maxMeters`.
-SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound);
+// Split each FILTER in `filters` with a conjunct (of `&&`) that is a fact (see
+// `engine/filterFacts`) into its conjuncts. Then this conjunct can be rewritten
+// on its own (e.g. to a `SpatialJoin`), and the other conjuncts are applied as
+// regular FILTERs. A conjunct that is a fact only with the definitions `defs`
+// of its group (e.g. `geof:distance(?a, ?b) <= ?max` with `VALUES ?max {
+// 500 }`) is replaced by an equivalent FILTER without them.
+//
+// NOTE: If the fact is not exact (e.g. for different values of `?max` in
+// different rows), the conjunct is kept in addition to this FILTER.
+void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
+                             const filterFacts::Definitions& defs);
 
 #endif  // QLEVER_SRC_ENGINE_QUERYREWRITEUTILS_H

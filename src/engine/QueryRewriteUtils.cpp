@@ -49,7 +49,7 @@ ResolvedGeoOperand resolveGeoOperand(
 static std::optional<
     std::pair<LibSpatialJoinConfig, sparqlExpression::GeoFunctionCall>>
 getSpatialJoinConfigForFilter(
-    const sparqlExpression::SparqlExpression& filterBody, bool allowDistance) {
+    const sparqlExpression::SparqlExpression& filterBody) {
   // The filter body directly is an optimizable `geof:sf...` function.
   if (auto call = getGeoFunctionExpressionParameters(filterBody)) {
     return std::pair{LibSpatialJoinConfig{call.value().function_},
@@ -62,92 +62,82 @@ getSpatialJoinConfigForFilter(
                                 call.value().pattern_};
     return std::pair{std::move(config), std::move(call).value()};
   }
-  // The filter body is a maximum distance spatial search (direct body of
-  // filter is a comparison).
-  if (auto call =
-          allowDistance ? getGeoDistanceFilter(filterBody) : std::nullopt) {
-    LibSpatialJoinConfig config{call.value().first.function_,
-                                call.value().second, std::nullopt};
-    return std::pair{std::move(config), std::move(call).value().first};
+  // The filter body bounds the distance between two geometries (see
+  // `filterFacts::recognizeDistanceBound`).
+  auto conjuncts = filterFacts::canonicalize(filterBody);
+  if (conjuncts.size() != 1) {
+    return std::nullopt;
+  }
+  if (auto bound = filterFacts::recognizeDistanceBound(conjuncts[0])) {
+    using enum SpatialJoinType::Enum;
+    return std::pair{
+        LibSpatialJoinConfig{WITHIN_DIST, bound->maxMeters_, std::nullopt},
+        sparqlExpression::GeoFunctionCall{WITHIN_DIST, std::move(bound->a_),
+                                          std::move(bound->b_)}};
   }
   return std::nullopt;
-}
-
-// Create a `SpatialJoin` with the given `config` between the geo function
-// operands `left` and `right`, see `rewriteFilterToSpatialJoin`.
-static std::shared_ptr<SpatialJoin> makeSpatialJoin(
-    LibSpatialJoinConfig config, const TripleComponent& left,
-    const TripleComponent& right, QueryExecutionContext* qec,
-    absl::FunctionRef<Variable()> generateUniqueVarName) {
-  // If neither side is a variable, rewriting is not possible.
-  bool leftIsVar = left.isVariable();
-  bool rightIsVar = right.isVariable();
-  if (!leftIsVar && !rightIsVar) {
-    return nullptr;
-  }
-
-  if (leftIsVar && rightIsVar && left.getVariable() == right.getVariable()) {
-    // TODO<ullingerc> As soon as we have a baseline implementation of
-    // `WktGeometricRelation`, replace this `throw` by `return nullptr;`.
-    throw std::runtime_error(absl::StrCat(
-        "Unsupported GeoSPARQL filter: Variable ", left.getVariable().name(),
-        " on both sides. Is this what you intended?"));
-  }
-
-  auto l = resolveGeoOperand(left, qec, generateUniqueVarName);
-  auto r = resolveGeoOperand(right, qec, generateUniqueVarName);
-  return qec->makeShared<SpatialJoin>(
-      qec,
-      SpatialJoinConfiguration{
-          std::move(config), std::move(l.variable_), std::move(r.variable_),
-          std::nullopt, PayloadVariables::all(),
-          SpatialJoinAlgorithm::LIBSPATIALJOIN, std::nullopt},
-      std::move(l.child_), std::move(r.child_), true);
 }
 
 // _____________________________________________________________________________
 std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
     const SparqlFilter& filter, QueryExecutionContext* qec,
-    absl::FunctionRef<Variable()> generateUniqueVarName, bool allowDistance) {
+    absl::FunctionRef<Variable()> generateUniqueVarName) {
   const auto& filterBody = *filter.expression_.getPimpl();
 
   // Currently, we can only optimize GeoSPARQL filters.
-  auto configAndCall = getSpatialJoinConfigForFilter(filterBody, allowDistance);
+  auto configAndCall = getSpatialJoinConfigForFilter(filterBody);
   if (!configAndCall.has_value()) {
     return nullptr;
   }
   auto& [config, call] = configAndCall.value();
-  return makeSpatialJoin(std::move(config), call.left_, call.right_, qec,
-                         generateUniqueVarName);
+
+  // If neither side is a variable, rewriting is not possible.
+  bool leftIsVar = call.left_.isVariable();
+  bool rightIsVar = call.right_.isVariable();
+  if (!leftIsVar && !rightIsVar) {
+    return nullptr;
+  }
+
+  if (leftIsVar && rightIsVar &&
+      call.left_.getVariable() == call.right_.getVariable()) {
+    // TODO<ullingerc> As soon as we have a baseline implementation of
+    // `WktGeometricRelation`, replace this `throw` by `return nullptr;`.
+    throw std::runtime_error(
+        absl::StrCat("Unsupported GeoSPARQL filter: Variable ",
+                     call.left_.getVariable().name(),
+                     " on both sides. Is this what you intended?"));
+  }
+
+  auto left = resolveGeoOperand(call.left_, qec, generateUniqueVarName);
+  auto right = resolveGeoOperand(call.right_, qec, generateUniqueVarName);
+  return qec->makeShared<SpatialJoin>(
+      qec,
+      SpatialJoinConfiguration{
+          std::move(config), std::move(left.variable_),
+          std::move(right.variable_), std::nullopt, PayloadVariables::all(),
+          SpatialJoinAlgorithm::LIBSPATIALJOIN, std::nullopt},
+      std::move(left.child_), std::move(right.child_), true);
 }
 
-// _____________________________________________________________________________
-std::shared_ptr<SpatialJoin> rewriteDistanceBoundToSpatialJoin(
-    const filterFacts::DistanceBound& bound, QueryExecutionContext* qec,
-    absl::FunctionRef<Variable()> generateUniqueVarName) {
-  return makeSpatialJoin(LibSpatialJoinConfig{SpatialJoinType::WITHIN_DIST,
-                                              bound.maxMeters_, std::nullopt},
-                         bound.a_, bound.b_, qec, generateUniqueVarName);
-}
+namespace {
 
-// _____________________________________________________________________________
+// Return a FILTER that is equivalent to `bound`, namely
+// `geof:metricDistance(a, b) <= maxMeters`.
 SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
   using namespace sparqlExpression;
-  // The operands of a `DistanceBound` are variables or fixed geometries, see
-  // `filterFacts::Canonicalizer`.
-  auto toExpression = [](const TripleComponent& tc) -> SparqlExpression::Ptr {
-    if (tc.isVariable()) {
-      return std::make_unique<VariableExpression>(tc.getVariable());
-    } else if (tc.isLiteral()) {
-      return std::make_unique<StringLiteralExpression>(tc.getLiteral());
-    } else if (tc.isId()) {
-      return std::make_unique<IdExpression>(tc.getId());
+  // The operands of a `DistanceBound` are variables or constant geometries (see
+  // `getGeoDistanceExpressionParameters`).
+  auto toExpression =
+      [](const TripleComponent& operand) -> SparqlExpression::Ptr {
+    if (operand.isVariable()) {
+      return std::make_unique<VariableExpression>(operand.getVariable());
+    } else if (operand.isLiteral()) {
+      return std::make_unique<StringLiteralExpression>(operand.getLiteral());
     }
-    const auto* point = std::get_if<GeoPoint>(&tc.getVariant());
-    AD_CORRECTNESS_CHECK(point != nullptr);
-    return std::make_unique<IdExpression>(ValueId::makeFromGeoPoint(*point));
+    AD_CORRECTNESS_CHECK(operand.isId());
+    return std::make_unique<IdExpression>(operand.getId());
   };
-  auto expr =
+  auto expression =
       std::make_unique<LessEqualExpression>(LessEqualExpression::Children{
           makeMetricDistExpression(toExpression(bound.a_),
                                    toExpression(bound.b_)),
@@ -157,5 +147,48 @@ SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
       absl::StrCat("geof:metricDistance(", bound.a_.toString(), ", ",
                    bound.b_.toString(), ") <= ", bound.maxMeters_);
   return SparqlFilter{
-      SparqlExpressionPimpl{std::move(expr), std::move(descriptor)}};
+      SparqlExpressionPimpl{std::move(expression), std::move(descriptor)}};
+}
+
+}  // namespace
+
+// _____________________________________________________________________________
+void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
+                             const filterFacts::Definitions& defs) {
+  std::vector<SparqlFilter> result;
+  for (auto& filter : filters) {
+    // Recognize the `DistanceBound` of each conjunct of `filter`. Keep a
+    // FILTER without any as it is.
+    auto conjuncts =
+        filterFacts::canonicalize(*filter.expression_.getPimpl(), defs);
+    auto bounds = ::ranges::to<std::vector>(
+        conjuncts | ql::views::transform(&filterFacts::recognizeDistanceBound));
+    if (ql::ranges::none_of(bounds,
+                            [](const auto& b) { return b.has_value(); })) {
+      result.push_back(std::move(filter));
+      continue;
+    }
+
+    // Split `filter` into its conjuncts.
+    auto pieces = conjuncts.size() > 1 ? filter.expression_.splitConjunction()
+                                       : std::vector{filter.expression_};
+    AD_CORRECTNESS_CHECK(pieces.size() == bounds.size());
+
+    // Replace a conjunct whose fact needs the definitions by an equivalent
+    // FILTER without them, which can be rewritten on its own. If the fact is
+    // not exact, the conjunct is kept as well.
+    for (auto&& [piece, bound] : ::ranges::views::zip(pieces, bounds)) {
+      bool needsDefinitions =
+          bound.has_value() &&
+          !filterFacts::recognizeDistanceBound(
+              filterFacts::canonicalize(*piece.getPimpl())[0]);
+      if (needsDefinitions) {
+        result.push_back(distanceBoundToFilter(bound.value()));
+      }
+      if (!needsDefinitions || !bound->exact_) {
+        result.push_back(SparqlFilter{std::move(piece)});
+      }
+    }
+  }
+  filters = std::move(result);
 }

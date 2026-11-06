@@ -1,8 +1,11 @@
 // Copyright 2026 The QLever Authors, in particular:
 //
-// 2026 Christoph Ullinger <ullingec@informatik.uni-freiburg.de>, UFR
+// 2026 Christoph Ullinger <ullingec@cs.uni-freiburg.de>, UFR
 //
 // UFR = University of Freiburg, Chair of Algorithms and Data Structures
+//
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #include "engine/filterFacts/Recognizers.h"
 
@@ -15,88 +18,29 @@ using valueIdComparators::Comparison;
 
 // _____________________________________________________________________________
 std::optional<DistanceBound> recognizeDistanceBound(const Conjunct& conjunct) {
+  // Only a `Constraint` bounds a distance, and only between two different
+  // geometries, at least one of which is a variable.
   const auto* constraint = std::get_if<Constraint>(&conjunct);
-  if (!constraint || (constraint->op_ != Comparison::LE &&
-                      constraint->op_ != Comparison::LT)) {
+  if (constraint == nullptr) {
     return std::nullopt;
   }
-  const auto* distance = std::get_if<Distance>(&constraint->lhs_);
-  if (!distance || distance->a_ == distance->b_ ||
-      (!distance->a_.isVariable() && !distance->b_.isVariable())) {
+  const Distance& distance = constraint->lhs_;
+  if (distance.a_ == distance.b_ ||
+      (!distance.a_.isVariable() && !distance.b_.isVariable())) {
     return std::nullopt;
   }
-  // `distance <= c` can only hold for a numeric `c`.
-  double maxMeters = -1;
-  for (const auto& c : constraint->rhs_) {
-    auto value = getNumericValue(c);
-    if (!value || std::isnan(value.value())) {
-      return std::nullopt;
-    }
-    maxMeters = std::max(maxMeters, value.value());
-  }
-  if (maxMeters < 0) {
-    return std::nullopt;
-  }
+
+  // The maximum distance must not be negative (for `<`, it is the largest
+  // `double` below the number).
+  double maxMeters = constraint->rhs_;
   if (constraint->op_ == Comparison::LT) {
     maxMeters =
         std::nextafter(maxMeters, -std::numeric_limits<double>::infinity());
   }
-  return DistanceBound{distance->a_, distance->b_, maxMeters,
-                       constraint->exact_};
-}
-
-// _____________________________________________________________________________
-std::optional<LangIn> recognizeLangIn(const Conjunct& conjunct) {
-  const auto* constraint = std::get_if<Constraint>(&conjunct);
-  if (!constraint || constraint->op_ != Comparison::EQ) {
+  if (!(maxMeters >= 0)) {
     return std::nullopt;
   }
-  const auto* lang = std::get_if<Lang>(&constraint->lhs_);
-  if (!lang || constraint->rhs_.empty()) {
-    return std::nullopt;
-  }
-  // `LANG` returns a plain literal, so it can only be equal to one.
-  ad_utility::HashSet<std::string> langs;
-  for (const auto& c : constraint->rhs_) {
-    if (!c.isLiteral() || c.getLiteral().hasLanguageTag() ||
-        c.getLiteral().hasDatatype()) {
-      return std::nullopt;
-    }
-    langs.emplace(c.getLiteral().getContent());
-  }
-  return LangIn{lang->var_, std::move(langs), constraint->exact_};
-}
-
-// _____________________________________________________________________________
-std::optional<Fact> recognize(const Conjunct& conjunct) {
-  if (auto fact = recognizeDistanceBound(conjunct)) {
-    return fact.value();
-  }
-  if (auto fact = recognizeLangIn(conjunct)) {
-    return fact.value();
-  }
-  return std::nullopt;
-}
-
-// _____________________________________________________________________________
-std::vector<FilterFacts> recognizeFacts(
-    const parsedQuery::GraphPattern& group) {
-  auto defs = collectDefinitions(group._graphPatterns);
-  std::vector<FilterFacts> result;
-  for (const auto& filter : group._filters) {
-    FilterFacts& facts = result.emplace_back();
-    for (const auto& conjunct :
-         canonicalize(*filter.expression_.getPimpl(), defs)) {
-      facts.push_back(recognize(conjunct));
-    }
-  }
-  return result;
-}
-
-// _____________________________________________________________________________
-bool isExact(const std::optional<Fact>& fact) {
-  return fact.has_value() &&
-         std::visit([](const auto& f) { return f.exact_; }, fact.value());
+  return DistanceBound{distance.a_, distance.b_, maxMeters, constraint->exact_};
 }
 
 }  // namespace filterFacts

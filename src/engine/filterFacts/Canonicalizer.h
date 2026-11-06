@@ -1,13 +1,15 @@
 // Copyright 2026 The QLever Authors, in particular:
 //
-// 2026 Christoph Ullinger <ullingec@informatik.uni-freiburg.de>, UFR
+// 2026 Christoph Ullinger <ullingec@cs.uni-freiburg.de>, UFR
 //
 // UFR = University of Freiburg, Chair of Algorithms and Data Structures
+//
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #ifndef QLEVER_SRC_ENGINE_FILTERFACTS_CANONICALIZER_H
 #define QLEVER_SRC_ENGINE_FILTERFACTS_CANONICALIZER_H
 
-#include <optional>
 #include <variant>
 #include <vector>
 
@@ -18,23 +20,30 @@
 #include "parser/TripleComponent.h"
 #include "util/HashMap.h"
 
-// The first two stages of the filter fact recognition (see
-// `docs/experimental/filter-fact-recognition.md`): collect the definitions of
-// the variables of a group graph pattern, and bring the FILTER expressions of
-// the group into a canonical form using these definitions.
+// The recognition of facts in FILTERs. A FILTER can be written in many
+// equivalent ways, for example `geof:distance(?a, ?b, unit:M) <= 500`,
+// `geof:distance(?a, ?b) <= 0.5`, or as one of several conditions combined
+// with `&&`. A rewrite of the query (e.g. to a
+// `SpatialJoin`) should not have to match each of them. Instead, each FILTER
+// is brought into a canonical form (`canonicalize`, this file), in which typed
+// facts are recognized (see `Recognizers.h`). The rewrites only use these
+// facts.
+//
+// NOTE: The canonical form only models the shapes that the recognizers need.
+// Every other expression stays `Opaque`, so it is never rewritten.
 namespace filterFacts {
 
-// What is statically known about the variables of a single group graph
-// pattern. The definitions never cross the boundaries of the group.
+// What is statically known about the variables of a group graph pattern, from
+// its `VALUES` and `BIND` clauses (but not from nested groups).
 struct Definitions {
-  // The possible values of a variable, from an inline `VALUES` clause of the
-  // group without `UNDEF` in the column of the variable. Every result row of
-  // the group binds the variable to one of these values.
+  // The values of a variable from a `VALUES` clause of the group without
+  // `UNDEF` in the column of the variable. Every result row of the group binds
+  // the variable to one of these values.
   ad_utility::HashMap<Variable, std::vector<TripleComponent>> constants_;
-  // `BIND(e AS ?v)` clauses of the group that can be substituted: `e` is
-  // deterministic, contains neither `NOW()` nor `EXISTS`, and all its input
-  // variables are always bound by the patterns before the `BIND`. The pointers
-  // point into the group graph pattern, which must outlive this struct.
+  // The expressions of the `BIND(e AS ?v)` clauses of the group that are
+  // equivalent to their target `?v`: `e` is deterministic, its variables are
+  // always bound before the `BIND`, and no later pattern of the group may bind
+  // `?v`. The pointers point into the group, which must outlive this struct.
   ad_utility::HashMap<Variable, const sparqlExpression::SparqlExpression*>
       expressions_;
 };
@@ -43,60 +52,48 @@ struct Definitions {
 Definitions collectDefinitions(
     const std::vector<parsedQuery::GraphPatternOperation>& group);
 
-// The canonical form of an expression. Only the shapes required by the
-// recognizers are modelled, everything else is `Opaque`.
-
-// `geof:distance(a_, b_)` in metres. `a_` and `b_` are variables or constants.
+// `geof:distance(a_, b_)` in meters. `a_` and `b_` are variables or constant
+// geometries.
 struct Distance {
   TripleComponent a_;
   TripleComponent b_;
   QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Distance, a_, b_)
 };
 
-// `LANG(var_)`.
-struct Lang {
-  Variable var_;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Lang, var_)
-};
-
-// Any other expression. It is kept unchanged, in particular nothing is
-// substituted inside of it (e.g. inside of `BOUND(...)` or `EXISTS {...}`).
-struct Opaque {
-  const sparqlExpression::SparqlExpression* expr_;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Opaque, expr_)
-};
-
-using Term = std::variant<Variable, Distance, Lang, Opaque>;
-
-// `lhs_ op_ c` holds for at least one constant `c` from `rhs_`. Several
-// constants come from `IN`, from `||` of equalities, or from a multi-row
-// `VALUES` clause.
+// The comparison `lhs_ op_ rhs_` of a distance with a number `rhs_` (in
+// meters), where `op_` is `<` or `<=`. The conjunct implies the comparison.
+//
+// NOTE: The conjunct and the comparison are equivalent iff `exact_` is true. It
+// is false if the number is a variable from a `VALUES` clause with different
+// numbers in different rows: then `rhs_` is the largest of them.
 struct Constraint {
-  Term lhs_;
+  Distance lhs_;
   valueIdComparators::Comparison op_;
-  std::vector<TripleComponent> rhs_;
-  // True iff the conjunct holds exactly when the `Constraint` holds. This is
-  // false if a variable with several values from a multi-row `VALUES` clause
-  // was substituted (in each row, the conjunct only holds for the value of
-  // this row, not for any of the values).
+  double rhs_;
   bool exact_ = true;
   QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_, exact_)
 };
 
-// A single conjunct of a FILTER: if the FILTER holds, each of its conjuncts
-// holds.
+// Any other expression.
+struct Opaque {
+  const sparqlExpression::SparqlExpression* expression_;
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Opaque, expression_)
+};
+
+// A conjunct of a FILTER (the FILTER holds iff all its conjuncts hold).
 using Conjunct = std::variant<Constraint, Opaque>;
 
-// Bring the expression of a FILTER into canonical form: split `&&` into
-// conjuncts (in the order of `SparqlExpressionPimpl::splitConjunction`),
-// substitute `defs`, fold constants, move the constant side of a comparison to
-// the right, and normalize distances to metres.
+// Bring the expression of a FILTER into canonical form: split it at `&&` into
+// its conjuncts, and bring each comparison `distance < number` or
+// `distance <= number` into a `Constraint` (with the number in meters). A
+// variable with a definition in `defs` is replaced by its definition (for the
+// distance, the number and the unit).
+//
+// NOTE: The result points into `filter` (for the `Opaque` conjuncts), so
+// `filter` must outlive it.
 std::vector<Conjunct> canonicalize(
-    const sparqlExpression::SparqlExpression& filter, const Definitions& defs);
-
-// Return the value of `tc` if it is a numeric constant (`xsd:int` or
-// `xsd:double`), and `std::nullopt` otherwise (e.g. for the string "500").
-std::optional<double> getNumericValue(const TripleComponent& tc);
+    const sparqlExpression::SparqlExpression& filter,
+    const Definitions& defs = {});
 
 }  // namespace filterFacts
 

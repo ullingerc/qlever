@@ -634,7 +634,7 @@ addLinkAndDiscoverTest(GeoCellGridTest vocabulary)
 
 addLinkAndDiscoverTest(QueryRewriteUtilTest engine)
 
-addLinkAndDiscoverTest(FilterFactsTest filterFacts)
+addLinkAndDiscoverTest(FilterFactsTest filterFacts sparqlParser)
 
 addLinkAndDiscoverTest(QueryPlannerFilterFactsTest engine)
 

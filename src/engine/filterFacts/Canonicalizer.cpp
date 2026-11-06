@@ -1,8 +1,11 @@
 // Copyright 2026 The QLever Authors, in particular:
 //
-// 2026 Christoph Ullinger <ullingec@informatik.uni-freiburg.de>, UFR
+// 2026 Christoph Ullinger <ullingec@cs.uni-freiburg.de>, UFR
 //
 // UFR = University of Freiburg, Chair of Algorithms and Data Structures
+//
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #include "engine/filterFacts/Canonicalizer.h"
 
@@ -21,66 +24,70 @@ using valueIdComparators::Comparison;
 
 namespace {
 
-// _____________________________________________________________________________
-bool containsNow(const SparqlExpression& expr) {
-  if (dynamic_cast<const sparqlExpression::NowDatetimeExpression*>(&expr)) {
+// Return true iff `expression` contains `NOW()`.
+bool containsNow(const SparqlExpression& expression) {
+  if (dynamic_cast<const sparqlExpression::NowDatetimeExpression*>(
+          &expression)) {
     return true;
   }
-  return ql::ranges::any_of(
-      expr.children(), [](const auto& child) { return containsNow(*child); });
+  return ql::ranges::any_of(expression.children(), [](const auto& child) {
+    return containsNow(*child);
+  });
 }
 
-// Return true iff `BIND(expr AS ?v)` may be substituted, given the variables
-// that are always bound before the `BIND`.
-bool isSubstitutable(const SparqlExpression& expr,
+// Return true iff the target of `BIND(expression AS ?v)` is equivalent to
+// `expression`, given the variables that are always bound before the `BIND`.
+bool isSubstitutable(const SparqlExpression& expression,
                      const ad_utility::HashSet<Variable>& alwaysBound) {
   std::vector<const SparqlExpression*> exists;
-  expr.getExistsExpressions(exists);
-  return expr.isDeterministic() && !containsNow(expr) && exists.empty() &&
-         ql::ranges::all_of(expr.containedVariables(),
-                            [&alwaysBound](const Variable* var) {
-                              return alwaysBound.contains(*var);
+  expression.getExistsExpressions(exists);
+  return expression.isDeterministic() && !containsNow(expression) &&
+         exists.empty() &&
+         ql::ranges::all_of(expression.containedVariables(),
+                            [&alwaysBound](const Variable* variable) {
+                              return alwaysBound.contains(*variable);
                             });
 }
 
-// Add the variables that `op` may bind to `vars`. Return false if they are not
-// known (for the less common kinds of operations), then any variable may be
-// bound.
-bool collectBoundVariables(const parsedQuery::GraphPatternOperation& op,
-                           ad_utility::HashSet<Variable>& vars) {
+// Add the variables that `operation` may bind to `variables`. Return false if
+// they are not known (for the less common kinds of operations), then any
+// variable may be bound.
+bool collectBoundVariables(const parsedQuery::GraphPatternOperation& operation,
+                           ad_utility::HashSet<Variable>& variables) {
   namespace p = parsedQuery;
-  auto collectAll = [&vars](const ParsedQuery::GraphPattern& pattern) {
-    return ql::ranges::all_of(pattern._graphPatterns, [&vars](const auto& op) {
-      return collectBoundVariables(op, vars);
-    });
+  auto collectAll = [&variables](const ParsedQuery::GraphPattern& pattern) {
+    return ql::ranges::all_of(pattern._graphPatterns,
+                              [&variables](const auto& child) {
+                                return collectBoundVariables(child, variables);
+                              });
   };
-  return op.visit([&vars, &collectAll](const auto& arg) {
+  return operation.visit([&variables, &collectAll](const auto& arg) {
     using T = std::decay_t<decltype(arg)>;
     if constexpr (std::is_same_v<T, p::BasicGraphPattern>) {
-      arg.collectAllContainedVariables(vars);
+      arg.collectAllContainedVariables(variables);
       return true;
     } else if constexpr (std::is_same_v<T, p::Values>) {
-      vars.insert(arg._inlineValues._variables.begin(),
-                  arg._inlineValues._variables.end());
+      variables.insert(arg._inlineValues._variables.begin(),
+                       arg._inlineValues._variables.end());
       return true;
     } else if constexpr (std::is_same_v<T, p::Bind>) {
-      vars.insert(arg._target);
+      variables.insert(arg._target);
       return true;
     } else if constexpr (std::is_same_v<T, p::Minus>) {
       return true;
     } else if constexpr (std::is_same_v<T, p::Optional>) {
       return collectAll(arg._child);
     } else if constexpr (std::is_same_v<T, p::GroupGraphPattern>) {
-      if (const auto* graphVar =
+      if (const auto* graphVariable =
               std::get_if<p::GroupGraphPattern::GraphVar>(&arg.graphSpec_)) {
-        vars.insert(graphVar->first);
+        variables.insert(graphVariable->first);
       }
       return collectAll(arg._child);
     } else if constexpr (std::is_same_v<T, p::Union>) {
       return collectAll(arg._child1) && collectAll(arg._child2);
     } else if constexpr (std::is_same_v<T, p::Subquery>) {
       const auto& visible = arg.get().getVisibleVariables();
-      vars.insert(visible.begin(), visible.end());
+      variables.insert(visible.begin(), visible.end());
       return true;
     } else {
       return false;
@@ -94,22 +101,25 @@ bool collectBoundVariables(const parsedQuery::GraphPatternOperation& op,
 Definitions collectDefinitions(
     const std::vector<parsedQuery::GraphPatternOperation>& group) {
   Definitions defs;
-  // ponytail: Only triples and `VALUES` count as always binding. Nested
-  // groups, `UNION`s, subqueries etc. are ignored, which is conservative.
+  // ponytail: Only triples and `VALUES` count as always binding, nested groups
+  // etc. are ignored (which is conservative).
   ad_utility::HashSet<Variable> alwaysBound;
-  for (const auto& op : group) {
-    // Remove the `BIND`s whose target `op` may bind again (where the
-    // expression is undefined, `op` binds the target freely, so the target is
-    // not equivalent to the expression).
-    ad_utility::HashSet<Variable> boundByOp;
-    bool isKnown = collectBoundVariables(op, boundByOp);
+  for (const auto& operation : group) {
+    // Remove the `BIND`s whose target `operation` may bind again (where the
+    // expression is undefined, the target is then bound freely, so it is not
+    // equivalent to the expression).
+    ad_utility::HashSet<Variable> boundByOperation;
+    bool isKnown = collectBoundVariables(operation, boundByOperation);
     absl::erase_if(defs.expressions_, [&](const auto& definition) {
-      return !isKnown || boundByOp.contains(definition.first);
+      return !isKnown || boundByOperation.contains(definition.first);
     });
 
-    if (const auto* bgp = std::get_if<parsedQuery::BasicGraphPattern>(&op)) {
+    // Add the definitions of `operation`.
+    if (const auto* bgp =
+            std::get_if<parsedQuery::BasicGraphPattern>(&operation)) {
       bgp->collectAllContainedVariables(alwaysBound);
-    } else if (const auto* values = std::get_if<parsedQuery::Values>(&op)) {
+    } else if (const auto* values =
+                   std::get_if<parsedQuery::Values>(&operation)) {
       const auto& [variables, rows] = values->_inlineValues;
       for (size_t i = 0; i < variables.size(); ++i) {
         std::vector<TripleComponent> column;
@@ -120,287 +130,158 @@ Definitions collectDefinitions(
           continue;
         }
         alwaysBound.insert(variables[i]);
-        // If several `VALUES` clauses bind the same variable, the values of
-        // any one of them are a sound over-approximation.
+        // If several `VALUES` clauses bind the same variable, each of them
+        // contains all its values.
         defs.constants_.emplace(variables[i], std::move(column));
       }
-    } else if (const auto* bind = std::get_if<parsedQuery::Bind>(&op)) {
-      // The target is not always bound: the expression might be undefined.
-      const auto* expr = bind->_expression.getPimpl();
-      if (isSubstitutable(*expr, alwaysBound)) {
-        defs.expressions_.emplace(bind->_target, expr);
+    } else if (const auto* bind = std::get_if<parsedQuery::Bind>(&operation)) {
+      // The target is not always bound (the expression may be undefined).
+      const auto* expression = bind->_expression.getPimpl();
+      if (isSubstitutable(*expression, alwaysBound)) {
+        defs.expressions_.emplace(bind->_target, expression);
       }
     }
   }
   return defs;
 }
 
-// _____________________________________________________________________________
-std::optional<double> getNumericValue(const TripleComponent& tc) {
-  if (tc.isInt()) {
-    return static_cast<double>(tc.getInt());
-  } else if (tc.isDouble()) {
-    return tc.getDouble();
-  } else if (tc.isId()) {
-    const Id& id = tc.getId();
-    if (id.getDatatype() == Datatype::Int) {
-      return static_cast<double>(id.getInt());
-    } else if (id.getDatatype() == Datatype::Double) {
-      return id.getDouble();
-    }
+namespace {
+
+// Return the operator if `expression` is a comparison with `<` or `<=`.
+std::optional<Comparison> getComparison(const SparqlExpression& expression) {
+  if (dynamic_cast<const sparqlExpression::LessThanExpression*>(&expression)) {
+    return Comparison::LT;
+  } else if (dynamic_cast<const sparqlExpression::LessEqualExpression*>(
+                 &expression)) {
+    return Comparison::LE;
   }
   return std::nullopt;
 }
 
-namespace {
-
-// _____________________________________________________________________________
-TripleComponent toTripleComponent(const Id& id) {
-  switch (id.getDatatype()) {
-    case Datatype::Int:
-      return TripleComponent{id.getInt()};
-    case Datatype::Double:
-      return TripleComponent{id.getDouble()};
-    case Datatype::Bool:
-      return TripleComponent{id.getBool()};
-    default:
-      return TripleComponent{id};
-  }
-}
-
-// _____________________________________________________________________________
-std::optional<double> fold(sparqlExpression::BinaryExpressionOperator op,
-                           double a, double b) {
-  using Op = sparqlExpression::BinaryExpressionOperator;
-  switch (op) {
-    case Op::Add:
-      return a + b;
-    case Op::Subtract:
-      return a - b;
-    case Op::Multiply:
-      return a * b;
-    case Op::Divide:
-      // The result of a division by zero depends on a runtime parameter.
-      return b == 0 ? std::nullopt : std::optional{a / b};
-    default:
-      return std::nullopt;
-  }
-}
-
-// _____________________________________________________________________________
-Comparison flip(Comparison op) {
-  switch (op) {
-    case Comparison::LT:
-      return Comparison::GT;
-    case Comparison::LE:
-      return Comparison::GE;
-    case Comparison::GT:
-      return Comparison::LT;
-    case Comparison::GE:
-      return Comparison::LE;
-    default:
-      return op;
-  }
-}
-
-// The recursive implementation of `canonicalize`.
-class Canonicalizer {
-  const Definitions& defs_;
-  // A variable with several values was substituted in the current top-level
-  // conjunct, see `Constraint::exact_`.
-  bool isCorrelated_ = false;
-
- public:
-  explicit Canonicalizer(const Definitions& defs) : defs_{defs} {}
-
-  // Split `&&` and canonicalize each conjunct.
-  void split(const SparqlExpression& expr, std::vector<Conjunct>& result) {
-    if (sparqlExpression::getBinaryOperator(expr) ==
-        sparqlExpression::BinaryExpressionOperator::And) {
-      split(*expr.children()[0], result);
-      split(*expr.children()[1], result);
-    } else {
-      isCorrelated_ = false;
-      result.push_back(toConjunct(expr));
+// Return `expression`, or the expression of the `BIND` in `defs` if it is a
+// variable with such a definition.
+const SparqlExpression& resolve(const SparqlExpression& expression,
+                                const Definitions& defs) {
+  if (auto variable = expression.getVariableOrNullopt()) {
+    if (auto it = defs.expressions_.find(variable.value());
+        it != defs.expressions_.end()) {
+      return resolve(*it->second, defs);
     }
   }
+  return expression;
+}
 
- private:
-  // If `expr` has a value from a statically known set of constants, return
-  // these constants.
-  std::optional<std::vector<TripleComponent>> toConstants(
-      const SparqlExpression& expr) {
-    using namespace sparqlExpression;
-    if (auto var = expr.getVariableOrNullopt()) {
-      if (auto it = defs_.constants_.find(var.value());
-          it != defs_.constants_.end()) {
-        isCorrelated_ |= it->second.size() > 1;
-        return it->second;
-      }
-      if (auto it = defs_.expressions_.find(var.value());
-          it != defs_.expressions_.end()) {
-        return toConstants(*it->second);
-      }
+// Return the value of `constant` if it is a number (`xsd:int` or
+// `xsd:double`), and `std::nullopt` otherwise (e.g. for the string "500").
+std::optional<double> getNumber(const TripleComponent& constant) {
+  if (constant.isInt()) {
+    return static_cast<double>(constant.getInt());
+  } else if (constant.isDouble()) {
+    return constant.getDouble();
+  }
+  return std::nullopt;
+}
+
+// Return the possible values of `expression` if it is a number or a variable
+// with only numbers in `defs` (and `std::nullopt` otherwise).
+std::optional<std::vector<double>> getNumbers(
+    const SparqlExpression& expression, const Definitions& defs) {
+  const auto& resolved = resolve(expression, defs);
+
+  // A variable with the numbers of a `VALUES` clause.
+  if (auto variable = resolved.getVariableOrNullopt()) {
+    auto it = defs.constants_.find(variable.value());
+    if (it == defs.constants_.end() || it->second.empty()) {
       return std::nullopt;
     }
-    if (const auto* id = dynamic_cast<const IdExpression*>(&expr)) {
-      return std::vector{toTripleComponent(id->value())};
+    std::vector<double> numbers;
+    for (const auto& constant : it->second) {
+      auto number = getNumber(constant);
+      if (!number.has_value()) {
+        return std::nullopt;
+      }
+      numbers.push_back(number.value());
     }
-    if (const auto* lit = dynamic_cast<const StringLiteralExpression*>(&expr)) {
-      return std::vector{TripleComponent{lit->value()}};
-    }
-    if (const auto* iri = dynamic_cast<const IriExpression*>(&expr)) {
-      return std::vector{TripleComponent{iri->value()}};
-    }
-    if (auto op = getBinaryOperator(expr)) {
-      return foldBinary(op.value(), expr);
-    }
+    return numbers;
+  }
+
+  // A single number.
+  const auto* id =
+      dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
+  if (id == nullptr) {
     return std::nullopt;
   }
+  if (id->value().getDatatype() == Datatype::Int) {
+    return std::vector{static_cast<double>(id->value().getInt())};
+  } else if (id->value().getDatatype() == Datatype::Double) {
+    return std::vector{id->value().getDouble()};
+  }
+  return std::nullopt;
+}
 
-  // Fold `a op b` for numeric constants `a` and `b`. At least one side must be
-  // a single constant.
-  std::optional<std::vector<TripleComponent>> foldBinary(
-      sparqlExpression::BinaryExpressionOperator op,
-      const SparqlExpression& expr) {
-    auto left = toConstants(*expr.children()[0]);
-    auto right = toConstants(*expr.children()[1]);
-    if (!left || !right || (left->size() != 1 && right->size() != 1)) {
-      return std::nullopt;
-    }
-    std::vector<TripleComponent> result;
-    for (const auto& a : left.value()) {
-      for (const auto& b : right.value()) {
-        auto x = getNumericValue(a);
-        auto y = getNumericValue(b);
-        if (!x || !y) {
-          return std::nullopt;
-        }
-        auto value = fold(op, x.value(), y.value());
-        if (!value) {
-          return std::nullopt;
-        }
-        result.emplace_back(value.value());
-      }
-    }
-    return result;
+// Return the single value of `variable` from `defs` if it is an IRI or a
+// literal (and `std::nullopt` otherwise).
+std::optional<TripleComponent> getConstant(const Variable& variable,
+                                           const Definitions& defs) {
+  if (auto values = defs.constants_.find(variable);
+      values != defs.constants_.end() && values->second.size() == 1) {
+    return values->second.front();
+  }
+  auto it = defs.expressions_.find(variable);
+  if (it == defs.expressions_.end()) {
+    return std::nullopt;
+  }
+  const auto& resolved = resolve(*it->second, defs);
+  if (const auto* iri =
+          dynamic_cast<const sparqlExpression::IriExpression*>(&resolved)) {
+    return TripleComponent{iri->value()};
+  } else if (const auto* literal =
+                 dynamic_cast<const sparqlExpression::StringLiteralExpression*>(
+                     &resolved)) {
+    return TripleComponent{literal->value()};
+  }
+  return std::nullopt;
+}
+
+// Return the canonical form of a single conjunct: `distance < number` and
+// `distance <= number` become a `Constraint`, everything else is `Opaque`.
+Conjunct toConjunct(const SparqlExpression& expression,
+                    const Definitions& defs) {
+  auto op = getComparison(expression);
+  if (!op.has_value()) {
+    return Opaque{&expression};
+  }
+  auto call = sparqlExpression::getGeoDistanceExpressionParameters(
+      resolve(*expression.children()[0], defs),
+      [&defs](const Variable& variable) {
+        return getConstant(variable, defs);
+      });
+  auto numbers = getNumbers(*expression.children()[1], defs);
+  if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
+      !numbers.has_value()) {
+    return Opaque{&expression};
   }
 
-  // Bring `expr` into canonical form, substituting the definitions of
-  // variables. Distances are returned in their original unit, together with
-  // the factor which converts this unit to metres.
-  std::pair<Term, double> toTerm(const SparqlExpression& expr) {
-    using namespace sparqlExpression;
-    if (auto var = expr.getVariableOrNullopt()) {
-      if (auto it = defs_.expressions_.find(var.value());
-          it != defs_.expressions_.end()) {
-        return toTerm(*it->second);
-      }
-      return {var.value(), 1};
-    }
-    if (auto call = getGeoDistanceExpressionParameters(expr);
-        call.has_value() && ad_utility::detail::isLengthUnit(call->unit_)) {
-      double toMetres =
-          ad_utility::detail::valueInUnitToKilometer(1, call->unit_) * 1000;
-      return {Distance{resolve(call->left_), resolve(call->right_)}, toMetres};
-    }
-    if (auto var = getVariableFromLangExpression(&expr)) {
-      return {Lang{var.value()}, 1};
-    }
-    return {Opaque{&expr}, 1};
-  }
+  // Convert the largest number from the unit of the distance to meters.
+  auto [min, max] = ql::ranges::minmax(numbers.value());
+  double meters =
+      ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
+  return Constraint{Distance{call->left_, call->right_}, op.value(), meters,
+                    min == max};
+}
 
-  // Replace a geometry argument of a function by its value, if it has a single
-  // one which can be a geometry (a literal, or a `GeoPoint` from `VALUES`).
-  TripleComponent resolve(const TripleComponent& tc) {
-    if (tc.isVariable()) {
-      if (auto it = defs_.constants_.find(tc.getVariable());
-          it != defs_.constants_.end() && it->second.size() == 1) {
-        const auto& value = it->second.front();
-        if (value.isLiteral() ||
-            std::holds_alternative<GeoPoint>(value.getVariant())) {
-          return value;
-        }
-      }
+// Split `expression` at `&&` and append the canonical form of each conjunct to
+// `result`.
+void split(const SparqlExpression& expression, const Definitions& defs,
+           std::vector<Conjunct>& result) {
+  if (sparqlExpression::isAndExpression(expression)) {
+    for (const auto& child : expression.children()) {
+      split(*child, defs, result);
     }
-    return tc;
+  } else {
+    result.push_back(toConjunct(expression, defs));
   }
-
-  // Build the `Constraint` `lhs op rhs` where `rhs` are constants.
-  Conjunct makeConstraint(const SparqlExpression& lhs, Comparison op,
-                          std::vector<TripleComponent> rhs) {
-    auto [term, toMetres] = toTerm(lhs);
-    if (toMetres != 1) {
-      for (auto& c : rhs) {
-        if (auto value = getNumericValue(c)) {
-          c = TripleComponent{value.value() * toMetres};
-        }
-      }
-    }
-    return Constraint{std::move(term), op, std::move(rhs), !isCorrelated_};
-  }
-
-  // Bring a single conjunct into canonical form.
-  Conjunct toConjunct(const SparqlExpression& expr) {
-    using namespace sparqlExpression;
-    if (auto op = getComparison(expr)) {
-      const auto& left = *expr.children()[0];
-      const auto& right = *expr.children()[1];
-      if (auto constants = toConstants(right)) {
-        return makeConstraint(left, op.value(), std::move(constants).value());
-      }
-      if (auto constants = toConstants(left)) {
-        return makeConstraint(right, flip(op.value()),
-                              std::move(constants).value());
-      }
-    } else if (dynamic_cast<const InExpression*>(&expr)) {
-      // `lhs IN (c1, c2, ...)` is `lhs = c` for some `c`.
-      auto children = expr.children();
-      std::vector<TripleComponent> rhs;
-      for (const auto& child : children.subspan(1)) {
-        auto constants = toConstants(*child);
-        if (!constants) {
-          return Opaque{&expr};
-        }
-        ql::ranges::move(constants.value(), std::back_inserter(rhs));
-      }
-      return makeConstraint(*children[0], Comparison::EQ, std::move(rhs));
-    } else if (getBinaryOperator(expr) == BinaryExpressionOperator::Or) {
-      // `x = a || x = b` is `x = c` for some `c` in `{a, b}`.
-      auto left = toConjunct(*expr.children()[0]);
-      auto right = toConjunct(*expr.children()[1]);
-      auto* l = std::get_if<Constraint>(&left);
-      auto* r = std::get_if<Constraint>(&right);
-      if (l && r && l->op_ == Comparison::EQ && r->op_ == Comparison::EQ &&
-          l->lhs_ == r->lhs_) {
-        ql::ranges::move(r->rhs_, std::back_inserter(l->rhs_));
-        return left;
-      }
-    }
-    return Opaque{&expr};
-  }
-
-  // If `expr` is a relational expression (`<`, `=`, etc.), return its
-  // operator.
-  static std::optional<Comparison> getComparison(const SparqlExpression& expr) {
-    std::optional<Comparison> result;
-    auto check = [&expr, &result](auto comp) {
-      constexpr Comparison op = decltype(comp)::value;
-      using T = sparqlExpression::relational::RelationalExpression<op>;
-      if (dynamic_cast<const T*>(&expr) != nullptr) {
-        result = op;
-      }
-    };
-    using C = Comparison;
-    check(std::integral_constant<C, C::LT>{});
-    check(std::integral_constant<C, C::LE>{});
-    check(std::integral_constant<C, C::EQ>{});
-    check(std::integral_constant<C, C::NE>{});
-    check(std::integral_constant<C, C::GT>{});
-    check(std::integral_constant<C, C::GE>{});
-    return result;
-  }
-};
+}
 
 }  // namespace
 
@@ -408,7 +289,7 @@ class Canonicalizer {
 std::vector<Conjunct> canonicalize(const SparqlExpression& filter,
                                    const Definitions& defs) {
   std::vector<Conjunct> result;
-  Canonicalizer{defs}.split(filter, result);
+  split(filter, defs, result);
   return result;
 }
 

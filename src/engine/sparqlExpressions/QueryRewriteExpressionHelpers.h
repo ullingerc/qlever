@@ -5,6 +5,8 @@
 #ifndef QLEVER_SRC_ENGINE_SPARQLEXPRESSIONS_QUERYREWRITEEXPRESSIONHELPERS_H
 #define QLEVER_SRC_ENGINE_SPARQLEXPRESSIONS_QUERYREWRITEEXPRESSIONHELPERS_H
 
+#include <functional>
+
 #include "engine/SpatialJoinConfig.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 #include "parser/TripleComponent.h"
@@ -13,10 +15,8 @@
 // This header declares utilities required during query planning for rewriting
 // parts of queries. The implementation of the
 // `getGeoFunctionExpressionParameters` and `getGeoDistanceExpressionParameters`
-// functions can be found in `GeoExpression.cpp`. Additionally note the
-// `getGeoDistanceFilter` function from `RelationalExpressions.cpp` for
-// extracting information from expressions of the form `geof:distance(?a, ?b) <=
-// constant`.
+// functions can be found in `GeoExpression.cpp`. Expressions of the form
+// `geof:distance(?a, ?b) <= constant` are recognized in `engine/filterFacts`.
 
 namespace sparqlExpression {
 
@@ -46,9 +46,12 @@ struct GeoDistanceCall : public GeoFunctionCall {
 
 // Same as `getGeoFunctionExpressionParameters`, but with special handling for
 // the unit of measurement associated with a distance. Also implemented in in
-// `GeoExpression.cpp`.
+// `GeoExpression.cpp`. If the unit is a variable, it is replaced by the result
+// of `constantOfVariable` (if given and not `std::nullopt`).
 std::optional<GeoDistanceCall> getGeoDistanceExpressionParameters(
-    const SparqlExpression& expr);
+    const SparqlExpression& expr,
+    const std::function<std::optional<TripleComponent>(const Variable&)>&
+        constantOfVariable = {});
 
 // Helper struct for `getDe9imRelationExpressionParameters`
 struct De9imRelationCall : public GeoFunctionCall {
@@ -59,23 +62,6 @@ struct De9imRelationCall : public GeoFunctionCall {
 // function, which additionally carries a DE-9IM filter pattern as its third
 // argument. Also implemented in `GeoExpression.cpp`.
 std::optional<De9imRelationCall> getDe9imRelationExpressionParameters(
-    const SparqlExpression& expr);
-
-// The binary operators that `getBinaryOperator` can identify.
-enum class BinaryExpressionOperator {
-  And,
-  Or,
-  Add,
-  Subtract,
-  Multiply,
-  Divide
-};
-
-// Return the operator if `expr` is one of the binary expressions `&&`, `||`,
-// `+`, `-`, `*`, or `/`, and `std::nullopt` otherwise. The operands are
-// `expr.children()`. Implemented in `NumericBinaryExpressions.cpp`, because the
-// classes of these expressions are hidden in that file.
-std::optional<BinaryExpressionOperator> getBinaryOperator(
     const SparqlExpression& expr);
 
 }  // namespace sparqlExpression

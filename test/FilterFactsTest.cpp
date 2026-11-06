@@ -1,8 +1,11 @@
 // Copyright 2026 The QLever Authors, in particular:
 //
-// 2026 Christoph Ullinger <ullingec@informatik.uni-freiburg.de>, UFR
+// 2026 Christoph Ullinger <ullingec@cs.uni-freiburg.de>, UFR
 //
 // UFR = University of Freiburg, Chair of Algorithms and Data Structures
+//
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #include <absl/strings/str_cat.h>
 #include <gmock/gmock.h>
@@ -10,562 +13,188 @@
 #include <cmath>
 #include <limits>
 
+#include "./util/GTestHelpers.h"
 #include "./util/ParsedQueryTestHelpers.h"
-#include "./util/TripleComponentTestHelpers.h"
 #include "engine/filterFacts/Canonicalizer.h"
 #include "engine/filterFacts/Recognizers.h"
-#include "engine/sparqlExpressions/SparqlExpression.h"
 
 namespace {
 
 using namespace filterFacts;
 using ::testing::ElementsAre;
-using ::testing::IsEmpty;
-using ::testing::UnorderedElementsAre;
 using ::testing::VariantWith;
 using valueIdComparators::Comparison;
 using V = Variable;
-using Literal = ad_utility::triple_component::Literal;
-constexpr auto iri = ad_utility::testing::iri;
 
-constexpr std::string_view prefixes =
-    "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
-    "PREFIX unit: <http://qudt.org/vocab/unit/> "
-    "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
-
-// The two geometries used by most queries below.
-constexpr std::string_view geoms = "?a <p> ?ga . ?b <p> ?gb . ";
-
-// A parsed query together with the definitions and the canonical form of the
-// FILTERs of its root group graph pattern.
+// A parsed query and the canonical form of the FILTERs of its root group
+// graph pattern (which point into the query).
 struct Canonical {
   ParsedQuery query_;
-  Definitions defs_;
   std::vector<Conjunct> conjuncts_;
 };
 
-// Parse `SELECT * { <body> }` and canonicalize all FILTERs of its root group.
-Canonical canonical(std::string_view body) {
-  Canonical result{ad_utility::testing::parseQuery(
-                       absl::StrCat(prefixes, "SELECT * { ", body, " }")),
-                   {},
-                   {}};
+// Parse `SELECT * { ?a <p> ?ga . ?b <p> ?gb . <definitions> FILTER(<filter>)
+// }` and canonicalize its FILTER with the definitions of the group.
+Canonical canonical(std::string_view filter,
+                    std::string_view definitions = "") {
+  Canonical result{
+      ad_utility::testing::parseQuery(absl::StrCat(
+          "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+          "PREFIX unit: <http://qudt.org/vocab/unit/> "
+          "SELECT * { ?a <p> ?ga . ?b <p> ?gb . ",
+          definitions, " FILTER(", filter, ") }")),
+      {}};
   const auto& group = result.query_._rootGraphPattern;
-  result.defs_ = collectDefinitions(group._graphPatterns);
-  for (const auto& filter : group._filters) {
-    ql::ranges::move(canonicalize(*filter.expression_.getPimpl(), result.defs_),
+  auto defs = collectDefinitions(group._graphPatterns);
+  for (const auto& f : group._filters) {
+    ql::ranges::move(canonicalize(*f.expression_.getPimpl(), defs),
                      std::back_inserter(result.conjuncts_));
   }
   return result;
 }
 
-// Matcher for a `Constraint` with numeric constants on the right side.
-auto numericConstraint(Term lhs, Comparison op, std::vector<double> rhs) {
+// Matcher for a `Constraint` `distance op meters` (compared with a tolerance,
+// because the factors of the conversion of units are rounded).
+auto constraint(Comparison op, double meters, bool exact = true) {
   using namespace ::testing;
-  auto toNumbers = [](const std::vector<TripleComponent>& constants) {
-    std::vector<double> numbers;
-    for (const auto& c : constants) {
-      numbers.push_back(getNumericValue(c).value_or(-12345));
-    }
-    return numbers;
-  };
-  std::vector<Matcher<double>> numbers;
-  for (double x : rhs) {
-    numbers.push_back(DoubleNear(x, 1e-3));
-  }
   return VariantWith<Constraint>(
-      AllOf(Field(&Constraint::lhs_, Eq(lhs)), Field(&Constraint::op_, op),
-            Field(&Constraint::rhs_,
-                  ResultOf(toNumbers, ElementsAreArray(numbers)))));
+      AllOf(Field(&Constraint::lhs_, Eq(Distance{V{"?ga"}, V{"?gb"}})),
+            Field(&Constraint::op_, op),
+            Field(&Constraint::rhs_, DoubleNear(meters, 1e-3)),
+            Field(&Constraint::exact_, exact)));
 }
 
-// Matcher for a `Constraint` with arbitrary constants on the right side.
-auto constraint(Term lhs, Comparison op, std::vector<TripleComponent> rhs,
-                bool exact = true) {
-  return VariantWith<Constraint>(
-      Constraint{std::move(lhs), op, std::move(rhs), exact});
-}
-
-// Matcher for an `Opaque` conjunct whose expression contains exactly the
-// given variables (so nothing was substituted inside of it).
-auto opaque(std::vector<Variable> variables) {
-  using namespace ::testing;
-  auto getVariables = [](const Opaque& o) {
-    ad_utility::HashSet<Variable> result;
-    for (const auto* var : o.expr_->containedVariables()) {
-      result.insert(*var);
-    }
-    return std::vector<Variable>(result.begin(), result.end());
-  };
-  return VariantWith<Opaque>(
-      ResultOf(getVariables, UnorderedElementsAreArray(variables)));
-}
-
-// The distance between the two geometries.
-Term dist() { return Distance{V{"?ga"}, V{"?gb"}}; }
-
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, DistanceShapes) {
-  auto expectDist500 = [](std::string_view body, ad_utility::source_location l =
-                                                     AD_CURRENT_SOURCE_LOC()) {
+// Test that `distance < number` and `distance <= number` become a
+// `Constraint` with the number in meters, also in a nested `&&`.
+TEST(FilterFactsCanonicalizer, Distance) {
+  auto expect = [](std::string_view filter, Comparison op, double meters,
+                   ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
     auto trace = generateLocationTrace(l);
-    EXPECT_THAT(canonical(absl::StrCat(geoms, body)).conjuncts_,
-                ElementsAre(numericConstraint(dist(), Comparison::LE, {500})));
+    EXPECT_THAT(canonical(filter).conjuncts_,
+                ElementsAre(constraint(op, meters)));
   };
-  // Direct, through `BIND`, through `VALUES`, and through `BIND` of a constant.
-  expectDist500("FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)");
-  expectDist500(
-      "BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)");
-  expectDist500(
-      "VALUES ?r { 500 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)");
-  expectDist500(
-      "BIND(500 AS ?r) FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)");
-  // The `VALUES` clause and the `FILTER` may be anywhere in the group.
-  expectDist500(
-      "FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r) VALUES ?r { 500 }");
-  // `BIND` and `VALUES` combined.
-  expectDist500(
-      "BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) VALUES ?r { 500 } "
-      "FILTER(?d <= ?r)");
 
-  // Several values.
-  EXPECT_THAT(
-      canonical(absl::StrCat(geoms,
-                             "VALUES ?r { 500 1000 } "
-                             "FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)"))
-          .conjuncts_,
-      ElementsAre(numericConstraint(dist(), Comparison::LE, {500, 1000})));
+  // Different distance functions and units.
+  expect("geof:distance(?ga, ?gb, unit:M) <= 500", Comparison::LE, 500);
+  expect("geof:distance(?ga, ?gb) <= 0.5", Comparison::LE, 500);
+  expect("geof:metricDistance(?ga, ?gb) < 500", Comparison::LT, 500);
+  expect("geof:distance(?ga, ?gb, unit:MI) < 1", Comparison::LT, 1609.344);
+
+  // Each conjunct of `&&` is canonicalized on its own.
+  auto result = canonical(
+      "geof:metricDistance(?ga, ?gb) <= 500 && "
+      "(?a != ?b && geof:metricDistance(?ga, ?gb) < 400)");
+  EXPECT_THAT(result.conjuncts_, ElementsAre(constraint(Comparison::LE, 500),
+                                             VariantWith<Opaque>(::testing::_),
+                                             constraint(Comparison::LT, 400)));
 }
 
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, FlipComparison) {
-  auto expectOp = [](std::string_view filter, Comparison op,
-                     ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
+// Test that a variable is replaced by its definition from `VALUES` or `BIND`
+// (for the distance, the number and the unit), and that a `Constraint` with
+// different numbers in different rows has the largest one and is not exact.
+TEST(FilterFactsCanonicalizer, Definitions) {
+  auto expect = [](std::string_view definitions, std::string_view filter,
+                   Comparison op, double meters, bool exact = true,
+                   ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
     auto trace = generateLocationTrace(l);
-    EXPECT_THAT(canonical(absl::StrCat(geoms, filter)).conjuncts_,
-                ElementsAre(numericConstraint(dist(), op, {500})));
+    EXPECT_THAT(canonical(filter, definitions).conjuncts_,
+                ElementsAre(constraint(op, meters, exact)));
   };
-  expectOp("FILTER(geof:metricDistance(?ga, ?gb) <= 500)", Comparison::LE);
-  expectOp("FILTER(geof:metricDistance(?ga, ?gb) < 500)", Comparison::LT);
-  expectOp("FILTER(500 >= geof:metricDistance(?ga, ?gb))", Comparison::LE);
-  expectOp("FILTER(500 > geof:metricDistance(?ga, ?gb))", Comparison::LT);
-  expectOp("FILTER(500 <= geof:metricDistance(?ga, ?gb))", Comparison::GE);
-  expectOp("FILTER(500 < geof:metricDistance(?ga, ?gb))", Comparison::GT);
-  expectOp("FILTER(500 = geof:metricDistance(?ga, ?gb))", Comparison::EQ);
-  expectOp("FILTER(500 != geof:metricDistance(?ga, ?gb))", Comparison::NE);
-  expectOp(
-      "BIND(geof:metricDistance(?ga, ?gb) AS ?d) VALUES ?r { 500 } "
-      "FILTER(?r >= ?d)",
-      Comparison::LE);
+  expect("VALUES ?r { 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
+         Comparison::LE, 500);
+  expect("BIND(0.5 AS ?r)", "geof:distance(?ga, ?gb) < ?r", Comparison::LT,
+         500);
+  expect("VALUES ?u { unit:MI }", "geof:distance(?ga, ?gb, ?u) <= 1",
+         Comparison::LE, 1609.344);
+  expect("BIND(unit:MI AS ?u)", "geof:distance(?ga, ?gb, ?u) <= 1",
+         Comparison::LE, 1609.344);
+  expect("BIND(geof:metricDistance(?ga, ?gb) AS ?d)", "?d <= 500",
+         Comparison::LE, 500);
+  expect("VALUES ?r { 1000 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
+         Comparison::LE, 1000, false);
 }
 
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, SplitConjunction) {
-  auto c = canonical(absl::StrCat(
-      geoms,
-      "FILTER(?a = <x> && (geof:metricDistance(?ga, ?gb) <= 500 && "
-      "STRLEN(?b) > 3)) FILTER(?b != <y>)"));
-  EXPECT_THAT(c.conjuncts_,
-              ElementsAre(constraint(V{"?a"}, Comparison::EQ, {iri("<x>")}),
-                          numericConstraint(dist(), Comparison::LE, {500}),
-                          VariantWith<Constraint>(::testing::Field(
-                              &Constraint::op_, Comparison::GT)),
-                          constraint(V{"?b"}, Comparison::NE, {iri("<y>")})));
-  // A disjunction is not split.
-  EXPECT_THAT(canonical("?a <p> ?b FILTER(?a = <x> || ?b = <y>)").conjuncts_,
-              ElementsAre(VariantWith<Opaque>(::testing::_)));
+// Test that only the columns of `VALUES` without `UNDEF` and the `BIND`s whose
+// target is equivalent to their expression are definitions.
+TEST(FilterFactsCanonicalizer, CollectDefinitions) {
+  using ::testing::Key;
+  using ::testing::UnorderedElementsAre;
+  auto query = ad_utility::testing::parseQuery(
+      "SELECT * { ?a <p> ?ga . BIND(?ga AS ?x) BIND(?gb AS ?y) ?b <p> ?gb . "
+      "BIND(RAND() AS ?z) BIND(NOW() AS ?n) BIND(?ga AS ?w) ?w <q> ?o . "
+      "VALUES (?r ?s) { (1 UNDEF) } }");
+  auto defs = collectDefinitions(query._rootGraphPattern._graphPatterns);
+
+  // `?y` is bound before `?gb`, `?z` and `?n` are not deterministic, and `?w`
+  // is bound again by a later triple.
+  EXPECT_THAT(defs.expressions_, UnorderedElementsAre(Key(V{"?x"})));
+  EXPECT_THAT(defs.constants_, UnorderedElementsAre(Key(V{"?r"})));
 }
 
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, UnitNormalization) {
-  auto expectMeters = [](std::string_view filter, double meters,
-                         ad_utility::source_location l =
-                             AD_CURRENT_SOURCE_LOC()) {
-    auto trace = generateLocationTrace(l);
-    EXPECT_THAT(
-        canonical(absl::StrCat(geoms, filter)).conjuncts_,
-        ElementsAre(numericConstraint(dist(), Comparison::LE, {meters})));
-  };
-  expectMeters("FILTER(geof:distance(?ga, ?gb) <= 0.5)", 500);
-  expectMeters("FILTER(geof:distance(?ga, ?gb, unit:KiloM) <= 0.5)", 500);
-  expectMeters("FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)", 500);
-  expectMeters("FILTER(geof:distance(?ga, ?gb, unit:MI) <= 1)", 1609.344);
-  expectMeters("FILTER(geof:metricDistance(?ga, ?gb) <= 500)", 500);
-  expectMeters("VALUES ?r { 0.5 } FILTER(geof:distance(?ga, ?gb) <= ?r)", 500);
-  expectMeters("FILTER(0.5 >= geof:distance(?ga, ?gb))", 500);
-
-  // Non-numeric constants are kept as they are.
-  EXPECT_THAT(
-      canonical(absl::StrCat(geoms, "FILTER(geof:distance(?ga, ?gb) <= \"x\")"))
-          .conjuncts_,
-      ElementsAre(constraint(dist(), Comparison::LE,
-                             {Literal::literalWithoutQuotes("x")})));
-}
-
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, ConstantFolding) {
-  auto expectMeters = [](std::string_view filter, double meters,
-                         ad_utility::source_location l =
-                             AD_CURRENT_SOURCE_LOC()) {
-    auto trace = generateLocationTrace(l);
-    EXPECT_THAT(
-        canonical(absl::StrCat(geoms, filter)).conjuncts_,
-        ElementsAre(numericConstraint(dist(), Comparison::LE, {meters})));
-  };
-  expectMeters("FILTER(geof:metricDistance(?ga, ?gb) <= 250 * 2)", 500);
-  expectMeters("FILTER(geof:metricDistance(?ga, ?gb) <= 250 + 250)", 500);
-  expectMeters("FILTER(geof:metricDistance(?ga, ?gb) <= 750 - 250)", 500);
-  expectMeters("FILTER(geof:metricDistance(?ga, ?gb) <= 1000 / 2)", 500);
-  expectMeters("FILTER(geof:distance(?ga, ?gb) <= 0.25 * 2)", 500);
-  expectMeters("VALUES ?r { 0.25 } FILTER(geof:distance(?ga, ?gb) <= ?r * 2)",
-               500);
-  expectMeters(
-      "VALUES ?r { 0.25 } BIND(?r * 2 AS ?s) "
-      "FILTER(geof:distance(?ga, ?gb) <= ?s)",
-      500);
-
-  // Not folded: a division by zero, non-numeric operands, and several values
-  // on both sides.
+// Test that every other expression stays `Opaque`.
+TEST(FilterFactsCanonicalizer, Opaque) {
   for (std::string_view filter :
-       {"FILTER(geof:metricDistance(?ga, ?gb) <= 1 / 0)",
-        "FILTER(geof:metricDistance(?ga, ?gb) <= \"1\" + 1)",
-        "VALUES ?r { 1 2 } VALUES ?s { 1 2 } "
-        "FILTER(geof:metricDistance(?ga, ?gb) <= ?r + ?s)"}) {
-    EXPECT_THAT(canonical(absl::StrCat(geoms, filter)).conjuncts_,
-                ElementsAre(VariantWith<Opaque>(::testing::_)))
+       {"geof:metricDistance(?ga, ?gb) > 500",
+        "500 >= geof:metricDistance(?ga, ?gb)",
+        "geof:metricDistance(?ga, ?gb) <= \"500\"",
+        "geof:metricDistance(?ga, ?gb) <= ?a",
+        "geof:metricDistance(?ga, ?gb) + 1 <= 500", "?a <= 500", "BOUND(?a)",
+        "geof:metricDistance(?ga, ?gb) <= 500 || ?a = 1"}) {
+    auto result = canonical(filter);
+    EXPECT_THAT(result.conjuncts_,
+                ElementsAre(VariantWith<Opaque>(
+                    Opaque{result.query_._rootGraphPattern._filters[0]
+                               .expression_.getPimpl()})))
         << filter;
   }
 }
 
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, NoSubstitutionInsideBoundOrExists) {
-  auto bind = "BIND(geof:metricDistance(?ga, ?gb) AS ?d) ";
-  // `BOUND(?d)` stays as it is, the other conjunct is substituted.
-  EXPECT_THAT(
-      canonical(absl::StrCat(geoms, bind, "FILTER(BOUND(?d) && ?d <= 500)"))
-          .conjuncts_,
-      ElementsAre(opaque({V{"?d"}}),
-                  numericConstraint(dist(), Comparison::LE, {500})));
-  EXPECT_THAT(
-      canonical(absl::StrCat(geoms, bind, "FILTER(!BOUND(?d) || ?d <= 500)"))
-          .conjuncts_,
-      ElementsAre(opaque({V{"?d"}})));
-  EXPECT_THAT(
-      canonical(absl::StrCat(geoms, bind,
-                             "FILTER(EXISTS { ?d <q> ?z } && ?d <= 500)"))
-          .conjuncts_,
-      ElementsAre(VariantWith<Opaque>(::testing::_),
-                  numericConstraint(dist(), Comparison::LE, {500})));
-}
-
-// _____________________________________________________________________________
-TEST(FilterFactsCanonicalizer, Lang) {
-  auto en = Literal::literalWithoutQuotes("en");
-  auto de = Literal::literalWithoutQuotes("de");
-  const Term lang = Lang{V{"?y"}};
-  auto expectLang =
-      [&](std::string_view body, std::vector<TripleComponent> langs,
-          ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
-        auto trace = generateLocationTrace(l);
-        EXPECT_THAT(
-            canonical(absl::StrCat("VALUES ?y { \"a\"@en } ", body)).conjuncts_,
-            ElementsAre(constraint(lang, Comparison::EQ, langs)));
-      };
-  expectLang("FILTER(LANG(?y) = \"en\")", {en});
-  expectLang("FILTER(\"en\" = LANG(?y))", {en});
-  expectLang("BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", {en});
-  expectLang("FILTER(LANG(?y) IN (\"en\", \"de\"))", {en, de});
-  expectLang("BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))", {en, de});
-  expectLang("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")", {en, de});
-
-  // A variable with several values from `VALUES` makes the constraint inexact.
-  EXPECT_THAT(canonical("VALUES ?y { \"a\"@en } VALUES ?l { \"en\" \"de\" } "
-                        "FILTER(LANG(?y) = ?l)")
-                  .conjuncts_,
-              ElementsAre(constraint(lang, Comparison::EQ, {en, de}, false)));
-
-  // Different variables or operators are not merged.
-  EXPECT_THAT(canonical("VALUES (?y ?z) { (\"a\"@en \"b\"@de) } "
-                        "FILTER(LANG(?y) = \"en\" || LANG(?z) = \"de\")")
-                  .conjuncts_,
-              ElementsAre(VariantWith<Opaque>(::testing::_)));
-  EXPECT_THAT(canonical("VALUES ?y { \"a\"@en } "
-                        "FILTER(LANG(?y) = \"en\" || LANG(?y) != \"de\")")
-                  .conjuncts_,
-              ElementsAre(VariantWith<Opaque>(::testing::_)));
-}
-
-// _____________________________________________________________________________
-TEST(FilterFactsDefinitions, CollectDefinitions) {
-  auto defs = [](std::string_view body) { return canonical(body).defs_; };
-  auto bind = "BIND(geof:metricDistance(?ga, ?gb) AS ?d) ";
-
-  // Positive cases.
-  auto d = defs(absl::StrCat(geoms, bind, "VALUES (?r ?s) { (1 2) (3 4) }"));
-  EXPECT_TRUE(d.expressions_.contains(V{"?d"}));
-  EXPECT_THAT(
-      d.constants_.at(V{"?r"}),
-      ElementsAre(TripleComponent{int64_t{1}}, TripleComponent{int64_t{3}}));
-  EXPECT_THAT(
-      d.constants_.at(V{"?s"}),
-      ElementsAre(TripleComponent{int64_t{2}}, TripleComponent{int64_t{4}}));
-  // Inputs bound by `VALUES` before the `BIND`.
-  EXPECT_TRUE(defs("VALUES ?x { 1 } BIND(?x + 1 AS ?y)")
-                  .expressions_.contains(V{"?y"}));
-
-  // `?gb` is not bound before the `BIND`.
-  EXPECT_THAT(
-      defs(absl::StrCat("?a <p> ?ga . ", bind, "?b <p> ?gb .")).expressions_,
-      IsEmpty());
-  // `?gb` is only bound in a nested group, an `OPTIONAL`, or another `BIND`.
-  for (std::string_view binding :
-       {"{ ?b <p> ?gb }", "OPTIONAL { ?b <p> ?gb }", "BIND(<x> AS ?gb)"}) {
-    EXPECT_THAT(defs(absl::StrCat("?a <p> ?ga . ", binding, bind)).expressions_,
-                ::testing::Not(::testing::Contains(::testing::Key(V{"?d"}))))
-        << binding;
-  }
-  // `?d` may be bound again by a later pattern, or by a later operation whose
-  // variables are not tracked (`SERVICE`), but not by `MINUS`.
-  for (std::string_view later :
-       {"?c <q> ?d", "VALUES ?d { 1 }", "OPTIONAL { ?c <q> ?d }",
-        "{ ?c <q> ?d } UNION { ?c <r> ?e }", "GRAPH ?d { ?c <q> ?e }",
-        "{ SELECT ?d { ?c <q> ?d } }", "SERVICE <x> { ?c <q> ?e }"}) {
-    EXPECT_THAT(defs(absl::StrCat(geoms, bind, later)).expressions_, IsEmpty())
-        << later;
-  }
-  for (std::string_view later : {"?c <q> ?e", "OPTIONAL { ?c <q> ?e }",
-                                 "MINUS { ?c <q> ?d }", "BIND(?d + 1 AS ?e)"}) {
-    EXPECT_TRUE(
-        defs(absl::StrCat(geoms, bind, later)).expressions_.contains(V{"?d"}))
-        << later;
-  }
-
-  // Non-deterministic expressions, `NOW()` and `EXISTS`.
-  for (std::string_view expr :
-       {"RAND()", "?x + RAND()", "UUID()", "STRUUID()", "BNODE()", "NOW()",
-        "YEAR(NOW())", "EXISTS { ?x <q> ?z }"}) {
-    EXPECT_THAT(
-        defs(absl::StrCat("?x <p> ?y BIND(", expr, " AS ?b)")).expressions_,
-        IsEmpty())
-        << expr;
-  }
-  // `UNDEF` in the column of the variable, but not in other columns.
-  auto undef = defs("VALUES (?r ?s) { (1 UNDEF) (2 3) }");
-  EXPECT_THAT(
-      undef.constants_.at(V{"?r"}),
-      ElementsAre(TripleComponent{int64_t{1}}, TripleComponent{int64_t{2}}));
-  EXPECT_FALSE(undef.constants_.contains(V{"?s"}));
-  // Definitions inside of nested groups, `OPTIONAL`, `MINUS`, `UNION` or
-  // subqueries are not visible.
-  for (std::string_view body :
-       {"{ VALUES ?r { 1 } BIND(1 AS ?q) }",
-        "?x <p> ?y OPTIONAL { VALUES ?r { 1 } BIND(1 AS ?q) }",
-        "?x <p> ?y MINUS { VALUES ?r { 1 } BIND(1 AS ?q) }",
-        "{ VALUES ?r { 1 } BIND(1 AS ?q) } UNION { ?x <p> ?y }",
-        "{ SELECT * { VALUES ?r { 1 } BIND(1 AS ?q) } }"}) {
-    auto nested = defs(body);
-    EXPECT_THAT(nested.constants_, IsEmpty()) << body;
-    EXPECT_THAT(nested.expressions_, IsEmpty()) << body;
-  }
-  // A `VALUES` clause after the `WHERE` clause is joined with the complete
-  // `WHERE` clause, which becomes a nested group (or, with `GROUP BY`, it is
-  // stored separately). Its values are not visible in the `WHERE` clause.
-  auto trailing = canonical("?x <p> ?y FILTER(?y <= ?r) } VALUES ?r { 1 ");
-  const auto& root = trailing.query_._rootGraphPattern;
-  EXPECT_THAT(root._filters, IsEmpty());
-  ASSERT_EQ(root._graphPatterns.size(), 2);
-  const auto& where =
-      std::get<parsedQuery::GroupGraphPattern>(root._graphPatterns[0])._child;
-  EXPECT_EQ(where._filters.size(), 1);
-  EXPECT_THAT(collectDefinitions(where._graphPatterns).constants_, IsEmpty());
-  auto groupBy = ad_utility::testing::parseQuery(
-      "SELECT ?r { ?x <p> ?r FILTER(?r <= 3) } GROUP BY ?r VALUES ?r { 1 }");
-  EXPECT_TRUE(groupBy.postQueryValuesClause_.has_value());
-  EXPECT_THAT(
-      collectDefinitions(groupBy._rootGraphPattern._graphPatterns).constants_,
-      IsEmpty());
-}
-
-// Recognize the facts of all FILTERs of the root group of
-// `SELECT * { <body> }`.
-std::vector<Fact> facts(std::string_view body) {
-  auto query = ad_utility::testing::parseQuery(
-      absl::StrCat(prefixes, "SELECT * { ", body, " }"));
-  std::vector<Fact> result;
-  for (auto& filterFacts : recognizeFacts(query._rootGraphPattern)) {
-    for (auto& fact : filterFacts) {
-      if (fact.has_value()) {
-        result.push_back(std::move(fact).value());
-      }
-    }
-  }
-  return result;
-}
-
-// _____________________________________________________________________________
+// Test that `distance <= c` and `distance < c` for a number `c >= 0` between
+// two different geometries (at least one of them a variable) are recognized
+// as `DistanceBound`.
 TEST(FilterFactsRecognizers, DistanceBound) {
-  auto expectBound =
-      [](std::string_view body, double maxMeters, bool exact = true,
-         ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
-        auto trace = generateLocationTrace(l);
-        EXPECT_THAT(facts(absl::StrCat(geoms, body)),
-                    ElementsAre(VariantWith<DistanceBound>(
-                        DistanceBound{V{"?ga"}, V{"?gb"}, maxMeters, exact})));
-      };
-  // The three shapes from the motivation, and some more.
-  expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)", 500);
-  expectBound("BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)",
-              500);
-  expectBound("VALUES ?r { 500 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-              500);
-  // For `<`, the largest double below the constant is used.
-  expectBound("FILTER(geof:distance(?ga, ?gb, unit:M) < 500)",
-              std::nextafter(500.0, -std::numeric_limits<double>::infinity()));
-  expectBound("FILTER(0.5 >= geof:distance(?ga, ?gb))", 500);
-  expectBound("FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)", 500);
-  // Several values: the largest one is used (over-approximation).
-  expectBound(
-      "VALUES ?r { 500 1000 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-      1000, false);
-  expectBound(
-      "VALUES ?r { 500 1000.5 250 } "
-      "FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-      1000.5, false);
-
-  // A constant geometry from a single-row `VALUES` clause is substituted (it
-  // is parsed as a `GeoPoint`).
-  auto withPoint =
-      facts(absl::StrCat(geoms,
-                         "VALUES ?p { \"POINT(7.8 47.9)\"^^"
-                         "<http://www.opengis.net/ont/geosparql#wktLiteral> } "
-                         "FILTER(geof:metricDistance(?ga, ?p) <= 500)"));
-  ASSERT_EQ(withPoint.size(), 1);
-  const auto& bound = std::get<DistanceBound>(withPoint[0]);
-  EXPECT_EQ(bound.a_, TripleComponent{V{"?ga"}});
-  EXPECT_FALSE(bound.b_.isVariable());
-  EXPECT_FALSE(bound.b_.isUndef());
-  EXPECT_EQ(bound.maxMeters_, 500);
-}
-
-// _____________________________________________________________________________
-TEST(FilterFactsRecognizers, DistanceBoundNegative) {
-  for (std::string_view body : {
-           // The bound must be numeric.
-           "FILTER(geof:metricDistance(?ga, ?gb) <= \"500\")",
-           "VALUES ?r { \"500\" } FILTER(geof:metricDistance(?ga, ?gb) <= ?r)",
-           "VALUES ?r { 500 \"1000\" } "
-           "FILTER(geof:metricDistance(?ga, ?gb) <= ?r)",
-           "FILTER(geof:metricDistance(?ga, ?gb) <= <x>)",
-           "FILTER(geof:metricDistance(?ga, ?gb) <= -1)",
-           // Wrong comparisons.
-           "FILTER(geof:metricDistance(?ga, ?gb) = 500)",
-           "FILTER(geof:metricDistance(?ga, ?gb) >= 500)",
-           "FILTER(geof:metricDistance(?ga, ?gb) != 500)",
-           "FILTER(500 <= geof:metricDistance(?ga, ?gb))",
-           // A unit which is not a constant, or not a length.
-           "VALUES ?u { unit:M } FILTER(geof:distance(?ga, ?gb, ?u) <= 500)",
-           "FILTER(geof:distance(?ga, ?gb, \"x\") <= 500)",
-           // No variable, or the same variable on both sides.
-           "FILTER(geof:metricDistance(?ga, ?ga) <= 500)",
-           "VALUES (?p ?q) { (\"POINT(1 1)\" \"POINT(2 2)\") } "
-           "FILTER(geof:metricDistance(?p, ?q) <= 500)",
-           // A disjunction.
-           "FILTER(geof:metricDistance(?ga, ?gb) <= 500 || ?a = ?b)",
-           // The `BIND` cannot be substituted.
-           "BIND(geof:metricDistance(?ga, ?gb) + RAND() AS ?d) "
-           "FILTER(?d <= 500)",
-           "VALUES ?r { 500 UNDEF } "
-           "FILTER(geof:metricDistance(?ga, ?gb) <= ?r)",
-       }) {
-    EXPECT_THAT(facts(absl::StrCat(geoms, body)), IsEmpty()) << body;
-  }
-  // The `BIND` is evaluated before `?gb` is bound.
-  EXPECT_THAT(facts("?a <p> ?ga . BIND(geof:metricDistance(?ga, ?gb) AS ?d) "
-                    "?b <p> ?gb . FILTER(?d <= 500)"),
-              IsEmpty());
-}
-
-// _____________________________________________________________________________
-TEST(FilterFactsRecognizers, LangIn) {
-  auto expectLangs =
-      [](std::string_view body, ad_utility::HashSet<std::string> langs,
-         bool exact = true,
-         ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
-        auto trace = generateLocationTrace(l);
-        EXPECT_THAT(
-            facts(absl::StrCat("VALUES ?y { \"a\"@en } ", body)),
-            ElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, langs, exact})));
-      };
-  expectLangs("FILTER(LANG(?y) = \"en\")", {"en"});
-  expectLangs("FILTER(LANG(?y) = \"en\"^^xsd:string)", {"en"});
-  expectLangs("BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", {"en"});
-  expectLangs("BIND(LANG(?y) AS ?l) FILTER(\"en\" = ?l)", {"en"});
-  expectLangs("BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))",
-              {"en", "de"});
-  expectLangs("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")", {"en", "de"});
-  expectLangs("VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)", {"en", "de"},
-              false);
-
-  for (std::string_view body : {
-           "FILTER(LANG(?y) = \"en\"@de)",
-           "FILTER(LANG(?y) = \"en\"^^<x>)",
-           "FILTER(LANG(?y) = <en>)",
-           "FILTER(LANG(?y) = 1)",
-           "FILTER(LANG(?y) != \"en\")",
-           "FILTER(LANG(?y) IN (\"en\", 1))",
-           "FILTER(LANG(?y) IN ())",
-           "FILTER(LANG(?y) = \"en\" || LANG(?y) != \"de\")",
-           "FILTER(LANGMATCHES(LANG(?y), \"en\"))",
-       }) {
-    EXPECT_THAT(facts(absl::StrCat("VALUES ?y { \"a\"@en } ", body)), IsEmpty())
-        << body;
-  }
-}
-
-// _____________________________________________________________________________
-TEST(FilterFactsRecognizers, SeveralFacts) {
-  EXPECT_THAT(facts(absl::StrCat(geoms,
-                                 "?a <label> ?y . "
-                                 "FILTER(LANG(?y) = \"en\" && "
-                                 "geof:metricDistance(?ga, ?gb) <= 500) "
-                                 "FILTER(?a != ?b)")),
-              UnorderedElementsAre(VariantWith<LangIn>(LangIn{V{"?y"}, {"en"}}),
-                                   VariantWith<DistanceBound>(DistanceBound{
-                                       V{"?ga"}, V{"?gb"}, 500})));
-}
-
-// Test that each conjunct of a FILTER gets its own fact (or none), which is
-// exact unless it uses a variable with several values.
-TEST(FilterFactsRecognizers, ExactConjuncts) {
-  auto exactConjuncts = [](std::string_view filter) {
-    auto query = ad_utility::testing::parseQuery(
-        absl::StrCat(prefixes, "SELECT * { ", geoms, "VALUES ?y { \"a\"@en } ",
-                     filter, " }"));
-    auto factsPerFilter = recognizeFacts(query._rootGraphPattern);
-    AD_CORRECTNESS_CHECK(factsPerFilter.size() == 1);
-    std::vector<bool> result;
-    for (const auto& fact : factsPerFilter[0]) {
-      result.push_back(isExact(fact));
-    }
-    return result;
+  auto recognize = [](std::string_view filter) {
+    auto conjuncts = canonical(filter).conjuncts_;
+    AD_CORRECTNESS_CHECK(conjuncts.size() == 1);
+    return recognizeDistanceBound(conjuncts[0]);
   };
+  auto point = std::string{
+      "\"POINT(7.8 48.0)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>"};
 
-  // Exact facts.
-  EXPECT_THAT(exactConjuncts("FILTER(geof:metricDistance(?ga, ?gb) < 500)"),
-              ElementsAre(true));
-  EXPECT_THAT(exactConjuncts("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")"),
-              ElementsAre(true));
-  EXPECT_THAT(exactConjuncts("FILTER(LANG(?y) = \"en\" && "
-                             "geof:metricDistance(?ga, ?gb) <= 500)"),
-              ElementsAre(true, true));
+  // `<=` and `<` (where the maximum distance is the largest `double` below
+  // the number).
+  EXPECT_THAT(recognize("geof:distance(?ga, ?gb, unit:M) <= 500"),
+              ::testing::Optional(DistanceBound{V{"?ga"}, V{"?gb"}, 500}));
 
-  // A conjunct that is not a fact, and a fact from several values.
-  EXPECT_THAT(exactConjuncts(
-                  "FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)"),
-              ElementsAre(true, false));
-  EXPECT_THAT(exactConjuncts("VALUES ?r { 500 1000 } "
-                             "FILTER(geof:metricDistance(?ga, ?gb) <= ?r)"),
-              ElementsAre(false));
+  // A `DistanceBound` from a `Constraint` that is not exact is not exact.
+  auto conjuncts =
+      canonical("geof:metricDistance(?ga, ?gb) <= ?r", "VALUES ?r { 500 1000 }")
+          .conjuncts_;
+  EXPECT_THAT(
+      recognizeDistanceBound(conjuncts.at(0)),
+      ::testing::Optional(DistanceBound{V{"?ga"}, V{"?gb"}, 1000, false}));
+  EXPECT_THAT(
+      recognize("geof:metricDistance(?ga, ?gb) < 500"),
+      ::testing::Optional(DistanceBound{
+          V{"?ga"}, V{"?gb"},
+          std::nextafter(500.0, -std::numeric_limits<double>::infinity())}));
+
+  // A constant geometry on one side.
+  EXPECT_THAT(
+      recognize(absl::StrCat("geof:metricDistance(?ga, ", point, ") <= 500")),
+      ::testing::Optional(
+          ::testing::Field(&DistanceBound::a_, TripleComponent{V{"?ga"}})));
+
+  // A negative maximum distance, the same variable or two constants, or no
+  // `Constraint` at all.
+  for (std::string filter :
+       {std::string{"geof:metricDistance(?ga, ?gb) <= -1"},
+        std::string{"geof:metricDistance(?ga, ?gb) < 0"},
+        std::string{"geof:metricDistance(?ga, ?ga) <= 500"},
+        absl::StrCat("geof:metricDistance(", point, ", ", point, ") <= 500"),
+        std::string{"BOUND(?a)"}}) {
+    EXPECT_EQ(recognize(filter), std::nullopt) << filter;
+  }
 }
 
 }  // namespace

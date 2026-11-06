@@ -7,7 +7,7 @@
 
 #include "backports/algorithm.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
-#include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
+#include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 
 namespace sparqlExpression {
@@ -74,9 +74,10 @@ bool SparqlExpressionPimpl::isResultAlwaysDefined(
 std::vector<SparqlExpressionPimpl> SparqlExpressionPimpl::splitConjunction()
     const {
   std::vector<SparqlExpressionPimpl> result;
-  auto split = [this, &result](SparqlExpression& expr, auto& self) -> void {
-    if (getBinaryOperator(expr) == BinaryExpressionOperator::And) {
-      for (auto& child : expr.children()) {
+  auto split = [this, &result](SparqlExpression& expression,
+                               auto& self) -> void {
+    if (isAndExpression(expression)) {
+      for (auto& child : expression.children()) {
         self(*child, self);
       }
       return;
@@ -84,7 +85,8 @@ std::vector<SparqlExpressionPimpl> SparqlExpressionPimpl::splitConjunction()
     // The aliasing constructor of `std::shared_ptr` keeps the complete tree
     // alive as long as the conjunct is used.
     result.push_back(SparqlExpressionPimpl{
-        std::shared_ptr<SparqlExpression>{_pimpl, &expr}, expr.descriptor()});
+        std::shared_ptr<SparqlExpression>{_pimpl, &expression},
+        expression.descriptor()});
   };
   split(*_pimpl, split);
   return result;
