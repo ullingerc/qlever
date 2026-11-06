@@ -11,7 +11,6 @@
 #include "engine/QueryRewriteUtils.h"
 #include "engine/SpatialJoin.h"
 #include "engine/Values.h"
-#include "engine/filterFacts/Canonicalizer.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionPimpl.h"
 #include "parser/data/SparqlFilter.h"
@@ -225,8 +224,9 @@ TEST(QueryRewriteUtilTest, GetGeoFunctionExpressionParametersWithFixedValue) {
 }
 
 // Test that a FILTER is split into its conjuncts iff one of them is a fact,
-// that each conjunct keeps its original input as descriptor, and that a
-// conjunct which is a fact only with the definitions of its group is replaced.
+// that each conjunct keeps its original input as descriptor, that a conjunct
+// which is a fact only with the definitions of its group is replaced, and that
+// a conjunct with an exact language filter is applied to the triples.
 TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
   auto rewrite = [](std::string_view filter,
                     std::string_view definitions = "") {
@@ -234,12 +234,9 @@ TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
         "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
         "SELECT * { ?a <p> ?b . ?x <p> ?y . ",
         definitions, " FILTER(", filter, ") }"));
-    auto filters = query._rootGraphPattern._filters;
-    rewriteFiltersWithFacts(filters,
-                            filterFacts::collectDefinitions(
-                                query._rootGraphPattern._graphPatterns));
+    rewriteFiltersWithFacts(query._rootGraphPattern);
     std::vector<std::string> descriptors;
-    for (const auto& f : filters) {
+    for (const auto& f : query._rootGraphPattern._filters) {
       descriptors.push_back(f.expression_.getDescriptor());
     }
     return descriptors;
@@ -263,6 +260,13 @@ TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
   EXPECT_THAT(
       rewrite("geof:distance(?y, ?b) <= ?r && ?x != ?a", "VALUES ?r { 0.5 }"),
       ElementsAre("geof:metricDistance(?y, ?b) <= 500", "?x != ?a"));
+
+  // A conjunct with a language filter is replaced by it, unless the language
+  // differs between the rows.
+  EXPECT_THAT(rewrite("LANG(?y) = \"en\" && ?x != ?a"),
+              ElementsAre("?x != ?a"));
+  EXPECT_THAT(rewrite("LANG(?y) = ?l", "VALUES ?l { \"en\" \"de\" }"),
+              ElementsAre("(LANG(?y) = ?l)"));
 }
 
 }  // namespace

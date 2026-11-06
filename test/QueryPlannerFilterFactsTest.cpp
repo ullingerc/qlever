@@ -16,10 +16,12 @@
 #include "./util/IndexTestHelpers.h"
 #include "engine/ExportQueryExecutionTrees.h"
 #include "engine/Filter.h"
+#include "engine/IndexScan.h"
 #include "engine/SpatialJoin.h"
 
-// Tests for the rewrite of FILTERs that are facts only with the definitions of
-// their group (from `VALUES` and `BIND`), see `rewriteFiltersWithFacts`.
+// Tests for the rewrite of FILTERs with facts, in particular of those that are
+// facts only with the definitions of their group (from `VALUES` and `BIND`),
+// see `rewriteFiltersWithFacts`.
 
 namespace {
 
@@ -245,6 +247,95 @@ TEST(QueryPlannerFilterFacts, BindTargetBoundLater) {
       rewritten,
       run(query(absl::StrCat(before, " FILTER((?d <= 500) || false)")), kg));
   EXPECT_EQ(rewritten.size(), 3 + 2);
+}
+
+// Labels with different language tags.
+constexpr std::string_view langTurtle =
+    "<x1> <label> \"a\"@en . <x1> <label> \"b\"@de . <x2> <label> \"c\"@fr . "
+    "<x3> <label> \"d\" . <x3> <other> \"e\"@en .";
+
+// The predicates of all `IndexScan`s and the descriptors of all `Filter`s of
+// the plan for `SELECT * { <body> }` on the index with the labels from above.
+std::pair<std::vector<std::string>, std::vector<std::string>> planLang(
+    std::string_view body) {
+  auto qet = h::parseAndPlan(
+      query(body), ad_utility::testing::getQec(std::string{langTurtle}));
+  std::vector<const IndexScan*> scans;
+  collect(*qet, scans);
+  std::vector<const Filter*> filters;
+  collect(*qet, filters);
+  std::vector<std::string> predicates;
+  for (const auto* scan : scans) {
+    predicates.push_back(scan->predicate().toString());
+  }
+  std::vector<std::string> descriptors;
+  for (const auto* filter : filters) {
+    descriptors.push_back(filter->getDescriptor());
+  }
+  return {predicates, descriptors};
+}
+
+// Test that a FILTER on the language of a variable becomes a scan with the
+// language tag in the predicate, which replaces the FILTER unless the language
+// differs between rows.
+TEST(QueryPlannerFilterFacts, LanguageFilters) {
+  using ::testing::HasSubstr;
+  using ::testing::UnorderedElementsAre;
+
+  // The language directly or from a `BIND`, or with `IN` and another
+  // conjunct.
+  auto [predicates, filters] =
+      planLang("?x <label> ?y FILTER(LANG(?y) = \"en\")");
+  EXPECT_THAT(predicates, ElementsAre("@en@<label>"));
+  EXPECT_THAT(filters, IsEmpty());
+  std::tie(predicates, filters) =
+      planLang("?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")");
+  EXPECT_THAT(predicates, ElementsAre("@en@<label>"));
+  EXPECT_THAT(filters, IsEmpty());
+  std::tie(predicates, filters) = planLang(
+      "?x <label> ?y FILTER(LANG(?y) IN (\"en\", \"de\") && ?x != <x1>)");
+  EXPECT_THAT(predicates, UnorderedElementsAre("@en@<label>", "@de@<label>"));
+  EXPECT_THAT(filters, ElementsAre(HasSubstr("?x != <x1>")));
+
+  // Different languages in different rows.
+  std::tie(predicates, filters) = planLang(
+      "?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)");
+  EXPECT_THAT(predicates, UnorderedElementsAre("@en@<label>", "@de@<label>"));
+  EXPECT_THAT(filters, ElementsAre(HasSubstr("?l")));
+}
+
+// Test that a query with a language filter has the same result as the query
+// with the FILTER `(f) || false` instead of `f`, which is never rewritten.
+TEST(QueryPlannerFilterFacts, LanguageFilterResultsAreEqual) {
+  // The body of the query with `$` for the expression of the FILTER, this
+  // expression, and the number of rows.
+  std::vector<std::tuple<std::string, std::string, size_t>> queries{
+      {"?x <label> ?y FILTER($)", "LANG(?y) = \"en\"", 1},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"en\"", 1},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l IN (\"en\", \"de\")",
+       2},
+      {"?x <label> ?y FILTER($)", "LANG(?y) = \"en\" || LANG(?y) = \"fr\"", 2},
+      {"?x <label> ?y FILTER($)", "LANG(?y) IN (\"en\", \"fr\") && ?x != <x1>",
+       1},
+      {"?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER($)", "LANG(?y) = ?l",
+       2},
+      // No triple with the variable as object and a fixed predicate.
+      {"?x ?p ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"en\"", 2},
+      // The empty language (no language filter).
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"\"", 1},
+      // A literal with a language tag, which never equals a language.
+      {"?x <label> ?y FILTER($)", "LANG(?y) = \"en\"@de", 0},
+  };
+  for (const auto& [body, expression, numRows] : queries) {
+    auto rewritten =
+        run(query(absl::StrReplaceAll(body, {{"$", expression}})), langTurtle);
+    auto opaque =
+        run(query(absl::StrReplaceAll(
+                body, {{"$", absl::StrCat("(", expression, ") || false")}})),
+            langTurtle);
+    EXPECT_EQ(rewritten, opaque) << body;
+    EXPECT_EQ(rewritten.size(), numRows + 2) << body;
+  }
 }
 
 }  // namespace
