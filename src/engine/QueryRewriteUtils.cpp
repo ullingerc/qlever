@@ -134,13 +134,9 @@ SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
       return std::make_unique<VariableExpression>(operand.getVariable());
     } else if (operand.isLiteral()) {
       return std::make_unique<StringLiteralExpression>(operand.getLiteral());
-    } else if (operand.isId()) {
-      return std::make_unique<IdExpression>(operand.getId());
     }
-    // A `GeoPoint` from a `VALUES` clause (see `filterFacts::canonicalize`).
-    const auto* point = std::get_if<GeoPoint>(&operand.getVariant());
-    AD_CORRECTNESS_CHECK(point != nullptr);
-    return std::make_unique<IdExpression>(Id::makeFromGeoPoint(*point));
+    AD_CORRECTNESS_CHECK(operand.isId());
+    return std::make_unique<IdExpression>(operand.getId());
   };
   auto expression =
       std::make_unique<LessEqualExpression>(LessEqualExpression::Children{

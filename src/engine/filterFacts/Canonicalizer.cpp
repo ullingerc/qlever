@@ -16,7 +16,6 @@
 #include "engine/sparqlExpressions/RelationalExpressions.h"
 #include "parser/ParsedQuery.h"
 #include "parser/VariableCounter.h"
-#include "rdfTypes/GeoPoint.h"
 #include "util/UnitOfMeasurement.h"
 
 namespace filterFacts {
@@ -255,25 +254,6 @@ std::optional<TripleComponent> getConstant(const Variable& variable,
   return std::nullopt;
 }
 
-// Return `operand`, or its value if it is a variable with a single value in
-// `defs` that can be a geometry (a literal, or a `GeoPoint` from `VALUES`).
-TripleComponent resolveGeometry(const TripleComponent& operand,
-                                const Definitions& defs) {
-  if (!operand.isVariable()) {
-    return operand;
-  }
-  auto it = defs.constants_.find(operand.getVariable());
-  if (it == defs.constants_.end() || it->second.size() != 1) {
-    return operand;
-  }
-  const auto& value = it->second.front();
-  if (value.isLiteral() ||
-      std::holds_alternative<GeoPoint>(value.getVariant())) {
-    return value;
-  }
-  return operand;
-}
-
 // Return the possible values of `expression` if it is a literal or a variable
 // with values in `defs` (and `std::nullopt` otherwise).
 std::optional<std::vector<TripleComponent>> getConstants(
@@ -385,9 +365,8 @@ Conjunct toConjunct(const SparqlExpression& expression,
   auto [min, max] = ql::ranges::minmax(numbers.value());
   double meters =
       ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
-  return Constraint{Distance{resolveGeometry(call->left_, defs),
-                             resolveGeometry(call->right_, defs)},
-                    op, meters, min == max};
+  return Constraint{Distance{call->left_, call->right_}, op, meters,
+                    min == max};
 }
 
 // Split `expression` at `&&` and append the canonical form of each conjunct to

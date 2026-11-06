@@ -118,17 +118,6 @@ TEST(FilterFactsCanonicalizer, Definitions) {
          Comparison::LE, 500);
   expect("VALUES ?r { 1000 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
          Comparison::LE, 1000, false);
-
-  // A geometry operand with a single value from `VALUES` (a `GeoPoint`).
-  auto isGeoPoint = [](const Constraint& constraint) {
-    return std::holds_alternative<GeoPoint>(constraint.lhs_.b_.getVariant());
-  };
-  EXPECT_THAT(canonical("geof:metricDistance(?ga, ?p) <= 500",
-                        "VALUES ?p { \"POINT(7.8 47.9)\"^^"
-                        "<http://www.opengis.net/ont/geosparql#wktLiteral> }")
-                  .conjuncts_,
-              ElementsAre(VariantWith<Constraint>(
-                  ::testing::ResultOf(isGeoPoint, ::testing::IsTrue()))));
 }
 
 // Test that a number computed with `+`, `-`, `*` or `/` is folded, unless it
