@@ -15,6 +15,7 @@
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
 #include "parser/ParsedQuery.h"
+#include "rdfTypes/GeoPoint.h"
 #include "util/UnitOfMeasurement.h"
 
 namespace filterFacts {
@@ -147,13 +148,20 @@ Definitions collectDefinitions(
 
 namespace {
 
-// Return the operator if `expression` is a comparison with `<` or `<=`.
-std::optional<Comparison> getComparison(const SparqlExpression& expression) {
-  if (dynamic_cast<const sparqlExpression::LessThanExpression*>(&expression)) {
-    return Comparison::LT;
-  } else if (dynamic_cast<const sparqlExpression::LessEqualExpression*>(
-                 &expression)) {
-    return Comparison::LE;
+// Return the operator if `expression` is a comparison with `<` or `<=`, and
+// `false`. For `>` and `>=`, return the operator of the equivalent comparison
+// with swapped operands (`b > a` is `a < b`), and `true`.
+std::optional<std::pair<Comparison, bool>> getComparison(
+    const SparqlExpression& expression) {
+  using namespace sparqlExpression;
+  if (dynamic_cast<const LessThanExpression*>(&expression)) {
+    return std::pair{Comparison::LT, false};
+  } else if (dynamic_cast<const LessEqualExpression*>(&expression)) {
+    return std::pair{Comparison::LE, false};
+  } else if (dynamic_cast<const GreaterThanExpression*>(&expression)) {
+    return std::pair{Comparison::LT, true};
+  } else if (dynamic_cast<const GreaterEqualExpression*>(&expression)) {
+    return std::pair{Comparison::LE, true};
   }
   return std::nullopt;
 }
@@ -182,8 +190,27 @@ std::optional<double> getNumber(const TripleComponent& constant) {
   return std::nullopt;
 }
 
-// Return the possible values of `expression` if it is a number or a variable
-// with only numbers in `defs` (and `std::nullopt` otherwise).
+// Return `a op b`, and `std::nullopt` for a division by zero (whose result
+// depends on a runtime parameter).
+std::optional<double> fold(sparqlExpression::ArithmeticOperator op, double a,
+                           double b) {
+  using enum sparqlExpression::ArithmeticOperator;
+  switch (op) {
+    case Add:
+      return a + b;
+    case Subtract:
+      return a - b;
+    case Multiply:
+      return a * b;
+    case Divide:
+      return b == 0 ? std::nullopt : std::optional{a / b};
+  }
+  AD_FAIL();
+}
+
+// Return the possible values of `expression` if it is a number, a variable
+// with only numbers in `defs`, or `+`, `-`, `*` or `/` of such expressions
+// (and `std::nullopt` otherwise).
 std::optional<std::vector<double>> getNumbers(
     const SparqlExpression& expression, const Definitions& defs) {
   const auto& resolved = resolve(expression, defs);
@@ -201,6 +228,29 @@ std::optional<std::vector<double>> getNumbers(
         return std::nullopt;
       }
       numbers.push_back(number.value());
+    }
+    return numbers;
+  }
+
+  // The result of `+`, `-`, `*` or `/` for each pair of values of the two
+  // operands, one of which must have a single value (to keep the number of
+  // values small).
+  if (auto op = sparqlExpression::getArithmeticOperator(resolved)) {
+    auto left = getNumbers(*resolved.children()[0], defs);
+    auto right = getNumbers(*resolved.children()[1], defs);
+    if (!left.has_value() || !right.has_value() ||
+        (left->size() != 1 && right->size() != 1)) {
+      return std::nullopt;
+    }
+    std::vector<double> numbers;
+    for (double a : left.value()) {
+      for (double b : right.value()) {
+        auto number = fold(op.value(), a, b);
+        if (!number.has_value()) {
+          return std::nullopt;
+        }
+        numbers.push_back(number.value());
+      }
     }
     return numbers;
   }
@@ -243,20 +293,127 @@ std::optional<TripleComponent> getConstant(const Variable& variable,
   return std::nullopt;
 }
 
+// Return `operand`, or its value if it is a variable with a single value in
+// `defs` that can be a geometry (a literal, or a `GeoPoint` from `VALUES`).
+TripleComponent resolveGeometry(const TripleComponent& operand,
+                                const Definitions& defs) {
+  if (!operand.isVariable()) {
+    return operand;
+  }
+  auto it = defs.constants_.find(operand.getVariable());
+  if (it == defs.constants_.end() || it->second.size() != 1) {
+    return operand;
+  }
+  const auto& value = it->second.front();
+  if (value.isLiteral() ||
+      std::holds_alternative<GeoPoint>(value.getVariant())) {
+    return value;
+  }
+  return operand;
+}
+
+// Return the possible values of `expression` if it is a literal or a variable
+// with values in `defs` (and `std::nullopt` otherwise).
+std::optional<std::vector<TripleComponent>> getConstants(
+    const SparqlExpression& expression, const Definitions& defs) {
+  const auto& resolved = resolve(expression, defs);
+  if (auto variable = resolved.getVariableOrNullopt()) {
+    auto it = defs.constants_.find(variable.value());
+    if (it == defs.constants_.end() || it->second.empty()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+  if (const auto* literal =
+          dynamic_cast<const sparqlExpression::StringLiteralExpression*>(
+              &resolved)) {
+    return std::vector{TripleComponent{literal->value()}};
+  }
+  return std::nullopt;
+}
+
+// Return the canonical form of `LANG(?x) = c`, `c = LANG(?x)`,
+// `LANG(?x) IN (c1, c2, ...)` and `||` of such comparisons for the same `?x`,
+// and `std::nullopt` for every other expression.
+std::optional<LangEquals> toLangEquals(const SparqlExpression& expression,
+                                       const Definitions& defs) {
+  using namespace sparqlExpression;
+  auto children = expression.children();
+
+  // Merge the constants of the two sides of `||` (`LANG(?x) = "en" ||
+  // LANG(?x) = "de"` is `LANG(?x) IN ("en", "de")`).
+  if (isOrExpression(expression)) {
+    auto left = toLangEquals(*children[0], defs);
+    auto right = toLangEquals(*children[1], defs);
+    if (!left.has_value() || !right.has_value() || left->var_ != right->var_) {
+      return std::nullopt;
+    }
+    ql::ranges::move(right->rhs_, std::back_inserter(left->rhs_));
+    left->exact_ = left->exact_ && right->exact_;
+    return left;
+  }
+
+  // Find `LANG(?x)` and the operands that it is compared with.
+  auto getLangVariable = [&defs](const SparqlExpression& operand) {
+    return getVariableFromLangExpression(&resolve(operand, defs));
+  };
+  bool isEqual = dynamic_cast<const EqualExpression*>(&expression);
+  if (!isEqual && !dynamic_cast<const InExpression*>(&expression)) {
+    return std::nullopt;
+  }
+  auto variable = getLangVariable(*children[0]);
+  auto constants = children.subspan(1);
+  if (isEqual && !variable.has_value()) {
+    variable = getLangVariable(*children[1]);
+    constants = children.first(1);
+  }
+  if (!variable.has_value()) {
+    return std::nullopt;
+  }
+
+  // Collect the values of these operands. The comparison is not exact if an
+  // operand has different values in different rows.
+  LangEquals result{variable.value(), {}};
+  for (const auto& constant : constants) {
+    auto values = getConstants(*constant, defs);
+    if (!values.has_value()) {
+      return std::nullopt;
+    }
+    result.exact_ =
+        result.exact_ &&
+        ql::ranges::all_of(values.value(), [&values](const auto& value) {
+          return value == values->front();
+        });
+    ql::ranges::move(values.value(), std::back_inserter(result.rhs_));
+  }
+  return result;
+}
+
 // Return the canonical form of a single conjunct: `distance < number` and
-// `distance <= number` become a `Constraint`, everything else is `Opaque`.
+// `distance <= number` (also with swapped operands) become a `Constraint`, a
+// comparison of `LANG(?x)` with constants becomes a `LangEquals`, everything
+// else is `Opaque`.
 Conjunct toConjunct(const SparqlExpression& expression,
                     const Definitions& defs) {
-  auto op = getComparison(expression);
-  if (!op.has_value()) {
+  if (auto langEquals = toLangEquals(expression, defs)) {
+    return std::move(langEquals).value();
+  }
+
+  // Bring the distance to the left side (`500 >= distance` is
+  // `distance <= 500`).
+  auto comparison = getComparison(expression);
+  if (!comparison.has_value()) {
     return Opaque{&expression};
   }
+  auto [op, isSwapped] = comparison.value();
+  const auto& distance = *expression.children()[isSwapped ? 1 : 0];
+  const auto& number = *expression.children()[isSwapped ? 0 : 1];
+
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
-      resolve(*expression.children()[0], defs),
-      [&defs](const Variable& variable) {
+      resolve(distance, defs), [&defs](const Variable& variable) {
         return getConstant(variable, defs);
       });
-  auto numbers = getNumbers(*expression.children()[1], defs);
+  auto numbers = getNumbers(number, defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
       !numbers.has_value()) {
     return Opaque{&expression};
@@ -266,8 +423,9 @@ Conjunct toConjunct(const SparqlExpression& expression,
   auto [min, max] = ql::ranges::minmax(numbers.value());
   double meters =
       ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
-  return Constraint{Distance{call->left_, call->right_}, op.value(), meters,
-                    min == max};
+  return Constraint{Distance{resolveGeometry(call->left_, defs),
+                             resolveGeometry(call->right_, defs)},
+                    op, meters, min == max};
 }
 
 // Split `expression` at `&&` and append the canonical form of each conjunct to

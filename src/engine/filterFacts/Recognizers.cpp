@@ -43,4 +43,21 @@ std::optional<DistanceBound> recognizeDistanceBound(const Conjunct& conjunct) {
   return DistanceBound{distance.a_, distance.b_, maxMeters, constraint->exact_};
 }
 
+// _____________________________________________________________________________
+std::optional<LangIn> recognizeLangIn(const Conjunct& conjunct) {
+  const auto* langEquals = std::get_if<LangEquals>(&conjunct);
+  if (langEquals == nullptr || langEquals->rhs_.empty()) {
+    return std::nullopt;
+  }
+  ad_utility::HashSet<std::string> langs;
+  for (const auto& constant : langEquals->rhs_) {
+    if (!constant.isLiteral() || constant.getLiteral().hasLanguageTag() ||
+        constant.getLiteral().hasDatatype()) {
+      return std::nullopt;
+    }
+    langs.emplace(constant.getLiteral().getContent());
+  }
+  return LangIn{langEquals->var_, std::move(langs), langEquals->exact_};
+}
+
 }  // namespace filterFacts

@@ -7,11 +7,11 @@
 #include "./QueryRewriteUtilTestHelpers.h"
 #include "./util/IndexTestHelpers.h"
 #include "./util/ParsedQueryTestHelpers.h"
+#include "./util/RuntimeParametersTestHelpers.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/QueryRewriteUtils.h"
 #include "engine/SpatialJoin.h"
 #include "engine/Values.h"
-#include "engine/filterFacts/Canonicalizer.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionPimpl.h"
 #include "parser/data/SparqlFilter.h"
@@ -234,12 +234,9 @@ TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
         "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
         "SELECT * { ?a <p> ?b . ?x <p> ?y . ",
         definitions, " FILTER(", filter, ") }"));
-    auto filters = query._rootGraphPattern._filters;
-    rewriteFiltersWithFacts(filters,
-                            filterFacts::collectDefinitions(
-                                query._rootGraphPattern._graphPatterns));
+    rewriteFiltersWithFacts(query._rootGraphPattern);
     std::vector<std::string> descriptors;
-    for (const auto& f : filters) {
+    for (const auto& f : query._rootGraphPattern._filters) {
       descriptors.push_back(f.expression_.getDescriptor());
     }
     return descriptors;
@@ -267,6 +264,43 @@ TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
   EXPECT_THAT(rewrite("geof:distance(?y, ?b) <= ?r", "VALUES ?r { 0.5 1 }"),
               ElementsAre("geof:metricDistance(?y, ?b) <= 1000",
                           "(geof:distance(?y, ?b) <= ?r)"));
+
+  // A conjunct with a language filter is replaced by it, unless the language
+  // differs between the rows.
+  EXPECT_THAT(rewrite("LANG(?y) = \"en\" && ?x != ?a"),
+              ElementsAre("?x != ?a"));
+  EXPECT_THAT(rewrite("LANG(?y) = ?l", "VALUES ?l { \"en\" \"de\" }"),
+              ElementsAre("(LANG(?y) = ?l)"));
+}
+
+// Test that `getArithmeticOperator` identifies `+`, `-`, `*` and `/`, and no
+// other expression.
+TEST(QueryRewriteUtilTest, GetArithmeticOperator) {
+  using AO = sparqlExpression::ArithmeticOperator;
+  auto check = [](auto makeFunction, std::optional<AO> expected,
+                  Loc loc = AD_CURRENT_SOURCE_LOC()) {
+    auto l = generateLocationTrace(loc);
+    auto expr = makeFunction(getExpr(V{"?a"}), getExpr(V{"?b"}));
+    EXPECT_EQ(getArithmeticOperator(*expr), expected);
+  };
+
+  // The four operators, the division with both of its implementations.
+  check(&makeAddExpression, AO::Add);
+  check(&makeSubtractExpression, AO::Subtract);
+  check(&makeMultiplyExpression, AO::Multiply);
+  for (bool divisionByZeroIsUndef : {true, false}) {
+    auto cleanup =
+        setRuntimeParameterForTest<&RuntimeParameters::divisionByZeroIsUndef_>(
+            divisionByZeroIsUndef);
+    check(&makeDivideExpression, AO::Divide);
+  }
+
+  // Other expressions.
+  check(&makeAndExpression, std::nullopt);
+  check(&makeOrExpression, std::nullopt);
+  check(&makePowExpression, std::nullopt);
+  check(&makeMetricDistExpression, std::nullopt);
+  EXPECT_EQ(getArithmeticOperator(*getExpr(V{"?a"})), std::nullopt);
 }
 
 }  // namespace

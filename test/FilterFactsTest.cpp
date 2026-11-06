@@ -25,6 +25,7 @@ using ::testing::ElementsAre;
 using ::testing::VariantWith;
 using valueIdComparators::Comparison;
 using V = Variable;
+using Literal = ad_utility::triple_component::Literal;
 
 // A parsed query and the canonical form of the FILTERs of its root group
 // graph pattern (which point into the query).
@@ -65,7 +66,8 @@ auto constraint(Comparison op, double meters, bool exact = true) {
 }
 
 // Test that `distance < number` and `distance <= number` become a
-// `Constraint` with the number in meters, also in a nested `&&`.
+// `Constraint` with the number in meters, also with swapped operands and in a
+// nested `&&`.
 TEST(FilterFactsCanonicalizer, Distance) {
   auto expect = [](std::string_view filter, Comparison op, double meters,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
@@ -79,6 +81,10 @@ TEST(FilterFactsCanonicalizer, Distance) {
   expect("geof:distance(?ga, ?gb) <= 0.5", Comparison::LE, 500);
   expect("geof:metricDistance(?ga, ?gb) < 500", Comparison::LT, 500);
   expect("geof:distance(?ga, ?gb, unit:MI) < 1", Comparison::LT, 1609.344);
+
+  // Swapped operands.
+  expect("500 >= geof:metricDistance(?ga, ?gb)", Comparison::LE, 500);
+  expect("0.5 > geof:distance(?ga, ?gb)", Comparison::LT, 500);
 
   // Each conjunct of `&&` is canonicalized on its own.
   auto result = canonical(
@@ -112,6 +118,89 @@ TEST(FilterFactsCanonicalizer, Definitions) {
          Comparison::LE, 500);
   expect("VALUES ?r { 1000 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
          Comparison::LE, 1000, false);
+
+  // A geometry operand with a single value from `VALUES` (a `GeoPoint`).
+  auto isGeoPoint = [](const Constraint& constraint) {
+    return std::holds_alternative<GeoPoint>(constraint.lhs_.b_.getVariant());
+  };
+  EXPECT_THAT(canonical("geof:metricDistance(?ga, ?p) <= 500",
+                        "VALUES ?p { \"POINT(7.8 47.9)\"^^"
+                        "<http://www.opengis.net/ont/geosparql#wktLiteral> }")
+                  .conjuncts_,
+              ElementsAre(VariantWith<Constraint>(
+                  ::testing::ResultOf(isGeoPoint, ::testing::IsTrue()))));
+}
+
+// Test that a number computed with `+`, `-`, `*` or `/` is folded, unless it
+// is a division by zero, an operand is not a number, or both operands have
+// several values.
+TEST(FilterFactsCanonicalizer, ConstantFolding) {
+  auto expect = [](std::string_view definitions, std::string_view filter,
+                   double meters, bool exact = true,
+                   ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(l);
+    EXPECT_THAT(canonical(filter, definitions).conjuncts_,
+                ElementsAre(constraint(Comparison::LE, meters, exact)));
+  };
+  expect("", "geof:metricDistance(?ga, ?gb) <= 250 * 2", 500);
+  expect("", "geof:metricDistance(?ga, ?gb) <= 250 + 250", 500);
+  expect("", "geof:metricDistance(?ga, ?gb) <= 750 - 250", 500);
+  expect("", "geof:metricDistance(?ga, ?gb) <= 1000 / 2", 500);
+  expect("", "geof:distance(?ga, ?gb) <= 0.25 * 2", 500);
+  expect("VALUES ?r { 0.25 }", "geof:distance(?ga, ?gb) <= ?r * 2", 500);
+  expect("VALUES ?r { 0.25 } BIND(?r * 2 AS ?s)",
+         "geof:distance(?ga, ?gb) <= ?s", 500);
+  expect("VALUES ?r { 100 250 }", "geof:metricDistance(?ga, ?gb) <= ?r * 2",
+         500, false);
+
+  for (auto [definitions, filter] :
+       std::vector<std::pair<std::string_view, std::string_view>>{
+           {"", "geof:metricDistance(?ga, ?gb) <= 1 / 0"},
+           {"", "geof:metricDistance(?ga, ?gb) <= \"1\" + 1"},
+           {"VALUES ?r { 1 2 } VALUES ?s { 1 2 }",
+            "geof:metricDistance(?ga, ?gb) <= ?r + ?s"}}) {
+    EXPECT_THAT(canonical(filter, definitions).conjuncts_,
+                ElementsAre(VariantWith<Opaque>(::testing::_)))
+        << filter;
+  }
+}
+
+// Test that a comparison of `LANG(?x)` with constants (also with `IN`, `||`,
+// swapped operands, and definitions) becomes a `LangEquals`, which is not
+// exact if a constant has different values in different rows.
+TEST(FilterFactsCanonicalizer, Lang) {
+  // `?y` is bound by `VALUES` (if it was bound by a triple, the parser would
+  // already apply the language filters).
+  auto expect = [](std::string_view definitions, std::string_view filter,
+                   std::vector<std::string_view> langs, bool exact = true,
+                   ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(l);
+    std::vector<TripleComponent> rhs;
+    for (auto lang : langs) {
+      rhs.emplace_back(Literal::literalWithoutQuotes(lang));
+    }
+    EXPECT_THAT(
+        canonical(filter, absl::StrCat("VALUES ?y { \"a\"@en } ", definitions))
+            .conjuncts_,
+        ElementsAre(VariantWith<LangEquals>(LangEquals{V{"?y"}, rhs, exact})));
+  };
+  expect("", "LANG(?y) = \"en\"", {"en"});
+  expect("", "\"en\" = LANG(?y)", {"en"});
+  expect("BIND(LANG(?y) AS ?l)", "?l = \"en\"", {"en"});
+  expect("BIND(\"en\" AS ?l)", "LANG(?y) = ?l", {"en"});
+  expect("", "LANG(?y) IN (\"en\", \"de\")", {"en", "de"});
+  expect("BIND(LANG(?y) AS ?l)", "?l IN (\"en\", \"de\")", {"en", "de"});
+  expect("", "LANG(?y) = \"en\" || LANG(?y) = \"de\"", {"en", "de"});
+  expect("VALUES ?l { \"en\" \"de\" }", "LANG(?y) = ?l", {"en", "de"}, false);
+
+  // Different variables or other comparisons.
+  for (std::string_view filter :
+       {"LANG(?y) = \"en\" || LANG(?ga) = \"de\"",
+        "LANG(?y) = \"en\" || LANG(?y) != \"de\"", "LANG(?y) != \"en\""}) {
+    EXPECT_THAT(canonical(filter, "VALUES ?y { \"a\"@en }").conjuncts_,
+                ElementsAre(VariantWith<Opaque>(::testing::_)))
+        << filter;
+  }
 }
 
 // Test that only the columns of `VALUES` without `UNDEF` and the `BIND`s whose
@@ -135,7 +224,7 @@ TEST(FilterFactsCanonicalizer, CollectDefinitions) {
 TEST(FilterFactsCanonicalizer, Opaque) {
   for (std::string_view filter :
        {"geof:metricDistance(?ga, ?gb) > 500",
-        "500 >= geof:metricDistance(?ga, ?gb)",
+        "500 <= geof:metricDistance(?ga, ?gb)",
         "geof:metricDistance(?ga, ?gb) <= \"500\"",
         "geof:metricDistance(?ga, ?gb) <= ?a",
         "geof:metricDistance(?ga, ?gb) + 1 <= 500", "?a <= 500", "BOUND(?a)",
@@ -193,6 +282,36 @@ TEST(FilterFactsRecognizers, DistanceBound) {
         std::string{"geof:metricDistance(?ga, ?ga) <= 500"},
         absl::StrCat("geof:metricDistance(", point, ", ", point, ") <= 500"),
         std::string{"BOUND(?a)"}}) {
+    EXPECT_EQ(recognize(filter), std::nullopt) << filter;
+  }
+}
+
+// Test that a `LangEquals` with plain string literals is recognized as
+// `LangIn`.
+TEST(FilterFactsRecognizers, LangIn) {
+  auto recognize = [](std::string_view filter,
+                      std::string_view definitions = "") {
+    auto conjuncts =
+        canonical(filter, absl::StrCat("VALUES ?y { \"a\"@en } ", definitions))
+            .conjuncts_;
+    AD_CORRECTNESS_CHECK(conjuncts.size() == 1);
+    return recognizeLangIn(conjuncts[0]);
+  };
+  EXPECT_THAT(recognize("LANG(?y) IN (\"en\", \"de\")"),
+              ::testing::Optional(LangIn{V{"?y"}, {"en", "de"}}));
+  EXPECT_THAT(recognize("LANG(?y) = "
+                        "\"en\"^^<http://www.w3.org/2001/XMLSchema#string>"),
+              ::testing::Optional(LangIn{V{"?y"}, {"en"}}));
+
+  // A `LangIn` from a `LangEquals` that is not exact is not exact.
+  EXPECT_THAT(recognize("LANG(?y) = ?l", "VALUES ?l { \"en\" \"de\" }"),
+              ::testing::Optional(LangIn{V{"?y"}, {"en", "de"}, false}));
+
+  // A literal with a language tag or a datatype, no literal, no constant at
+  // all, or no `LangEquals`.
+  for (std::string_view filter :
+       {"LANG(?y) = \"en\"@de", "LANG(?y) = \"en\"^^<x>", "LANG(?y) = <en>",
+        "LANG(?y) IN ()", "LANGMATCHES(LANG(?y), \"en\")"}) {
     EXPECT_EQ(recognize(filter), std::nullopt) << filter;
   }
 }

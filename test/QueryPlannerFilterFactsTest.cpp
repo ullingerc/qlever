@@ -16,10 +16,12 @@
 #include "./util/IndexTestHelpers.h"
 #include "engine/ExportQueryExecutionTrees.h"
 #include "engine/Filter.h"
+#include "engine/IndexScan.h"
 #include "engine/SpatialJoin.h"
 
-// Tests for the rewrite of FILTERs that are facts only with the definitions of
-// their group (from `VALUES` and `BIND`), see `rewriteFiltersWithFacts`.
+// Tests for the rewrite of FILTERs with facts, in particular of those that are
+// facts only with the definitions of their group (from `VALUES` and `BIND`),
+// see `rewriteFiltersWithFacts`.
 
 namespace {
 
@@ -89,9 +91,10 @@ PlanSummary plan(const std::string& q) {
   return result;
 }
 
-// Test that a distance FILTER with the maximum distance, the unit or the
-// distance itself from a `VALUES` or `BIND` clause becomes a `SpatialJoin`,
-// which replaces the FILTER unless the maximum distance differs between rows.
+// Test that a distance FILTER with the maximum distance, the unit, a geometry
+// or the distance itself from a `VALUES` or `BIND` clause (also with swapped
+// operands or a computed maximum distance) becomes a `SpatialJoin`, which
+// replaces the FILTER unless the maximum distance differs between rows.
 TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
   auto expect = [](std::string body, double maxDist, std::string filter,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
@@ -119,6 +122,16 @@ TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
   expect(absl::StrCat("BIND(", dist, " AS ?d) VALUES ?r { 500 } ",
                       "FILTER(?d <= ?r && ?a != ?b)"),
          500, "?a != ?b");
+  expect(absl::StrCat("VALUES ?p { \"POINT(7.8 48.0)\"^^"
+                      "<http://www.opengis.net/ont/geosparql#wktLiteral> } ",
+                      "VALUES ?r { 500 } FILTER(geof:metricDistance(?ga, ?p) "
+                      "<= ?r)"),
+         500, "");
+
+  // Swapped operands or a computed maximum distance.
+  expect(absl::StrCat("FILTER(500 >= ", dist, ")"), 500, "");
+  expect(absl::StrCat("VALUES ?r { 250 } FILTER(", dist, " <= ?r * 2)"), 500,
+         "");
 
   // Different maximum distances in different rows: the `SpatialJoin` uses
   // the largest one, and the FILTER stays.
@@ -226,6 +239,34 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
        absl::StrCat(filter, " && ?a != ?b"), 4},
       // Two radii: the `SpatialJoin` uses 1000 m, the FILTER does the rest.
       {absl::StrCat(geoms, "VALUES ?r { 500 1000 } FILTER($)"), filter, 8 + 10},
+      // Without definitions, also with swapped operands, `<`, a computed
+      // maximum distance, and another conjunct.
+      {absl::StrCat(geoms, "FILTER($)"), absl::StrCat(dist, " <= 500"), 8},
+      {absl::StrCat(geoms, "FILTER($)"), absl::StrCat("500 >= ", dist), 8},
+      {absl::StrCat(geoms, "FILTER($)"), absl::StrCat(dist, " < 500"), 8},
+      {absl::StrCat(geoms, "VALUES ?r { 250 } FILTER($)"),
+       absl::StrCat(dist, " <= ?r * 2"), 8},
+      {absl::StrCat(geoms, "FILTER($)"),
+       absl::StrCat(dist, " <= 500 && ?a != ?b"), 4},
+      // A geometry from `VALUES`: `<a1>` and `<a2>` are within 500 m of the
+      // first point.
+      {absl::StrCat(geoms,
+                    "VALUES ?p { \"POINT(7.8 48.0)\"^^"
+                    "<http://www.opengis.net/ont/geosparql#wktLiteral> } "
+                    "VALUES ?r { 500 } FILTER($)"),
+       "geof:metricDistance(?ga, ?p) <= ?r", 2 * 4},
+      // Definitions that are not used.
+      {absl::StrCat("?a <p> ?ga . BIND(", dist,
+                    " AS ?d) ?b <p> ?gb . FILTER($)"),
+       "?d <= 500", 0},
+      {absl::StrCat(geoms, "VALUES ?r { 500 UNDEF } FILTER($)"), filter, 8},
+      // `?gb` is never bound, so the `SpatialJoin` can never be completed.
+      {absl::StrCat("?a <p> ?ga . FILTER($)"), absl::StrCat(dist, " <= 500"),
+       0},
+      // The FILTER inside the `OPTIONAL` cannot see `?ga`.
+      {absl::StrCat("?a <p> ?ga . OPTIONAL { ?b <p> ?gb . BIND(", dist,
+                    " AS ?d) FILTER($) }"),
+       "?d <= 500", 4},
   };
   for (const auto& [body, expression, numRows] : queries) {
     auto rewritten =
@@ -258,6 +299,88 @@ TEST(QueryPlannerFilterFacts, BindTargetBoundLater) {
       rewritten,
       run(query(absl::StrCat(before, " FILTER((?d <= 500) || false)")), kg));
   EXPECT_EQ(rewritten.size(), 3 + 2);
+}
+
+// Labels with different language tags.
+constexpr std::string_view langTurtle =
+    "<x1> <label> \"a\"@en . <x1> <label> \"b\"@de . <x2> <label> \"c\"@fr . "
+    "<x3> <label> \"d\" . <x3> <other> \"e\"@en .";
+
+// The predicates of all `IndexScan`s and the descriptors of all `Filter`s of
+// the plan for `SELECT * { <body> }` on the index with the labels from above.
+std::pair<std::vector<std::string>, std::vector<std::string>> planLang(
+    std::string_view body) {
+  auto qet = h::parseAndPlan(
+      query(body), ad_utility::testing::getQec(std::string{langTurtle}));
+  std::vector<const IndexScan*> scans;
+  collect(*qet, scans);
+  std::vector<const Filter*> filters;
+  collect(*qet, filters);
+  std::vector<std::string> predicates;
+  for (const auto* scan : scans) {
+    predicates.push_back(scan->predicate().toString());
+  }
+  std::vector<std::string> descriptors;
+  for (const auto* filter : filters) {
+    descriptors.push_back(filter->getDescriptor());
+  }
+  return {predicates, descriptors};
+}
+
+// Test that a FILTER on the language of a variable becomes a scan with the
+// language tag in the predicate, which replaces the FILTER unless the language
+// differs between rows.
+TEST(QueryPlannerFilterFacts, LanguageFilters) {
+  using ::testing::HasSubstr;
+  using ::testing::UnorderedElementsAre;
+
+  // The language from a `BIND`, or with `IN` and another conjunct.
+  auto [predicates, filters] =
+      planLang("?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")");
+  EXPECT_THAT(predicates, ElementsAre("@en@<label>"));
+  EXPECT_THAT(filters, IsEmpty());
+  std::tie(predicates, filters) = planLang(
+      "?x <label> ?y FILTER(LANG(?y) IN (\"en\", \"de\") && ?x != <x1>)");
+  EXPECT_THAT(predicates, UnorderedElementsAre("@en@<label>", "@de@<label>"));
+  EXPECT_THAT(filters, ElementsAre(HasSubstr("?x != <x1>")));
+
+  // Different languages in different rows.
+  std::tie(predicates, filters) = planLang(
+      "?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)");
+  EXPECT_THAT(predicates, UnorderedElementsAre("@en@<label>", "@de@<label>"));
+  EXPECT_THAT(filters, ElementsAre(HasSubstr("?l")));
+}
+
+// Test that a query with a language filter has the same result as the query
+// with the FILTER `(f) || false` instead of `f`, which is never rewritten.
+TEST(QueryPlannerFilterFacts, LanguageFilterResultsAreEqual) {
+  // The body of the query with `$` for the expression of the FILTER, this
+  // expression, and the number of rows.
+  std::vector<std::tuple<std::string, std::string, size_t>> queries{
+      {"?x <label> ?y FILTER($)", "LANG(?y) = \"en\"", 1},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"en\"", 1},
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l IN (\"en\", \"de\")",
+       2},
+      {"?x <label> ?y FILTER($)", "LANG(?y) = \"en\" || LANG(?y) = \"fr\"", 2},
+      {"?x <label> ?y FILTER($)", "LANG(?y) IN (\"en\", \"fr\") && ?x != <x1>",
+       1},
+      {"?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER($)", "LANG(?y) = ?l",
+       2},
+      // No triple with the variable as object and a fixed predicate.
+      {"?x ?p ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"en\"", 2},
+      // The empty language (no language filter).
+      {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"\"", 1},
+  };
+  for (const auto& [body, expression, numRows] : queries) {
+    auto rewritten =
+        run(query(absl::StrReplaceAll(body, {{"$", expression}})), langTurtle);
+    auto opaque =
+        run(query(absl::StrReplaceAll(
+                body, {{"$", absl::StrCat("(", expression, ") || false")}})),
+            langTurtle);
+    EXPECT_EQ(rewritten, opaque) << body;
+    EXPECT_EQ(rewritten.size(), numRows + 2) << body;
+  }
 }
 
 }  // namespace

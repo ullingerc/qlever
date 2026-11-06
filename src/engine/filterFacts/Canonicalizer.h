@@ -22,9 +22,9 @@
 
 // The recognition of facts in FILTERs. A FILTER can be written in many
 // equivalent ways, for example `geof:distance(?a, ?b, unit:M) <= 500`,
-// `geof:distance(?a, ?b) <= 0.5`, or as one of several conditions combined
-// with `&&`. A rewrite of the query (e.g. to a
-// `SpatialJoin`) should not have to match each of them. Instead, each FILTER
+// `geof:distance(?a, ?b) <= 0.5`, `500 >= geof:metricDistance(?a, ?b)`, or as
+// one of several conditions combined with `&&`. A rewrite of the query (e.g. to
+// a `SpatialJoin`) should not have to match each of them. Instead, each FILTER
 // is brought into a canonical form (`canonicalize`, this file), in which typed
 // facts are recognized (see `Recognizers.h`). The rewrites only use these
 // facts.
@@ -74,6 +74,20 @@ struct Constraint {
   QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_, exact_)
 };
 
+// The comparison `LANG(var_) = c` for at least one of the constants `c` in
+// `rhs_` (from `=`, `IN`, or `||` of such comparisons). The conjunct implies
+// the comparison.
+//
+// NOTE: The conjunct and the comparison are equivalent iff `exact_` is true. It
+// is false if a constant is a variable from a `VALUES` clause with different
+// values in different rows: then `rhs_` contains all of them.
+struct LangEquals {
+  Variable var_;
+  std::vector<TripleComponent> rhs_;
+  bool exact_ = true;
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(LangEquals, var_, rhs_, exact_)
+};
+
 // Any other expression.
 struct Opaque {
   const sparqlExpression::SparqlExpression* expression_;
@@ -81,15 +95,20 @@ struct Opaque {
 };
 
 // A conjunct of a FILTER (the FILTER holds iff all its conjuncts hold).
-using Conjunct = std::variant<Constraint, Opaque>;
+using Conjunct = std::variant<Constraint, LangEquals, Opaque>;
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
-// its conjuncts, and bring each comparison `distance < number` or
-// `distance <= number` into a `Constraint` (with the number in meters). A
-// variable with a definition in `defs` is replaced by its definition (for the
-// distance, the number and the unit).
+// its conjuncts, bring each comparison `distance < number` or
+// `distance <= number` into a `Constraint` (with the number in meters), and
+// each comparison of `LANG(?x)` with constants into a `LangEquals`. A variable
+// with a definition in `defs` is replaced by its definition (for the distance,
+// the number, the unit, `LANG(?x)` and the constants), and so is a geometry
+// operand of the distance with a single value from `VALUES`.
 //
-// NOTE: The result points into `filter` (for the `Opaque` conjuncts), so
+// NOTE 1: The comparisons may also have swapped operands (`500 >= distance`),
+// and the number may be computed with `+`, `-`, `*` and `/`.
+//
+// NOTE 2: The result points into `filter` (for the `Opaque` conjuncts), so
 // `filter` must outlive it.
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpression& filter,

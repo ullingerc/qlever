@@ -14,6 +14,7 @@
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
+#include "parser/GraphPattern.h"
 
 namespace {
 
@@ -133,9 +134,13 @@ SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
       return std::make_unique<VariableExpression>(operand.getVariable());
     } else if (operand.isLiteral()) {
       return std::make_unique<StringLiteralExpression>(operand.getLiteral());
+    } else if (operand.isId()) {
+      return std::make_unique<IdExpression>(operand.getId());
     }
-    AD_CORRECTNESS_CHECK(operand.isId());
-    return std::make_unique<IdExpression>(operand.getId());
+    // A `GeoPoint` from a `VALUES` clause (see `filterFacts::canonicalize`).
+    const auto* point = std::get_if<GeoPoint>(&operand.getVariant());
+    AD_CORRECTNESS_CHECK(point != nullptr);
+    return std::make_unique<IdExpression>(Id::makeFromGeoPoint(*point));
   };
   auto expression =
       std::make_unique<LessEqualExpression>(LessEqualExpression::Children{
@@ -153,18 +158,30 @@ SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
 }  // namespace
 
 // _____________________________________________________________________________
-void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
-                             const filterFacts::Definitions& defs) {
+void rewriteFiltersWithFacts(parsedQuery::GraphPattern& group) {
+  auto defs = filterFacts::collectDefinitions(group._graphPatterns);
   std::vector<SparqlFilter> result;
-  for (auto& filter : filters) {
-    // Recognize the `DistanceBound` of each conjunct of `filter`. Keep a
-    // FILTER without any as it is.
+  for (auto& filter : group._filters) {
+    // Recognize the `DistanceBound` of each conjunct of `filter`.
     auto conjuncts =
         filterFacts::canonicalize(*filter.expression_.getPimpl(), defs);
     auto bounds = ::ranges::to<std::vector>(
         conjuncts | ql::views::transform(&filterFacts::recognizeDistanceBound));
+
+    // Apply the `LangIn` fact of each conjunct to the triples of `group`. The
+    // conjunct is replaced iff this succeeds and the fact is exact.
+    std::vector<bool> isReplaced;
+    for (const auto& conjunct : conjuncts) {
+      auto langIn = filterFacts::recognizeLangIn(conjunct);
+      bool isApplied = langIn.has_value() &&
+                       group.addLanguageFilter(langIn->var_, langIn->langs_);
+      isReplaced.push_back(isApplied && langIn->exact_);
+    }
+
+    // Keep a FILTER without a `DistanceBound` or a replaced conjunct as it is.
     if (ql::ranges::none_of(bounds,
-                            [](const auto& b) { return b.has_value(); })) {
+                            [](const auto& b) { return b.has_value(); }) &&
+        ql::ranges::none_of(isReplaced, std::identity{})) {
       result.push_back(std::move(filter));
       continue;
     }
@@ -174,10 +191,15 @@ void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
                                        : std::vector{filter.expression_};
     AD_CORRECTNESS_CHECK(pieces.size() == bounds.size());
 
-    // Replace a conjunct whose fact needs the definitions by an equivalent
-    // FILTER without them, which can be rewritten on its own. If the fact is
-    // not exact, the conjunct is kept as well.
-    for (auto&& [piece, bound] : ::ranges::views::zip(pieces, bounds)) {
+    // Drop the replaced conjuncts. Replace a conjunct whose fact needs the
+    // definitions by an equivalent FILTER without them, which can be
+    // rewritten on its own. If the fact is not exact, the conjunct is kept as
+    // well.
+    for (auto&& [piece, bound, replaced] :
+         ::ranges::views::zip(pieces, bounds, isReplaced)) {
+      if (replaced) {
+        continue;
+      }
       bool needsDefinitions =
           bound.has_value() &&
           !filterFacts::recognizeDistanceBound(
@@ -190,5 +212,5 @@ void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
       }
     }
   }
-  filters = std::move(result);
+  group._filters = std::move(result);
 }
