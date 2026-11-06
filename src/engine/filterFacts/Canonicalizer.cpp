@@ -25,25 +25,14 @@ using valueIdComparators::Comparison;
 
 namespace {
 
-// Return true iff `expression` contains `NOW()`.
-bool containsNow(const SparqlExpression& expression) {
-  if (dynamic_cast<const sparqlExpression::NowDatetimeExpression*>(
-          &expression)) {
-    return true;
-  }
-  return ql::ranges::any_of(expression.children(), [](const auto& child) {
-    return containsNow(*child);
-  });
-}
-
 // Return true iff the target of `BIND(expression AS ?v)` is equivalent to
 // `expression`, given the variables that are always bound before the `BIND`.
 bool isSubstitutable(const SparqlExpression& expression,
                      const ad_utility::HashSet<Variable>& alwaysBound) {
   std::vector<const SparqlExpression*> exists;
   expression.getExistsExpressions(exists);
-  return expression.isDeterministic() && !containsNow(expression) &&
-         exists.empty() &&
+  return expression.isDeterministic() &&
+         !sparqlExpression::containsNow(expression) && exists.empty() &&
          ql::ranges::all_of(expression.containedVariables(),
                             [&alwaysBound](const Variable* variable) {
                               return alwaysBound.contains(*variable);
@@ -116,17 +105,6 @@ Definitions collectDefinitions(
 
 namespace {
 
-// Return the operator if `expression` is a comparison with `<` or `<=`.
-std::optional<Comparison> getComparison(const SparqlExpression& expression) {
-  if (dynamic_cast<const sparqlExpression::LessThanExpression*>(&expression)) {
-    return Comparison::LT;
-  } else if (dynamic_cast<const sparqlExpression::LessEqualExpression*>(
-                 &expression)) {
-    return Comparison::LE;
-  }
-  return std::nullopt;
-}
-
 // Return `expression`, or the expression of the `BIND` in `defs` if it is a
 // variable with such a definition.
 const SparqlExpression& resolve(const SparqlExpression& expression,
@@ -147,16 +125,6 @@ std::optional<double> getNumber(const SparqlExpression& expression,
                                 const Definitions& defs) {
   const auto& resolved = resolve(expression, defs);
 
-  // Return the value of `id` if it is a number.
-  auto getIdNumber = [](const Id& id) -> std::optional<double> {
-    if (id.getDatatype() == Datatype::Int) {
-      return static_cast<double>(id.getInt());
-    } else if (id.getDatatype() == Datatype::Double) {
-      return id.getDouble();
-    }
-    return std::nullopt;
-  };
-
   // A variable with a single number from a `VALUES` clause or a `BIND` (whose
   // constant is an `Id`).
   if (auto variable = resolved.getVariableOrNullopt()) {
@@ -164,21 +132,14 @@ std::optional<double> getNumber(const SparqlExpression& expression,
     if (it == defs.constants_.end() || it->second.size() != 1) {
       return std::nullopt;
     }
-    const auto& constant = it->second.front();
-    if (constant.isInt()) {
-      return static_cast<double>(constant.getInt());
-    } else if (constant.isDouble()) {
-      return constant.getDouble();
-    } else if (constant.isId()) {
-      return getIdNumber(constant.getId());
-    }
-    return std::nullopt;
+    return it->second.front().getNumber();
   }
 
   // A number.
   const auto* id =
       dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
-  return id == nullptr ? std::nullopt : getIdNumber(id->value());
+  return id == nullptr ? std::nullopt
+                       : TripleComponent{id->value()}.getNumber();
 }
 
 // Return the single value of `variable` from `defs` (from `VALUES` or a `BIND`
@@ -198,8 +159,8 @@ Conjunct toConjunct(const SparqlExpression& expression,
                     const Definitions& defs) {
   // Match `distance op number` for a distance in a unit of length, return
   // `Opaque` for every other expression.
-  auto op = getComparison(expression);
-  if (!op.has_value()) {
+  auto op = sparqlExpression::getComparison(expression);
+  if (op != Comparison::LT && op != Comparison::LE) {
     return Opaque{&expression};
   }
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
