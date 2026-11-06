@@ -5,8 +5,7 @@ branch is built on the stack of upstream PRs (`filter-facts-canonicalizer`,
 `-planner`, `-definitions`, `-constants`, `-multi-row-values`,
 `-unit-variable`, and #3904); this document describes the stack together with
 the features of this branch that are not in the stack yet (LANG facts, `IN`
-and `||`, swapped comparisons, arithmetic folding, geometry operands from
-`VALUES`). The earlier design with implied filter-substitute entries and a
+and `||`, swapped comparisons, arithmetic folding). The earlier design with implied filter-substitute entries and a
 covered-filter bit (instead of synthesized FILTERs) is kept on the branch
 `filter-fact-recognition-pre-reconcile`.
 
@@ -57,8 +56,8 @@ The code lives in `src/engine/filterFacts/` and in `rewriteFiltersWithFacts`
    `Conjunct`s (split at `&&`), each one of:
    - `Constraint{Distance{a, b}, op, rhs, exact}`: `distance(a, b) < rhs` or
      `<= rhs` in meters. Also with swapped operands (`500 >= d`), with the
-     number computed by `+ - * /`, and with the distance, the number, the unit
-     and the geometry operands from the definitions. With several values (from
+     number computed by `+ - * /`, and with the distance, the number and the
+     unit from the definitions. With several values (from
      a multi-row `VALUES` clause), `rhs` is the largest one, and `exact` is
      false unless all values are equal.
    - `LangEquals{var, rhs, exact}`: `LANG(?x) = c` for some `c` in `rhs` (from
@@ -120,9 +119,10 @@ The code lives in `src/engine/filterFacts/` and in `rewriteFiltersWithFacts`
 - **Synthesized FILTER without `SpatialJoin`.** If the `SpatialJoin` is not
   chosen, the synthesized FILTER is evaluated instead of the original one (for
   a `BIND` of the distance, the distance is then computed twice).
-- **Geometry operands from `VALUES`.** A variable operand with a single value
-  is already joined with its `VALUES` clause by the `SpatialJoin`; replacing it
-  by the value only changes the child of the `SpatialJoin`.
+- **Geometry operands from `VALUES` are not resolved (dropped, 2026-11-06).**
+  A variable operand with a single value is already joined with its `VALUES`
+  clause by the `SpatialJoin`; replacing it by the value would only change the
+  child of the `SpatialJoin`.
 - **The `LANG` consumer mutates the parsed group.** `addLanguageFilter`
   rewrites the triples of the group when the planner starts planning it. A
   removed conjunct is not seen again, but a kept (inexact) one would be
