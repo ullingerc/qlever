@@ -3,10 +3,11 @@
 Status: experimental branch, always on (there is no runtime switch). The
 branch is built on the stack of upstream PRs (`filter-facts-canonicalizer`,
 `-planner`, `-definitions`, `-constants`, `-multi-row-values`,
-`-unit-variable`, and #3904); this document describes the stack together with
-the features of this branch that are not in the stack yet (LANG facts, `IN`
-and `||`, swapped comparisons, arithmetic folding). The earlier design with implied filter-substitute entries and a
-covered-filter bit (instead of synthesized FILTERs) is kept on the branch
+`-unit-variable`, `-lang`, `-lang-planner`, #3904 and #3908); this document
+describes the stack together with the features of this branch that are not in
+the stack yet (swapped comparisons, arithmetic folding). The earlier design
+with implied filter-substitute entries and a covered-filter bit (instead of
+synthesized FILTERs) is kept on the branch
 `filter-fact-recognition-pre-reconcile`.
 
 ## Problem
@@ -45,11 +46,14 @@ The code lives in `src/engine/filterFacts/` and in `rewriteFiltersWithFacts`
    graph pattern, a single scan over its direct children records:
    - `constants_`: the values of a variable from an inline `VALUES` clause of
      the group, if its column contains no `UNDEF`. Several rows give several
-     values.
-   - `expressions_`: the expression `e` of `BIND(e AS ?v)`, if `e` is
-     deterministic, contains neither `NOW()` nor `EXISTS`, and all its
+     values. Also the value of `BIND(c AS ?v)` for a constant `c`
+     (`SparqlExpressionPimpl::getConstantValue`, numbers come as an `Id`),
+     like a `VALUES` clause with a single row.
+   - `expressions_`: the expression `e` of any other `BIND(e AS ?v)`, if `e`
+     is deterministic, contains neither `NOW()` nor `EXISTS`, and all its
      variables are always bound by the patterns *before* the `BIND` (only
-     triples and `VALUES` columns without `UNDEF` count). It is removed again
+     triples, `VALUES` columns without `UNDEF` and `BIND`s of constants
+     count). It is removed again
      if a later pattern of the group may bind `?v` (where `e` is undefined,
      that pattern binds `?v` freely).
 2. **Canonicalizer** (`canonicalize`). Each FILTER becomes a list of
@@ -80,8 +84,9 @@ The code lives in `src/engine/filterFacts/` and in `rewriteFiltersWithFacts`
      which also uses `canonicalize` and `recognizeDistanceBound`) turns it into
      a `SpatialJoin`.
 
-   The parser still applies its own LANG rewrite to the direct shapes
-   (`getLanguageFilterExpression`), so the consumer only sees the others.
+   The parser no longer applies LANG filters itself (its hook and
+   `getLanguageFilterExpression` are removed), so all LANG shapes go through
+   this consumer.
 5. **Residual filter.** If a fact is not exact, its conjunct stays as well.
    For example, `VALUES ?r { 500 1000 } FILTER(dist <= ?r)` gives a
    `SpatialJoin` with a radius of 1000 m and the original FILTER on top.
@@ -111,8 +116,8 @@ The code lives in `src/engine/filterFacts/` and in `rewriteFiltersWithFacts`
 
 - **Cross-scope filters.** Definitions and facts never cross group, subquery,
   `UNION`, `OPTIONAL` or `MINUS` boundaries.
-- **Conservative always-bound analysis.** Only triples and `VALUES` columns
-  without `UNDEF` count as always binding.
+- **Conservative always-bound analysis.** Only triples, `VALUES` columns
+  without `UNDEF` and `BIND`s of constants count as always binding.
 - **Limited folding.** Only `+ - * /` on numbers, with at least one side
   single-valued, in `double`. Division by zero is not folded. To be replaced by
   the evaluator of #3897.
