@@ -10,6 +10,7 @@
 #include "engine/SpatialJoin.h"
 #include "engine/Values.h"
 #include "engine/filterFacts/Recognizers.h"
+#include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
@@ -118,20 +119,73 @@ std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
       std::move(left.child_), std::move(right.child_), true);
 }
 
+namespace {
+
+// Return a FILTER that is equivalent to `bound`, namely
+// `geof:metricDistance(a, b) <= maxMeters`.
+SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
+  using namespace sparqlExpression;
+  // The operands of a `DistanceBound` are variables or constant geometries (see
+  // `getGeoDistanceExpressionParameters`).
+  auto toExpression =
+      [](const TripleComponent& operand) -> SparqlExpression::Ptr {
+    if (operand.isVariable()) {
+      return std::make_unique<VariableExpression>(operand.getVariable());
+    } else if (operand.isLiteral()) {
+      return std::make_unique<StringLiteralExpression>(operand.getLiteral());
+    }
+    AD_CORRECTNESS_CHECK(operand.isId());
+    return std::make_unique<IdExpression>(operand.getId());
+  };
+  auto expression =
+      std::make_unique<LessEqualExpression>(LessEqualExpression::Children{
+          makeMetricDistExpression(toExpression(bound.a_),
+                                   toExpression(bound.b_)),
+          std::make_unique<IdExpression>(
+              Id::makeFromDouble(bound.maxMeters_))});
+  auto descriptor =
+      absl::StrCat("geof:metricDistance(", bound.a_.toString(), ", ",
+                   bound.b_.toString(), ") <= ", bound.maxMeters_);
+  return SparqlFilter{
+      SparqlExpressionPimpl{std::move(expression), std::move(descriptor)}};
+}
+
+}  // namespace
+
 // _____________________________________________________________________________
-void splitFiltersWithFacts(std::vector<SparqlFilter>& filters) {
+void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
+                             const filterFacts::Definitions& defs) {
   std::vector<SparqlFilter> result;
   for (auto& filter : filters) {
-    auto conjuncts = filterFacts::canonicalize(*filter.expression_.getPimpl());
-    bool hasFact = ql::ranges::any_of(conjuncts, [](const auto& conjunct) {
-      return filterFacts::recognizeDistanceBound(conjunct).has_value();
-    });
-    if (conjuncts.size() > 1 && hasFact) {
-      for (auto& conjunct : filter.expression_.splitConjunction()) {
-        result.push_back(SparqlFilter{std::move(conjunct)});
-      }
-    } else {
+    // Recognize the `DistanceBound` of each conjunct of `filter`. Keep a
+    // FILTER without any as it is.
+    auto conjuncts =
+        filterFacts::canonicalize(*filter.expression_.getPimpl(), defs);
+    auto bounds = ::ranges::to<std::vector>(
+        conjuncts | ql::views::transform(&filterFacts::recognizeDistanceBound));
+    if (ql::ranges::none_of(bounds,
+                            [](const auto& b) { return b.has_value(); })) {
       result.push_back(std::move(filter));
+      continue;
+    }
+
+    // Split `filter` into its conjuncts.
+    auto pieces = conjuncts.size() > 1 ? filter.expression_.splitConjunction()
+                                       : std::vector{filter.expression_};
+    AD_CORRECTNESS_CHECK(pieces.size() == bounds.size());
+
+    // Replace a conjunct whose fact needs the definitions by an equivalent
+    // FILTER without them, which can be rewritten on its own.
+    for (auto&& [piece, bound] : ::ranges::views::zip(pieces, bounds)) {
+      bool needsDefinitions =
+          bound.has_value() &&
+          !filterFacts::recognizeDistanceBound(
+              filterFacts::canonicalize(*piece.getPimpl())[0]);
+      if (needsDefinitions) {
+        result.push_back(distanceBoundToFilter(bound.value()));
+      } else {
+        result.push_back(SparqlFilter{std::move(piece)});
+      }
     }
   }
   filters = std::move(result);

@@ -158,33 +158,66 @@ std::optional<Comparison> getComparison(const SparqlExpression& expression) {
   return std::nullopt;
 }
 
+// Return `expression`, or the expression of the `BIND` in `defs` if it is a
+// variable with such a definition.
+const SparqlExpression& resolve(const SparqlExpression& expression,
+                                const Definitions& defs) {
+  if (auto variable = expression.getVariableOrNullopt()) {
+    if (auto it = defs.expressions_.find(variable.value());
+        it != defs.expressions_.end()) {
+      return resolve(*it->second, defs);
+    }
+  }
+  return expression;
+}
+
 // Return the value of `expression` if it is a number (`xsd:int` or
-// `xsd:double`), and `std::nullopt` otherwise (e.g. for the string "500").
-std::optional<double> getNumber(const SparqlExpression& expression) {
-  const auto* constant =
-      dynamic_cast<const sparqlExpression::IdExpression*>(&expression);
-  if (constant == nullptr) {
+// `xsd:double`) or a variable with a single number in `defs`, and
+// `std::nullopt` otherwise (e.g. for the string "500").
+std::optional<double> getNumber(const SparqlExpression& expression,
+                                const Definitions& defs) {
+  const auto& resolved = resolve(expression, defs);
+
+  // A variable with a single number from a `VALUES` clause.
+  if (auto variable = resolved.getVariableOrNullopt()) {
+    auto it = defs.constants_.find(variable.value());
+    if (it == defs.constants_.end() || it->second.size() != 1) {
+      return std::nullopt;
+    }
+    const auto& constant = it->second.front();
+    if (constant.isInt()) {
+      return static_cast<double>(constant.getInt());
+    } else if (constant.isDouble()) {
+      return constant.getDouble();
+    }
     return std::nullopt;
   }
-  const Id& id = constant->value();
-  if (id.getDatatype() == Datatype::Int) {
-    return static_cast<double>(id.getInt());
-  } else if (id.getDatatype() == Datatype::Double) {
-    return id.getDouble();
+
+  // A number.
+  const auto* id =
+      dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
+  if (id == nullptr) {
+    return std::nullopt;
+  }
+  if (id->value().getDatatype() == Datatype::Int) {
+    return static_cast<double>(id->value().getInt());
+  } else if (id->value().getDatatype() == Datatype::Double) {
+    return id->value().getDouble();
   }
   return std::nullopt;
 }
 
 // Return the canonical form of a single conjunct: `distance < number` and
 // `distance <= number` become a `Constraint`, everything else is `Opaque`.
-Conjunct toConjunct(const SparqlExpression& expression) {
+Conjunct toConjunct(const SparqlExpression& expression,
+                    const Definitions& defs) {
   auto op = getComparison(expression);
   if (!op.has_value()) {
     return Opaque{&expression};
   }
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
-      *expression.children()[0]);
-  auto number = getNumber(*expression.children()[1]);
+      resolve(*expression.children()[0], defs));
+  auto number = getNumber(*expression.children()[1], defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
       !number.has_value()) {
     return Opaque{&expression};
@@ -199,22 +232,24 @@ Conjunct toConjunct(const SparqlExpression& expression) {
 
 // Split `expression` at `&&` and append the canonical form of each conjunct to
 // `result`.
-void split(const SparqlExpression& expression, std::vector<Conjunct>& result) {
+void split(const SparqlExpression& expression, const Definitions& defs,
+           std::vector<Conjunct>& result) {
   if (sparqlExpression::isAndExpression(expression)) {
     for (const auto& child : expression.children()) {
-      split(*child, result);
+      split(*child, defs, result);
     }
   } else {
-    result.push_back(toConjunct(expression));
+    result.push_back(toConjunct(expression, defs));
   }
 }
 
 }  // namespace
 
 // _____________________________________________________________________________
-std::vector<Conjunct> canonicalize(const SparqlExpression& filter) {
+std::vector<Conjunct> canonicalize(const SparqlExpression& filter,
+                                   const Definitions& defs) {
   std::vector<Conjunct> result;
-  split(filter, result);
+  split(filter, defs, result);
   return result;
 }
 

@@ -80,12 +80,15 @@ using Conjunct = std::variant<Constraint, Opaque>;
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
 // its conjuncts, and bring each comparison `distance < number` or
-// `distance <= number` into a `Constraint` (with the number in meters).
+// `distance <= number` into a `Constraint` (with the number in meters). A
+// variable with a definition in `defs` is replaced by its definition (for the
+// distance and the number).
 //
 // NOTE: The result points into `filter` (for the `Opaque` conjuncts), so
 // `filter` must outlive it.
 std::vector<Conjunct> canonicalize(
-    const sparqlExpression::SparqlExpression& filter);
+    const sparqlExpression::SparqlExpression& filter,
+    const Definitions& defs = {});
 
 }  // namespace filterFacts
 

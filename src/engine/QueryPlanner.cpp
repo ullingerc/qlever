@@ -62,6 +62,7 @@
 #include "engine/TransitivePathBase.h"
 #include "engine/Union.h"
 #include "engine/Values.h"
+#include "engine/filterFacts/Canonicalizer.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
@@ -291,7 +292,9 @@ std::shared_ptr<QueryExecutionTree> QueryPlanner::createExecutionTree(
 // _____________________________________________________________________________
 SubtreePlanVec QueryPlanner::optimize(ParsedQuery::GraphPattern* rootPattern) {
   // A conjunct of a FILTER that is a fact can then be rewritten on its own.
-  splitFiltersWithFacts(rootPattern->_filters);
+  rewriteFiltersWithFacts(
+      rootPattern->_filters,
+      filterFacts::collectDefinitions(rootPattern->_graphPatterns));
   QueryPlanner::GraphPatternPlanner optimizer{*this, rootPattern};
   for (auto& child : rootPattern->_graphPatterns) {
     child.visit([&optimizer](auto& arg) {
