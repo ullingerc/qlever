@@ -46,7 +46,9 @@ All code lives in `src/engine/filterFacts/`.
      `EXISTS`, and all input variables of `e` are always bound by the patterns
      *before* the `BIND` in the same group. "Always bound" is a minimal,
      conservative analysis: only the variables of triples and of `VALUES`
-     columns without `UNDEF` count.
+     columns without `UNDEF` count. It is removed again if a later pattern of
+     the group may bind `?v` (where `e` is undefined, that pattern binds `?v`
+     freely, so `?v` is no longer equivalent to `e`).
 2. **Canonicalizer** (`canonicalize`). Each FILTER becomes a list of
    `Conjunct`s, each either a `Constraint{lhs, op, rhs}` or an `Opaque`
    expression:
@@ -104,7 +106,7 @@ All code lives in `src/engine/filterFacts/`.
 
 | Condition | How it is enforced | Tests |
 |---|---|---|
-| A `BIND` is substituted only if all its inputs are always bound before it, and it is deterministic. | `collectDefinitions` scans the group in order and tracks the always-bound variables. The expression must satisfy `isDeterministic()` and contain no `NOW()` (which counts as deterministic in QLever) and no `EXISTS`. | `FilterFactsDefinitions.CollectDefinitions`, `QueryPlannerFilterFacts.NoRewrite` |
+| A `BIND` is substituted only if all its inputs are always bound before it, it is deterministic, and no later pattern may bind its target. | `collectDefinitions` scans the group in order and tracks the always-bound variables. The expression must satisfy `isDeterministic()` and contain no `NOW()` (which counts as deterministic in QLever) and no `EXISTS`. A later operation whose variables are not tracked (e.g. `SERVICE`) removes all definitions before it. | `FilterFactsDefinitions.CollectDefinitions`, `QueryPlannerFilterFacts.NoRewrite`, `QueryPlannerFilterFacts.BindTargetBoundLater` |
 | Only inline `VALUES`, never a trailing `VALUES` after `WHERE {}`, and never a column with `UNDEF`. | Only the direct children of the group are scanned. Columns with `UNDEF` are skipped. A trailing `VALUES` is not among them: without `GROUP BY`, the parser moves the `WHERE` clause into a nested group and joins the `VALUES` with it in a new root group (see `ParsedQuery.cpp`), so the FILTERs of the `WHERE` clause are in a different scope. With `GROUP BY`, it is stored in `ParsedQuery::postQueryValuesClause_`. | `FilterFactsDefinitions.CollectDefinitions`, `QueryPlannerFilterFacts.NoRewrite` |
 | No substitution inside `BOUND(...)` or `EXISTS`. | The canonicalizer only descends into the shapes it models. All other expressions are `Opaque`. | `FilterFactsCanonicalizer.NoSubstitutionInsideBoundOrExists` |
 | Typed constants. | Recognizers check the type of every constant. `getNumericValue` accepts only `xsd:int` and `xsd:double`, so the string `"500"` is rejected. `LangIn` accepts only literals without language tag or datatype (other than `xsd:string`). | `FilterFactsRecognizers.*` |

@@ -269,6 +269,33 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
   }
 }
 
+// Test that a `BIND` whose target is bound again by a later pattern is not
+// substituted (where the expression is undefined, the later pattern binds the
+// target freely).
+TEST(QueryPlannerFilterFacts, BindTargetBoundLater) {
+  // A point, a literal that is not a geometry, and the number 3.
+  constexpr std::string_view kg =
+      "<a1> <p> \"POINT(7.8 48.0)\"^^"
+      "<http://www.opengis.net/ont/geosparql#wktLiteral> . "
+      "<a2> <p> \"no geometry\" . <c> <q> 3 .";
+
+  // The three pairs with `<a2>` have no distance, so `?d` is bound to 3 by the
+  // triple after the `BIND`, which passes the FILTER.
+  auto q = query(absl::StrCat(
+      geoms, "BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) ?c <q> ?d ",
+      "FILTER(?d <= 500)"));
+  auto withFacts = [&q, &kg] {
+    auto cleanup = factsEnabled(true);
+    return run(q, kg);
+  }();
+  auto withoutFacts = [&q, &kg] {
+    auto cleanup = factsEnabled(false);
+    return run(q, kg);
+  }();
+  EXPECT_EQ(withFacts, withoutFacts);
+  EXPECT_EQ(withFacts.size(), 3 + 2);
+}
+
 // Labels with different language tags.
 constexpr std::string_view langTurtle =
     "<x1> <label> \"a\"@en . <x1> <label> \"b\"@de . <x2> <label> \"c\"@fr . "

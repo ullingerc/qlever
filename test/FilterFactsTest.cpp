@@ -315,6 +315,22 @@ TEST(FilterFactsDefinitions, CollectDefinitions) {
                 ::testing::Not(::testing::Contains(::testing::Key(V{"?d"}))))
         << binding;
   }
+  // `?d` may be bound again by a later pattern, or by a later operation whose
+  // variables are not tracked (`SERVICE`), but not by `MINUS`.
+  for (std::string_view later :
+       {"?c <q> ?d", "VALUES ?d { 1 }", "OPTIONAL { ?c <q> ?d }",
+        "{ ?c <q> ?d } UNION { ?c <r> ?e }", "GRAPH ?d { ?c <q> ?e }",
+        "{ SELECT ?d { ?c <q> ?d } }", "SERVICE <x> { ?c <q> ?e }"}) {
+    EXPECT_THAT(defs(absl::StrCat(geoms, bind, later)).expressions_, IsEmpty())
+        << later;
+  }
+  for (std::string_view later : {"?c <q> ?e", "OPTIONAL { ?c <q> ?e }",
+                                 "MINUS { ?c <q> ?d }", "BIND(?d + 1 AS ?e)"}) {
+    EXPECT_TRUE(
+        defs(absl::StrCat(geoms, bind, later)).expressions_.contains(V{"?d"}))
+        << later;
+  }
+
   // Non-deterministic expressions, `NOW()` and `EXISTS`.
   for (std::string_view expr :
        {"RAND()", "?x + RAND()", "UUID()", "STRUUID()", "BNODE()", "NOW()",
