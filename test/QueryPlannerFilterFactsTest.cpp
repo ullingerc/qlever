@@ -89,9 +89,9 @@ PlanSummary plan(const std::string& q) {
   return result;
 }
 
-// Test that a distance FILTER with the maximum distance or the distance itself
-// from a `VALUES` or `BIND` clause becomes a `SpatialJoin`, which replaces the
-// FILTER.
+// Test that a distance FILTER with the maximum distance, the unit or the
+// distance itself from a `VALUES` or `BIND` clause becomes a `SpatialJoin`,
+// which replaces the FILTER.
 TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
   auto expect = [](std::string body, double maxDist, std::string filter,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
@@ -108,10 +108,14 @@ TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
     }
   };
 
-  // The maximum distance or the distance from `VALUES` or `BIND`.
+  // The maximum distance, the unit or the distance from `VALUES` or `BIND`.
   expect(absl::StrCat("VALUES ?r { 500 } FILTER(", dist, " <= ?r)"), 500, "");
   expect(absl::StrCat("BIND(0.5 AS ?r) FILTER(geof:distance(?ga, ?gb) < ?r)"),
          std::nextafter(500.0, 0.0), "");
+  expect("VALUES ?u { unit:MI } FILTER(geof:distance(?ga, ?gb, ?u) <= 1)",
+         1609.344, "");
+  expect("BIND(unit:M AS ?u) FILTER(geof:distance(?ga, ?gb, ?u) <= 500)", 500,
+         "");
   expect(absl::StrCat("BIND(", dist, " AS ?d) VALUES ?r { 500 } ",
                       "FILTER(?d <= ?r && ?a != ?b)"),
          500, "?a != ?b");
@@ -203,6 +207,8 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
       {absl::StrCat(geoms, "VALUES ?r { 500 } FILTER($)"), filter, 8},
       {absl::StrCat(geoms, "BIND(0.5 AS ?r) FILTER($)"),
        "geof:distance(?ga, ?gb) < ?r", 8},
+      {absl::StrCat(geoms, "VALUES ?u { unit:M } FILTER($)"),
+       "geof:distance(?ga, ?gb, ?u) <= 500", 8},
       // Without `?d`, which the `SpatialJoin` computes with `libspatialjoin`
       // (the `BIND` is pushed down), with a slightly different value than
       // `geof:distance`.

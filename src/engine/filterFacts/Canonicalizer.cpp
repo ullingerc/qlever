@@ -207,6 +207,30 @@ std::optional<double> getNumber(const SparqlExpression& expression,
   return std::nullopt;
 }
 
+// Return the single value of `variable` from `defs` if it is an IRI or a
+// literal (and `std::nullopt` otherwise).
+std::optional<TripleComponent> getConstant(const Variable& variable,
+                                           const Definitions& defs) {
+  if (auto values = defs.constants_.find(variable);
+      values != defs.constants_.end() && values->second.size() == 1) {
+    return values->second.front();
+  }
+  auto it = defs.expressions_.find(variable);
+  if (it == defs.expressions_.end()) {
+    return std::nullopt;
+  }
+  const auto& resolved = resolve(*it->second, defs);
+  if (const auto* iri =
+          dynamic_cast<const sparqlExpression::IriExpression*>(&resolved)) {
+    return TripleComponent{iri->value()};
+  } else if (const auto* literal =
+                 dynamic_cast<const sparqlExpression::StringLiteralExpression*>(
+                     &resolved)) {
+    return TripleComponent{literal->value()};
+  }
+  return std::nullopt;
+}
+
 // Return the canonical form of a single conjunct: `distance < number` and
 // `distance <= number` become a `Constraint`, everything else is `Opaque`.
 Conjunct toConjunct(const SparqlExpression& expression,
@@ -216,7 +240,10 @@ Conjunct toConjunct(const SparqlExpression& expression,
     return Opaque{&expression};
   }
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
-      resolve(*expression.children()[0], defs));
+      resolve(*expression.children()[0], defs),
+      [&defs](const Variable& variable) {
+        return getConstant(variable, defs);
+      });
   auto number = getNumber(*expression.children()[1], defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
       !number.has_value()) {

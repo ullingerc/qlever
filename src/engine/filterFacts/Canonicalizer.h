@@ -82,7 +82,7 @@ using Conjunct = std::variant<Constraint, Opaque>;
 // its conjuncts, and bring each comparison `distance < number` or
 // `distance <= number` into a `Constraint` (with the number in meters). A
 // variable with a definition in `defs` is replaced by its definition (for the
-// distance and the number).
+// distance, the number and the unit).
 //
 // NOTE: The result points into `filter` (for the `Opaque` conjuncts), so
 // `filter` must outlive it.
