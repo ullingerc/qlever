@@ -37,7 +37,7 @@ struct DistanceBound {
                                         exact_)
 };
 
-// Recognize `distance(a, b) <= c` and `distance(a, b) < c` for a number
+// Recognize `distance(a, b) <= c` and `distance(a, b) < c` for a finite number
 // `c >= 0`. For `<`, the maximum distance is the largest `double` below `c`
 // (because a `SpatialJoin` includes the pairs at exactly its maximum
 // distance).
