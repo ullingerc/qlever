@@ -165,13 +165,13 @@ TEST(QueryPlannerFilterFacts, PlanMatchesExactly) {
                 geoms, "FILTER(geof:distance(?ga, ?gb, unit:M) <= 500)")),
             spatialJoin(std::nullopt));
 
-  // The `SpatialJoin` also replaces a FILTER on the target of a `BIND`.
+  // The `SpatialJoin` also replaces a FILTER on the target of a `BIND`, and
+  // the `BIND` itself (by providing `?d`).
   h::expect(
       query(absl::StrCat(
           geoms,
           "BIND(geof:distance(?ga, ?gb, unit:M) AS ?d) FILTER(?d <= 500)")),
-      h::Bind(spatialJoin(std::nullopt), "geof:distance(?ga, ?gb, unit:M)",
-              V{"?d"}));
+      spatialJoin(V{"?d"}));
 }
 
 // _____________________________________________________________________________
@@ -249,7 +249,12 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
   std::vector<std::pair<std::string, size_t>> queries{
       // Pairs within 500 m: 4 with itself, a1-a2, a2-a3 (in both directions).
       {absl::StrCat(geoms, "FILTER(", dist, " <= 500)"), 8},
-      {absl::StrCat(geoms, "BIND(", dist, " AS ?d) FILTER(?d <= 500)"), 8},
+      // Without `?d`, which the `SpatialJoin` computes with `libspatialjoin`
+      // (the `BIND` is pushed down), with a slightly different value than
+      // `geof:distance`.
+      {absl::StrCat("{ SELECT ?a ?b { ", geoms, "BIND(", dist,
+                    " AS ?d) FILTER(?d <= 500) } }"),
+       8},
       {absl::StrCat(geoms, "VALUES ?r { 500 } FILTER(", dist, " <= ?r)"), 8},
       {absl::StrCat(geoms, "FILTER(500 >= ", dist, ")"), 8},
       {absl::StrCat(geoms, "FILTER(", dist, " < 500)"), 8},
