@@ -56,8 +56,9 @@ bool isSubstitutable(const SparqlExpression& expression,
 Definitions collectDefinitions(
     const std::vector<parsedQuery::GraphPatternOperation>& group) {
   Definitions defs;
-  // The variables that are always bound by the patterns so far. Only triples
-  // and `VALUES` count (ignoring nested groups etc. is conservative).
+  // The variables that are always bound by the patterns so far. Only triples,
+  // `VALUES` and `BIND`s of constants count (ignoring nested groups etc. is
+  // conservative).
   ad_utility::HashSet<Variable> alwaysBound;
   for (const auto& operation : group) {
     // Remove the `BIND`s whose target `operation` may bind again, that is, any
@@ -139,8 +140,8 @@ const SparqlExpression& resolve(const SparqlExpression& expression,
   return expression;
 }
 
-// Return the value of `constant` if it is a number (`xsd:int` or
-// `xsd:double`, also as an `Id`), and `std::nullopt` otherwise (e.g. for the
+// Return the value of `constant` if it is a number (an `int64_t` or `double`,
+// or an `Int` or `Double` `Id`), and `std::nullopt` otherwise (e.g. for the
 // string "500").
 std::optional<double> getNumber(const TripleComponent& constant) {
   if (constant.isInt()) {
@@ -195,6 +196,8 @@ std::optional<std::vector<double>> getNumbers(
 // `distance <= number` become a `Constraint`, everything else is `Opaque`.
 Conjunct toConjunct(const SparqlExpression& expression,
                     const Definitions& defs) {
+  // Match `distance op number` for a distance in a unit of length, return
+  // `Opaque` for every other expression.
   auto op = getComparison(expression);
   if (!op.has_value()) {
     return Opaque{&expression};
@@ -208,9 +211,19 @@ Conjunct toConjunct(const SparqlExpression& expression,
   }
 
   // Convert the largest number from the unit of the distance to meters.
+  //
+  // NOTE: For meters and kilometers, the conversion is exact (in particular, a
+  // number in meters is not converted to kilometers and back, which may change
+  // it). For the other units, it is exact only up to the rounding of the
+  // conversion factor.
   auto [min, max] = ql::ranges::minmax(numbers.value());
-  double meters =
-      ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
+  double meters = max;
+  if (call->unit_ == UnitOfMeasurement::KILOMETERS) {
+    meters *= 1000;
+  } else if (call->unit_ != UnitOfMeasurement::METERS) {
+    meters =
+        ad_utility::detail::valueInUnitToKilometer(meters, call->unit_) * 1000;
+  }
   return Constraint{Distance{call->left_, call->right_}, op.value(), meters,
                     min == max};
 }
