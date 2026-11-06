@@ -165,9 +165,10 @@ TEST(QueryPlannerFilterFacts, NoRewrite) {
            // `UNDEF` in `VALUES`.
            absl::StrCat(geoms, "VALUES ?r { 500 UNDEF } FILTER(", dist,
                         " <= ?r)"),
-           // Non-deterministic `BIND`s.
+           // A non-deterministic `BIND`.
            absl::StrCat(geoms, "BIND(", dist, " + RAND() AS ?d) ",
                         "FILTER(?d <= 500)"),
+           // A radius with a function call, which is not folded.
            absl::StrCat(geoms, "BIND(500 + YEAR(NOW()) * 0 AS ?r) FILTER(",
                         dist, " <= ?r)"),
            // Definitions in another group.
