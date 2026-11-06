@@ -91,10 +91,11 @@ PlanSummary plan(const std::string& q) {
   return result;
 }
 
-// Test that a distance FILTER with the maximum distance, the unit, a geometry
-// or the distance itself from a `VALUES` or `BIND` clause (also with swapped
-// operands or a computed maximum distance) becomes a `SpatialJoin`, which
-// replaces the FILTER unless the maximum distance differs between rows.
+// Test that a distance FILTER with the maximum distance, the unit or the
+// distance itself from a `VALUES` or `BIND` clause, or with a geometry bound by
+// `VALUES` (also with swapped operands or a computed maximum distance), becomes
+// a `SpatialJoin`, which replaces the FILTER unless the maximum distance
+// differs between rows.
 TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
   auto expect = [](std::string body, double maxDist, std::string filter,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
@@ -248,8 +249,8 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
        absl::StrCat(dist, " <= ?r * 2"), 8},
       {absl::StrCat(geoms, "FILTER($)"),
        absl::StrCat(dist, " <= 500 && ?a != ?b"), 4},
-      // A geometry from `VALUES`: `<a1>` and `<a2>` are within 500 m of the
-      // first point.
+      // A geometry bound by `VALUES` (a child of the `SpatialJoin`): `<a1>`
+      // and `<a2>` are within 500 m of the first point.
       {absl::StrCat(geoms,
                     "VALUES ?p { \"POINT(7.8 48.0)\"^^"
                     "<http://www.opengis.net/ont/geosparql#wktLiteral> } "
