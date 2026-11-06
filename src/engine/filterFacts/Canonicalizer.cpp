@@ -97,9 +97,15 @@ Definitions collectDefinitions(
         defs.constants_.emplace(variables[i], std::move(column));
       }
     } else if (const auto* bind = std::get_if<parsedQuery::Bind>(&operation)) {
-      // The target is not always bound (the expression may be undefined).
-      const auto* expression = bind->_expression.getPimpl();
-      if (isSubstitutable(*expression, alwaysBound)) {
+      // The target of a constant is always bound to it, like a `VALUES`
+      // clause with a single row. The target of any other expression is not
+      // always bound (the expression may be undefined).
+      if (auto constant = bind->_expression.getConstantValue()) {
+        alwaysBound.insert(bind->_target);
+        defs.constants_.emplace(bind->_target,
+                                std::vector{std::move(constant).value()});
+      } else if (const auto* expression = bind->_expression.getPimpl();
+                 isSubstitutable(*expression, alwaysBound)) {
         defs.expressions_.emplace(bind->_target, expression);
       }
     }
@@ -141,12 +147,19 @@ const SparqlExpression& resolve(const SparqlExpression& expression,
 }
 
 // Return the value of `constant` if it is a number (`xsd:int` or
-// `xsd:double`), and `std::nullopt` otherwise (e.g. for the string "500").
+// `xsd:double`, also as an `Id`), and `std::nullopt` otherwise (e.g. for the
+// string "500").
 std::optional<double> getNumber(const TripleComponent& constant) {
   if (constant.isInt()) {
     return static_cast<double>(constant.getInt());
   } else if (constant.isDouble()) {
     return constant.getDouble();
+  } else if (constant.isId() &&
+             constant.getId().getDatatype() == Datatype::Int) {
+    return static_cast<double>(constant.getId().getInt());
+  } else if (constant.isId() &&
+             constant.getId().getDatatype() == Datatype::Double) {
+    return constant.getId().getDouble();
   }
   return std::nullopt;
 }
@@ -176,7 +189,7 @@ std::optional<std::vector<double>> getNumbers(
     const SparqlExpression& expression, const Definitions& defs) {
   const auto& resolved = resolve(expression, defs);
 
-  // A variable with the numbers of a `VALUES` clause.
+  // A variable with the numbers of a `VALUES` clause or a `BIND`.
   if (auto variable = resolved.getVariableOrNullopt()) {
     auto it = defs.constants_.find(variable.value());
     if (it == defs.constants_.end() || it->second.empty()) {
@@ -222,12 +235,9 @@ std::optional<std::vector<double>> getNumbers(
   if (id == nullptr) {
     return std::nullopt;
   }
-  if (id->value().getDatatype() == Datatype::Int) {
-    return std::vector{static_cast<double>(id->value().getInt())};
-  } else if (id->value().getDatatype() == Datatype::Double) {
-    return std::vector{id->value().getDouble()};
-  }
-  return std::nullopt;
+  auto number = getNumber(TripleComponent{id->value()});
+  return number.has_value() ? std::optional{std::vector{number.value()}}
+                            : std::nullopt;
 }
 
 // Return the single value of `variable` from `defs` if it is an IRI or a
