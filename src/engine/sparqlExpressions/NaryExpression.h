@@ -37,6 +37,8 @@ SparqlExpression::Ptr makeMultiplyExpression(SparqlExpression::Ptr child1,
                                              SparqlExpression::Ptr child2);
 SparqlExpression::Ptr makeOrExpression(SparqlExpression::Ptr child1,
                                        SparqlExpression::Ptr child2);
+// Return true iff `expression` is an `||` (made by `makeOrExpression`).
+bool isOrExpression(const SparqlExpression& expression);
 SparqlExpression::Ptr makeSubtractExpression(SparqlExpression::Ptr child1,
                                              SparqlExpression::Ptr child2);
 

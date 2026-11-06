@@ -69,6 +69,20 @@ struct Constraint {
   QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_)
 };
 
+// The comparison `LANG(var_) = c` for at least one of the constants `c` in
+// `rhs_` (from `=`, `IN`, or `||` of such comparisons). The conjunct implies
+// the comparison.
+//
+// NOTE: The conjunct and the comparison are equivalent iff `exact_` is true. It
+// is false if a constant is a variable from a `VALUES` clause with different
+// values in different rows: then `rhs_` contains all of them.
+struct LangEquals {
+  Variable var_;
+  std::vector<TripleComponent> rhs_;
+  bool exact_ = true;
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(LangEquals, var_, rhs_, exact_)
+};
+
 // Any other expression.
 struct Opaque {
   const sparqlExpression::SparqlExpression* expression_;
@@ -76,13 +90,14 @@ struct Opaque {
 };
 
 // A conjunct of a FILTER (the FILTER holds iff all its conjuncts hold).
-using Conjunct = std::variant<Constraint, Opaque>;
+using Conjunct = std::variant<Constraint, LangEquals, Opaque>;
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
-// its conjuncts, and bring each comparison `distance < number` or
-// `distance <= number` into a `Constraint` (with the number in meters). A
-// variable with a definition in `defs` is replaced by its definition (for the
-// distance and the number).
+// its conjuncts, bring each comparison `distance < number` or
+// `distance <= number` into a `Constraint` (with the number in meters), and
+// each comparison of `LANG(?x)` with constants into a `LangEquals`. A variable
+// with a definition in `defs` is replaced by its definition (for the distance,
+// the number, `LANG(?x)` and the constants).
 //
 // NOTE: The result points into `filter` (for the `Opaque` conjuncts), so
 // `filter` must outlive it.

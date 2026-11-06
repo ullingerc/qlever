@@ -25,6 +25,7 @@ using ::testing::ElementsAre;
 using ::testing::VariantWith;
 using valueIdComparators::Comparison;
 using V = Variable;
+using Literal = ad_utility::triple_component::Literal;
 
 // A parsed query and the canonical form of the FILTERs of its root group
 // graph pattern (which point into the query).
@@ -106,6 +107,44 @@ TEST(FilterFactsCanonicalizer, Definitions) {
          Comparison::LE, 500);
 }
 
+// Test that a comparison of `LANG(?x)` with constants (also with `IN`, `||`,
+// swapped operands, and definitions) becomes a `LangEquals`, which is not
+// exact if a constant has different values in different rows.
+TEST(FilterFactsCanonicalizer, Lang) {
+  // `?y` is bound by `VALUES` (if it was bound by a triple, the parser would
+  // already apply the language filters).
+  auto expect = [](std::string_view definitions, std::string_view filter,
+                   std::vector<std::string_view> langs, bool exact = true,
+                   ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(l);
+    std::vector<TripleComponent> rhs;
+    for (auto lang : langs) {
+      rhs.emplace_back(Literal::literalWithoutQuotes(lang));
+    }
+    EXPECT_THAT(
+        canonical(filter, absl::StrCat("VALUES ?y { \"a\"@en } ", definitions))
+            .conjuncts_,
+        ElementsAre(VariantWith<LangEquals>(LangEquals{V{"?y"}, rhs, exact})));
+  };
+  expect("", "LANG(?y) = \"en\"", {"en"});
+  expect("", "\"en\" = LANG(?y)", {"en"});
+  expect("BIND(LANG(?y) AS ?l)", "?l = \"en\"", {"en"});
+  expect("BIND(\"en\" AS ?l)", "LANG(?y) = ?l", {"en"});
+  expect("", "LANG(?y) IN (\"en\", \"de\")", {"en", "de"});
+  expect("BIND(LANG(?y) AS ?l)", "?l IN (\"en\", \"de\")", {"en", "de"});
+  expect("", "LANG(?y) = \"en\" || LANG(?y) = \"de\"", {"en", "de"});
+  expect("VALUES ?l { \"en\" \"de\" }", "LANG(?y) = ?l", {"en", "de"}, false);
+
+  // Different variables or other comparisons.
+  for (std::string_view filter :
+       {"LANG(?y) = \"en\" || LANG(?ga) = \"de\"",
+        "LANG(?y) = \"en\" || LANG(?y) != \"de\"", "LANG(?y) != \"en\""}) {
+    EXPECT_THAT(canonical(filter, "VALUES ?y { \"a\"@en }").conjuncts_,
+                ElementsAre(VariantWith<Opaque>(::testing::_)))
+        << filter;
+  }
+}
+
 // Test that only the columns of `VALUES` without `UNDEF` and the `BIND`s whose
 // target is equivalent to their expression are definitions.
 TEST(FilterFactsCanonicalizer, CollectDefinitions) {
@@ -180,6 +219,36 @@ TEST(FilterFactsRecognizers, DistanceBound) {
         std::string{"geof:metricDistance(?ga, ?ga) <= 500"},
         absl::StrCat("geof:metricDistance(", point, ", ", point, ") <= 500"),
         std::string{"BOUND(?a)"}}) {
+    EXPECT_EQ(recognize(filter), std::nullopt) << filter;
+  }
+}
+
+// Test that a `LangEquals` with plain string literals is recognized as
+// `LangIn`.
+TEST(FilterFactsRecognizers, LangIn) {
+  auto recognize = [](std::string_view filter,
+                      std::string_view definitions = "") {
+    auto conjuncts =
+        canonical(filter, absl::StrCat("VALUES ?y { \"a\"@en } ", definitions))
+            .conjuncts_;
+    AD_CORRECTNESS_CHECK(conjuncts.size() == 1);
+    return recognizeLangIn(conjuncts[0]);
+  };
+  EXPECT_THAT(recognize("LANG(?y) IN (\"en\", \"de\")"),
+              ::testing::Optional(LangIn{V{"?y"}, {"en", "de"}}));
+  EXPECT_THAT(recognize("LANG(?y) = "
+                        "\"en\"^^<http://www.w3.org/2001/XMLSchema#string>"),
+              ::testing::Optional(LangIn{V{"?y"}, {"en"}}));
+
+  // A `LangIn` from a `LangEquals` that is not exact is not exact.
+  EXPECT_THAT(recognize("LANG(?y) = ?l", "VALUES ?l { \"en\" \"de\" }"),
+              ::testing::Optional(LangIn{V{"?y"}, {"en", "de"}, false}));
+
+  // A literal with a language tag or a datatype, no literal, no constant at
+  // all, or no `LangEquals`.
+  for (std::string_view filter :
+       {"LANG(?y) = \"en\"@de", "LANG(?y) = \"en\"^^<x>", "LANG(?y) = <en>",
+        "LANG(?y) IN ()", "LANGMATCHES(LANG(?y), \"en\")"}) {
     EXPECT_EQ(recognize(filter), std::nullopt) << filter;
   }
 }
