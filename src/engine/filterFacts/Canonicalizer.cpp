@@ -187,8 +187,8 @@ Conjunct toConjunct(const SparqlExpression& expression,
                     const Definitions& defs) {
   // Match `distance op number` for a distance in a unit of length, return
   // `Opaque` for every other expression.
-  auto op = getComparison(expression);
-  if (!op.has_value()) {
+  auto op = sparqlExpression::getComparison(expression);
+  if (op != Comparison::LT && op != Comparison::LE) {
     return Opaque{&expression};
   }
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
