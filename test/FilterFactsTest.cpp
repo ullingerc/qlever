@@ -140,8 +140,8 @@ TEST(FilterFactsCanonicalizer, Definitions) {
 // swapped operands, and definitions) becomes a `LangEquals`, which is not
 // exact if a constant has different values in different rows.
 TEST(FilterFactsCanonicalizer, Lang) {
-  // `?y` is bound by `VALUES` (if it was bound by a triple, the parser would
-  // already apply the language filters).
+  // Expect that `filter` (with `?y` bound by `VALUES` and the given
+  // `definitions`) is a single `LangEquals` for `?y`.
   auto expect = [](std::string_view definitions, std::string_view filter,
                    std::vector<std::string_view> langs, bool exact = true,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
