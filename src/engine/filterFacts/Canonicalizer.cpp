@@ -180,28 +180,15 @@ std::optional<double> getNumber(const SparqlExpression& expression,
   return id == nullptr ? std::nullopt : getIdNumber(id->value());
 }
 
-// Return the single value of `variable` from `defs` if it is an IRI or a
-// literal (and `std::nullopt` otherwise).
+// Return the single value of `variable` from `defs` (from `VALUES` or a `BIND`
+// of a constant), and `std::nullopt` if it has none or several.
 std::optional<TripleComponent> getConstant(const Variable& variable,
                                            const Definitions& defs) {
-  if (auto values = defs.constants_.find(variable);
-      values != defs.constants_.end() && values->second.size() == 1) {
-    return values->second.front();
-  }
-  auto it = defs.expressions_.find(variable);
-  if (it == defs.expressions_.end()) {
+  auto it = defs.constants_.find(variable);
+  if (it == defs.constants_.end() || it->second.size() != 1) {
     return std::nullopt;
   }
-  const auto& resolved = resolve(*it->second, defs);
-  if (const auto* iri =
-          dynamic_cast<const sparqlExpression::IriExpression*>(&resolved)) {
-    return TripleComponent{iri->value()};
-  } else if (const auto* literal =
-                 dynamic_cast<const sparqlExpression::StringLiteralExpression*>(
-                     &resolved)) {
-    return TripleComponent{literal->value()};
-  }
-  return std::nullopt;
+  return it->second.front();
 }
 
 // Return the canonical form of a single conjunct: `distance < number` and
