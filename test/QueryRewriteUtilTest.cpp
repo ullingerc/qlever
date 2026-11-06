@@ -225,8 +225,9 @@ TEST(QueryRewriteUtilTest, GetGeoFunctionExpressionParametersWithFixedValue) {
 }
 
 // Test that a FILTER is split into its conjuncts iff one of them is a fact,
-// that each conjunct keeps its original input as descriptor, and that a
-// conjunct which is a fact only with the definitions of its group is replaced.
+// that each conjunct keeps its original input as descriptor, that a conjunct
+// which is a fact only with the definitions of its group is replaced, and that
+// a conjunct with an exact language filter is applied to the triples.
 TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
   auto rewrite = [](std::string_view filter,
                     std::string_view definitions = "") {

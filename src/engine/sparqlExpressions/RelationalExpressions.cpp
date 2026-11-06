@@ -301,42 +301,6 @@ ql::span<SparqlExpression::Ptr> RelationalExpression<Comp>::childrenImpl() {
   return {children_.data(), children_.size()};
 }
 
-// _____________________________________________________________________________
-template <Comparison Comp>
-std::optional<SparqlExpression::LangFilterData>
-RelationalExpression<Comp>::getLanguageFilterExpression() const {
-  if (Comp != Comparison::EQ) {
-    return std::nullopt;
-  }
-
-  // We support both directions: LANG(?x) = "en" and "en" = LANG(?x).
-  auto getLangFilterData =
-      [](const auto& left, const auto& right) -> std::optional<LangFilterData> {
-    std::optional<Variable> optVar = getVariableFromLangExpression(left.get());
-    const auto* langPtr =
-        dynamic_cast<const StringLiteralExpression*>(right.get());
-
-    if (!optVar.has_value() || !langPtr) {
-      return std::nullopt;
-    }
-
-    // TODO<joka921> Check that the language string doesn't contain a datatype
-    // etc.
-    // TODO<joka921> Is this even allowed by the grammar?
-    return LangFilterData{std::move(optVar.value()),
-                          {std::string{langPtr->value().getContent()}}};
-  };
-
-  const auto& child1 = children_[0];
-  const auto& child2 = children_[1];
-
-  if (auto langFilterData = getLangFilterData(child1, child2)) {
-    return langFilterData;
-  } else {
-    return getLangFilterData(child2, child1);
-  }
-}
-
 namespace {
 // _____________________________________________________________________________
 template <typename Children>
@@ -579,27 +543,6 @@ auto InExpression::getEstimatesForFilterExpression(
     const std::optional<Variable>& firstSortedVariable) const -> Estimates {
   return getEstimatesForFilterExpressionImpl(
       inputSizeEstimate, reductionFactorEquals, children_, firstSortedVariable);
-}
-
-// _____________________________________________________________________________
-std::optional<SparqlExpression::LangFilterData>
-InExpression::getLanguageFilterExpression() const {
-  const auto& left = children_[0];
-  std::optional<Variable> optVar = getVariableFromLangExpression(left.get());
-  if (!optVar.has_value() || children_.size() < 2) {
-    return std::nullopt;
-  }
-  ad_utility::HashSet<std::string> languages;
-  for (const auto& child : children_ | ql::views::drop(1)) {
-    const auto* langPtr =
-        dynamic_cast<const StringLiteralExpression*>(child.get());
-    if (!langPtr) {
-      return std::nullopt;
-    }
-    languages.emplace(langPtr->value().getContent());
-  }
-
-  return LangFilterData{std::move(optVar.value()), std::move(languages)};
 }
 
 // Explicit instantiations

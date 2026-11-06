@@ -103,8 +103,7 @@ using Conjunct = std::variant<Constraint, LangEquals, Opaque>;
 // `distance <= number` into a `Constraint` (with the number in meters), and
 // each comparison of `LANG(?x)` with constants into a `LangEquals`. A variable
 // with a definition in `defs` is replaced by its definition (for the distance,
-// the number, the unit, `LANG(?x)` and the constants), and so is a geometry
-// operand of the distance with a single value from `VALUES`.
+// the number, the unit, `LANG(?x)` and the constants).
 //
 // NOTE 1: The comparisons may also have swapped operands (`500 >= distance`),
 // and the number may be computed with `+`, `-`, `*` and `/`.

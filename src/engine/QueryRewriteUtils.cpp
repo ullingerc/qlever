@@ -188,9 +188,8 @@ void rewriteFiltersWithFacts(parsedQuery::GraphPattern& group) {
     AD_CORRECTNESS_CHECK(pieces.size() == bounds.size());
 
     // Drop the replaced conjuncts. Replace a conjunct whose fact needs the
-    // definitions by an equivalent FILTER without them, which can be
-    // rewritten on its own. If the fact is not exact, the conjunct is kept as
-    // well.
+    // definitions by an equivalent FILTER without them, which can be rewritten
+    // on its own. If the fact is not exact, the conjunct is kept as well.
     for (auto&& [piece, bound, replaced] :
          ::ranges::views::zip(pieces, bounds, isReplaced)) {
       if (replaced) {

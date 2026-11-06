@@ -37,11 +37,10 @@ std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
 // `group` (e.g. `geof:distance(?a, ?b) <= ?max` with `VALUES ?max { 500 }`) is
 // replaced by an equivalent FILTER without them. A `LangIn` fact is applied to
 // the triples of `group` (see `GraphPattern::addLanguageFilter`), which
-// replaces its conjunct if this succeeds.
+// replaces its conjunct if this succeeds and the fact is exact.
 //
 // NOTE: If the fact is not exact (e.g. for different values of `?max` in
-// different rows), the conjunct is kept in addition to this FILTER (or to the
-// language filter).
+// different rows), the conjunct is kept in addition to this FILTER.
 void rewriteFiltersWithFacts(parsedQuery::GraphPattern& group);
 
 #endif  // QLEVER_SRC_ENGINE_QUERYREWRITEUTILS_H

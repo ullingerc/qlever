@@ -334,8 +334,13 @@ TEST(QueryPlannerFilterFacts, LanguageFilters) {
   using ::testing::HasSubstr;
   using ::testing::UnorderedElementsAre;
 
-  // The language from a `BIND`, or with `IN` and another conjunct.
+  // The language directly or from a `BIND`, or with `IN` and another
+  // conjunct.
   auto [predicates, filters] =
+      planLang("?x <label> ?y FILTER(LANG(?y) = \"en\")");
+  EXPECT_THAT(predicates, ElementsAre("@en@<label>"));
+  EXPECT_THAT(filters, IsEmpty());
+  std::tie(predicates, filters) =
       planLang("?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")");
   EXPECT_THAT(predicates, ElementsAre("@en@<label>"));
   EXPECT_THAT(filters, IsEmpty());
@@ -370,6 +375,8 @@ TEST(QueryPlannerFilterFacts, LanguageFilterResultsAreEqual) {
       {"?x ?p ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"en\"", 2},
       // The empty language (no language filter).
       {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER($)", "?l = \"\"", 1},
+      // A literal with a language tag, which never equals a language.
+      {"?x <label> ?y FILTER($)", "LANG(?y) = \"en\"@de", 0},
   };
   for (const auto& [body, expression, numRows] : queries) {
     auto rewritten =
