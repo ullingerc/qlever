@@ -97,9 +97,15 @@ Definitions collectDefinitions(
         defs.constants_.emplace(variables[i], std::move(column));
       }
     } else if (const auto* bind = std::get_if<parsedQuery::Bind>(&operation)) {
-      // The target is not always bound (the expression may be undefined).
-      const auto* expression = bind->_expression.getPimpl();
-      if (isSubstitutable(*expression, alwaysBound)) {
+      // The target of a constant is always bound to it, like a `VALUES`
+      // clause with a single row. The target of any other expression is not
+      // always bound (the expression may be undefined).
+      if (auto constant = bind->_expression.getConstantValue()) {
+        alwaysBound.insert(bind->_target);
+        defs.constants_.emplace(bind->_target,
+                                std::vector{std::move(constant).value()});
+      } else if (const auto* expression = bind->_expression.getPimpl();
+                 isSubstitutable(*expression, alwaysBound)) {
         defs.expressions_.emplace(bind->_target, expression);
       }
     }
@@ -140,7 +146,18 @@ std::optional<double> getNumber(const SparqlExpression& expression,
                                 const Definitions& defs) {
   const auto& resolved = resolve(expression, defs);
 
-  // A variable with a single number from a `VALUES` clause.
+  // Return the value of `id` if it is a number.
+  auto getIdNumber = [](const Id& id) -> std::optional<double> {
+    if (id.getDatatype() == Datatype::Int) {
+      return static_cast<double>(id.getInt());
+    } else if (id.getDatatype() == Datatype::Double) {
+      return id.getDouble();
+    }
+    return std::nullopt;
+  };
+
+  // A variable with a single number from a `VALUES` clause or a `BIND` (whose
+  // constant is an `Id`).
   if (auto variable = resolved.getVariableOrNullopt()) {
     auto it = defs.constants_.find(variable.value());
     if (it == defs.constants_.end() || it->second.size() != 1) {
@@ -151,6 +168,8 @@ std::optional<double> getNumber(const SparqlExpression& expression,
       return static_cast<double>(constant.getInt());
     } else if (constant.isDouble()) {
       return constant.getDouble();
+    } else if (constant.isId()) {
+      return getIdNumber(constant.getId());
     }
     return std::nullopt;
   }
@@ -158,15 +177,7 @@ std::optional<double> getNumber(const SparqlExpression& expression,
   // A number.
   const auto* id =
       dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
-  if (id == nullptr) {
-    return std::nullopt;
-  }
-  if (id->value().getDatatype() == Datatype::Int) {
-    return static_cast<double>(id->value().getInt());
-  } else if (id->value().getDatatype() == Datatype::Double) {
-    return id->value().getDouble();
-  }
-  return std::nullopt;
+  return id == nullptr ? std::nullopt : getIdNumber(id->value());
 }
 
 // Return the possible values of `expression` if it is a literal or a variable
