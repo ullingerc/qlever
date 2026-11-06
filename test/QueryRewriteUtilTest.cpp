@@ -6,6 +6,7 @@
 
 #include "./QueryRewriteUtilTestHelpers.h"
 #include "./util/IndexTestHelpers.h"
+#include "./util/ParsedQueryTestHelpers.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/QueryRewriteUtils.h"
 #include "engine/SpatialJoin.h"
@@ -255,6 +256,41 @@ TEST(QueryRewriteUtilTest, GetGeoFunctionExpressionParametersWithFixedValue) {
       makePowExpression(getExpr(V{"?a"}), getExpr(V{"?c"})), getExpr(V{"?b"}));
   checkGeoFunctionCall(getGeoFunctionExpressionParameters(*unsupportedArgPtr),
                        std::nullopt);
+}
+
+// Test that a FILTER is split into its conjuncts iff one of them can be
+// rewritten to a `SpatialJoin`, and that each conjunct keeps its original input
+// as descriptor.
+TEST(QueryRewriteUtilTest, SplitFiltersForSpatialJoins) {
+  auto split = [](std::string_view filter) {
+    auto query = ad_utility::testing::parseQuery(absl::StrCat(
+        "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+        "SELECT * { ?a <p> ?b . ?x <p> ?y . FILTER(",
+        filter, ") }"));
+    auto filters = query._rootGraphPattern._filters;
+    splitFiltersForSpatialJoins(filters);
+    std::vector<std::string> descriptors;
+    for (const auto& f : filters) {
+      descriptors.push_back(f.expression_.getDescriptor());
+    }
+    return descriptors;
+  };
+  using ::testing::ElementsAre;
+
+  // A conjunct that can be rewritten, also nested in `&&`.
+  EXPECT_THAT(split("geof:sfIntersects(?y, ?b) && ?x != ?a"),
+              ElementsAre("geof:sfIntersects(?y, ?b)", "?x != ?a"));
+  EXPECT_THAT(
+      split("?x != ?a && (geof:distance(?y, ?b) <= 0.5 && ?x != <c>)"),
+      ElementsAre("?x != ?a", "geof:distance(?y, ?b) <= 0.5", "?x != <c>"));
+
+  // No conjunct can be rewritten (or it has the same variable on both sides,
+  // for which `rewriteFilterToSpatialJoin` throws), or the FILTER is no `&&`.
+  for (std::string_view filter : {"geof:distance(?y, ?b) > 0.5 && ?x != ?a",
+                                  "geof:sfIntersects(?y, ?y) && ?x != ?a",
+                                  "geof:sfIntersects(?y, ?b) || ?x != ?a"}) {
+    EXPECT_THAT(split(filter), ElementsAre(absl::StrCat("(", filter, ")")));
+  }
 }
 
 }  // namespace

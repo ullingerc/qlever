@@ -1725,6 +1725,38 @@ TEST(QueryPlanner, FilterIsNotRewritten) {
                                         scan("?a", "<p>", "?b"))));
 }
 
+// Test that a `geof:` conjunct of a FILTER is rewritten to a `SpatialJoin`,
+// and the other conjuncts are applied as a FILTER on top of it.
+TEST(QueryPlanner, SpatialJoinFromConjunctOfFilter) {
+  auto scan = h::IndexScanFromStrings;
+  using V = Variable;
+  using enum SpatialJoinType::Enum;
+  auto query = [](std::string_view filter) {
+    return absl::StrCat(
+        "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+        "SELECT * WHERE { ?a <p> ?b . ?x <p> ?y . FILTER(",
+        filter, ") }");
+  };
+  auto spatialJoin = [&scan](double maxDist, SpatialJoinType type) {
+    return h::spatialJoinFilterSubstitute(
+        maxDist, -1, V{"?y"}, V{"?b"}, std::nullopt, PayloadVariables::all(),
+        SpatialJoinAlgorithm::LIBSPATIALJOIN, type, std::nullopt,
+        scan("?x", "<p>", "?y"), scan("?a", "<p>", "?b"));
+  };
+
+  // A distance and a relation conjunct, on either side of `&&`.
+  h::expect(query("geof:distance(?y, ?b) <= 0.5 && ?x != ?a"),
+            h::Filter("?x != ?a", spatialJoin(500, WITHIN_DIST)));
+  h::expect(query("?x != ?a && geof:sfIntersects(?y, ?b)"),
+            h::Filter("?x != ?a", spatialJoin(-1, INTERSECTS)));
+
+  // Without such a conjunct, the FILTER is applied as a whole.
+  h::expect(query("geof:distance(?y, ?b) > 0.5 && ?x != ?a"),
+            h::Filter("geof:distance(?y, ?b) > 0.5 && ?x != ?a",
+                      h::CartesianProductJoin(scan("?x", "<p>", "?y"),
+                                              scan("?a", "<p>", "?b"))));
+}
+
 // _____________________________________________________________________________
 TEST(QueryPlanner, SpatialJoinFromGeofRelationFilter) {
   auto scan = h::IndexScanFromStrings;

@@ -110,3 +110,33 @@ std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
           SpatialJoinAlgorithm::LIBSPATIALJOIN, std::nullopt},
       std::move(left.child_), std::move(right.child_), true);
 }
+
+// _____________________________________________________________________________
+void splitFiltersForSpatialJoins(std::vector<SparqlFilter>& filters) {
+  // Return true iff `rewriteFilterToSpatialJoin` would rewrite `conjunct`
+  // (without throwing for the same variable on both sides).
+  auto isRewritable =
+      [](const sparqlExpression::SparqlExpressionPimpl& conjunct) {
+        auto configAndCall =
+            getSpatialJoinConfigForFilter(*conjunct.getPimpl());
+        if (!configAndCall.has_value()) {
+          return false;
+        }
+        const auto& call = configAndCall.value().second;
+        return (call.left_.isVariable() || call.right_.isVariable()) &&
+               call.left_ != call.right_;
+      };
+
+  std::vector<SparqlFilter> result;
+  for (auto& filter : filters) {
+    auto conjuncts = filter.expression_.splitConjunction();
+    if (conjuncts.size() > 1 && ql::ranges::any_of(conjuncts, isRewritable)) {
+      for (auto& conjunct : conjuncts) {
+        result.push_back(SparqlFilter{std::move(conjunct)});
+      }
+    } else {
+      result.push_back(std::move(filter));
+    }
+  }
+  filters = std::move(result);
+}
