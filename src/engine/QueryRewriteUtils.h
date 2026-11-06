@@ -36,6 +36,9 @@ std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
 // regular FILTERs. A conjunct that is a fact only with the definitions `defs`
 // of its group (e.g. `geof:distance(?a, ?b) <= ?max` with `VALUES ?max {
 // 500 }`) is replaced by an equivalent FILTER without them.
+//
+// NOTE: If the fact is not exact (e.g. for different values of `?max` in
+// different rows), the conjunct is kept in addition to this FILTER.
 void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
                              const filterFacts::Definitions& defs);
 

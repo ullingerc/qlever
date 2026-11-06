@@ -171,38 +171,50 @@ const SparqlExpression& resolve(const SparqlExpression& expression,
   return expression;
 }
 
-// Return the value of `expression` if it is a number (`xsd:int` or
-// `xsd:double`) or a variable with a single number in `defs`, and
-// `std::nullopt` otherwise (e.g. for the string "500").
-std::optional<double> getNumber(const SparqlExpression& expression,
-                                const Definitions& defs) {
+// Return the value of `constant` if it is a number (`xsd:int` or
+// `xsd:double`), and `std::nullopt` otherwise (e.g. for the string "500").
+std::optional<double> getNumber(const TripleComponent& constant) {
+  if (constant.isInt()) {
+    return static_cast<double>(constant.getInt());
+  } else if (constant.isDouble()) {
+    return constant.getDouble();
+  }
+  return std::nullopt;
+}
+
+// Return the possible values of `expression` if it is a number or a variable
+// with only numbers in `defs` (and `std::nullopt` otherwise).
+std::optional<std::vector<double>> getNumbers(
+    const SparqlExpression& expression, const Definitions& defs) {
   const auto& resolved = resolve(expression, defs);
 
-  // A variable with a single number from a `VALUES` clause.
+  // A variable with the numbers of a `VALUES` clause.
   if (auto variable = resolved.getVariableOrNullopt()) {
     auto it = defs.constants_.find(variable.value());
-    if (it == defs.constants_.end() || it->second.size() != 1) {
+    if (it == defs.constants_.end() || it->second.empty()) {
       return std::nullopt;
     }
-    const auto& constant = it->second.front();
-    if (constant.isInt()) {
-      return static_cast<double>(constant.getInt());
-    } else if (constant.isDouble()) {
-      return constant.getDouble();
+    std::vector<double> numbers;
+    for (const auto& constant : it->second) {
+      auto number = getNumber(constant);
+      if (!number.has_value()) {
+        return std::nullopt;
+      }
+      numbers.push_back(number.value());
     }
-    return std::nullopt;
+    return numbers;
   }
 
-  // A number.
+  // A single number.
   const auto* id =
       dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
   if (id == nullptr) {
     return std::nullopt;
   }
   if (id->value().getDatatype() == Datatype::Int) {
-    return static_cast<double>(id->value().getInt());
+    return std::vector{static_cast<double>(id->value().getInt())};
   } else if (id->value().getDatatype() == Datatype::Double) {
-    return id->value().getDouble();
+    return std::vector{id->value().getDouble()};
   }
   return std::nullopt;
 }
@@ -217,17 +229,18 @@ Conjunct toConjunct(const SparqlExpression& expression,
   }
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
       resolve(*expression.children()[0], defs));
-  auto number = getNumber(*expression.children()[1], defs);
+  auto numbers = getNumbers(*expression.children()[1], defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
-      !number.has_value()) {
+      !numbers.has_value()) {
     return Opaque{&expression};
   }
 
-  // Convert the number from the unit of the distance to meters.
+  // Convert the largest number from the unit of the distance to meters.
+  auto [min, max] = ql::ranges::minmax(numbers.value());
   double meters =
-      ad_utility::detail::valueInUnitToKilometer(number.value(), call->unit_) *
-      1000;
-  return Constraint{Distance{call->left_, call->right_}, op.value(), meters};
+      ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
+  return Constraint{Distance{call->left_, call->right_}, op.value(), meters,
+                    min == max};
 }
 
 // Split `expression` at `&&` and append the canonical form of each conjunct to

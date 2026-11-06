@@ -55,12 +55,13 @@ Canonical canonical(std::string_view filter,
 
 // Matcher for a `Constraint` `distance op meters` (compared with a tolerance,
 // because the factors of the conversion of units are rounded).
-auto constraint(Comparison op, double meters) {
+auto constraint(Comparison op, double meters, bool exact = true) {
   using namespace ::testing;
   return VariantWith<Constraint>(
       AllOf(Field(&Constraint::lhs_, Eq(Distance{V{"?ga"}, V{"?gb"}})),
             Field(&Constraint::op_, op),
-            Field(&Constraint::rhs_, DoubleNear(meters, 1e-3))));
+            Field(&Constraint::rhs_, DoubleNear(meters, 1e-3)),
+            Field(&Constraint::exact_, exact)));
 }
 
 // Test that `distance < number` and `distance <= number` become a
@@ -89,14 +90,15 @@ TEST(FilterFactsCanonicalizer, Distance) {
 }
 
 // Test that a variable is replaced by its definition from `VALUES` or `BIND`
-// (for the distance and the number).
+// (for the distance and the number), and that a `Constraint` with
+// different numbers in different rows has the largest one and is not exact.
 TEST(FilterFactsCanonicalizer, Definitions) {
   auto expect = [](std::string_view definitions, std::string_view filter,
-                   Comparison op, double meters,
+                   Comparison op, double meters, bool exact = true,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
     auto trace = generateLocationTrace(l);
     EXPECT_THAT(canonical(filter, definitions).conjuncts_,
-                ElementsAre(constraint(op, meters)));
+                ElementsAre(constraint(op, meters, exact)));
   };
   expect("VALUES ?r { 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
          Comparison::LE, 500);
@@ -104,6 +106,8 @@ TEST(FilterFactsCanonicalizer, Definitions) {
          500);
   expect("BIND(geof:metricDistance(?ga, ?gb) AS ?d)", "?d <= 500",
          Comparison::LE, 500);
+  expect("VALUES ?r { 1000 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
+         Comparison::LE, 1000, false);
 }
 
 // Test that only the columns of `VALUES` without `UNDEF` and the `BIND`s whose
@@ -158,6 +162,13 @@ TEST(FilterFactsRecognizers, DistanceBound) {
   EXPECT_THAT(recognize("geof:distance(?ga, ?gb, unit:M) <= 500"),
               ::testing::Optional(DistanceBound{V{"?ga"}, V{"?gb"}, 500}));
 
+  // A `DistanceBound` from a `Constraint` that is not exact is not exact.
+  auto conjuncts =
+      canonical("geof:metricDistance(?ga, ?gb) <= ?r", "VALUES ?r { 500 1000 }")
+          .conjuncts_;
+  EXPECT_THAT(
+      recognizeDistanceBound(conjuncts.at(0)),
+      ::testing::Optional(DistanceBound{V{"?ga"}, V{"?gb"}, 1000, false}));
   EXPECT_THAT(
       recognize("geof:metricDistance(?ga, ?gb) < 500"),
       ::testing::Optional(DistanceBound{

@@ -91,7 +91,7 @@ PlanSummary plan(const std::string& q) {
 
 // Test that a distance FILTER with the maximum distance or the distance itself
 // from a `VALUES` or `BIND` clause becomes a `SpatialJoin`, which replaces the
-// FILTER.
+// FILTER unless the maximum distance differs between rows.
 TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
   auto expect = [](std::string body, double maxDist, std::string filter,
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
@@ -115,6 +115,11 @@ TEST(QueryPlannerFilterFacts, DistanceWithDefinitions) {
   expect(absl::StrCat("BIND(", dist, " AS ?d) VALUES ?r { 500 } ",
                       "FILTER(?d <= ?r && ?a != ?b)"),
          500, "?a != ?b");
+
+  // Different maximum distances in different rows: the `SpatialJoin` uses
+  // the largest one, and the FILTER stays.
+  expect(absl::StrCat("VALUES ?r { 500 1000 } FILTER(", dist, " <= ?r)"), 1000,
+         absl::StrCat("(", dist, " <= ?r)"));
 }
 
 // Test that the `SpatialJoin` also replaces a FILTER on the target of a
@@ -213,6 +218,8 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
       // with itself.
       {absl::StrCat(geoms, "VALUES ?r { 500 } FILTER($)"),
        absl::StrCat(filter, " && ?a != ?b"), 4},
+      // Two radii: the `SpatialJoin` uses 1000 m, the FILTER does the rest.
+      {absl::StrCat(geoms, "VALUES ?r { 500 1000 } FILTER($)"), filter, 8 + 10},
   };
   for (const auto& [body, expression, numRows] : queries) {
     auto rewritten =

@@ -175,7 +175,8 @@ void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
     AD_CORRECTNESS_CHECK(pieces.size() == bounds.size());
 
     // Replace a conjunct whose fact needs the definitions by an equivalent
-    // FILTER without them, which can be rewritten on its own.
+    // FILTER without them, which can be rewritten on its own. If the fact is
+    // not exact, the conjunct is kept as well.
     for (auto&& [piece, bound] : ::ranges::views::zip(pieces, bounds)) {
       bool needsDefinitions =
           bound.has_value() &&
@@ -183,7 +184,8 @@ void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
               filterFacts::canonicalize(*piece.getPimpl())[0]);
       if (needsDefinitions) {
         result.push_back(distanceBoundToFilter(bound.value()));
-      } else {
+      }
+      if (!needsDefinitions || !bound->exact_) {
         result.push_back(SparqlFilter{std::move(piece)});
       }
     }

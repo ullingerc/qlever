@@ -259,10 +259,14 @@ TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
     EXPECT_THAT(rewrite(filter), ElementsAre(absl::StrCat("(", filter, ")")));
   }
 
-  // A fact with the maximum distance from `VALUES` is replaced.
+  // A fact with the maximum distance from `VALUES` is replaced, and kept as
+  // well if the maximum distance differs between the rows.
   EXPECT_THAT(
       rewrite("geof:distance(?y, ?b) <= ?r && ?x != ?a", "VALUES ?r { 0.5 }"),
       ElementsAre("geof:metricDistance(?y, ?b) <= 500", "?x != ?a"));
+  EXPECT_THAT(rewrite("geof:distance(?y, ?b) <= ?r", "VALUES ?r { 0.5 1 }"),
+              ElementsAre("geof:metricDistance(?y, ?b) <= 1000",
+                          "(geof:distance(?y, ?b) <= ?r)"));
 }
 
 }  // namespace
