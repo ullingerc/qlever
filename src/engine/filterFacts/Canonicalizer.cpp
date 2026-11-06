@@ -25,25 +25,14 @@ using valueIdComparators::Comparison;
 
 namespace {
 
-// Return true iff `expression` contains `NOW()`.
-bool containsNow(const SparqlExpression& expression) {
-  if (dynamic_cast<const sparqlExpression::NowDatetimeExpression*>(
-          &expression)) {
-    return true;
-  }
-  return ql::ranges::any_of(expression.children(), [](const auto& child) {
-    return containsNow(*child);
-  });
-}
-
 // Return true iff the target of `BIND(expression AS ?v)` is equivalent to
 // `expression`, given the variables that are always bound before the `BIND`.
 bool isSubstitutable(const SparqlExpression& expression,
                      const ad_utility::HashSet<Variable>& alwaysBound) {
   std::vector<const SparqlExpression*> exists;
   expression.getExistsExpressions(exists);
-  return expression.isDeterministic() && !containsNow(expression) &&
-         exists.empty() &&
+  return expression.isDeterministic() &&
+         !sparqlExpression::containsNow(expression) && exists.empty() &&
          ql::ranges::all_of(expression.containedVariables(),
                             [&alwaysBound](const Variable* variable) {
                               return alwaysBound.contains(*variable);
@@ -119,17 +108,14 @@ namespace {
 // Return the operator if `expression` is a comparison with `<` or `<=`, and
 // `false`. For `>` and `>=`, return the operator of the equivalent comparison
 // with swapped operands (`b > a` is `a < b`), and `true`.
-std::optional<std::pair<Comparison, bool>> getComparison(
+std::optional<std::pair<Comparison, bool>> getLessComparison(
     const SparqlExpression& expression) {
-  using namespace sparqlExpression;
-  if (dynamic_cast<const LessThanExpression*>(&expression)) {
-    return std::pair{Comparison::LT, false};
-  } else if (dynamic_cast<const LessEqualExpression*>(&expression)) {
-    return std::pair{Comparison::LE, false};
-  } else if (dynamic_cast<const GreaterThanExpression*>(&expression)) {
-    return std::pair{Comparison::LT, true};
-  } else if (dynamic_cast<const GreaterEqualExpression*>(&expression)) {
-    return std::pair{Comparison::LE, true};
+  using enum Comparison;
+  auto op = sparqlExpression::getComparison(expression);
+  if (op == LT || op == LE) {
+    return std::pair{op.value(), false};
+  } else if (op == GT || op == GE) {
+    return std::pair{op == GT ? LT : LE, true};
   }
   return std::nullopt;
 }
@@ -145,24 +131,6 @@ const SparqlExpression& resolve(const SparqlExpression& expression,
     }
   }
   return expression;
-}
-
-// Return the value of `constant` if it is a number (an `int64_t` or `double`,
-// or an `Int` or `Double` `Id`), and `std::nullopt` otherwise (e.g. for the
-// string "500").
-std::optional<double> getNumber(const TripleComponent& constant) {
-  if (constant.isInt()) {
-    return static_cast<double>(constant.getInt());
-  } else if (constant.isDouble()) {
-    return constant.getDouble();
-  } else if (constant.isId() &&
-             constant.getId().getDatatype() == Datatype::Int) {
-    return static_cast<double>(constant.getId().getInt());
-  } else if (constant.isId() &&
-             constant.getId().getDatatype() == Datatype::Double) {
-    return constant.getId().getDouble();
-  }
-  return std::nullopt;
 }
 
 // Return `a op b`, and `std::nullopt` for a division by zero (whose result
@@ -198,7 +166,7 @@ std::optional<std::vector<double>> getNumbers(
     }
     std::vector<double> numbers;
     for (const auto& constant : it->second) {
-      auto number = getNumber(constant);
+      auto number = constant.getNumber();
       if (!number.has_value()) {
         return std::nullopt;
       }
@@ -236,7 +204,7 @@ std::optional<std::vector<double>> getNumbers(
   if (id == nullptr) {
     return std::nullopt;
   }
-  auto number = getNumber(TripleComponent{id->value()});
+  auto number = TripleComponent{id->value()}.getNumber();
   return number.has_value() ? std::optional{std::vector{number.value()}}
                             : std::nullopt;
 }
@@ -342,7 +310,7 @@ Conjunct toConjunct(const SparqlExpression& expression,
   // Match `distance op number` for a distance in a unit of length, also with
   // swapped operands (`500 >= distance` is `distance <= 500`), return `Opaque`
   // for every other expression.
-  auto comparison = getComparison(expression);
+  auto comparison = getLessComparison(expression);
   if (!comparison.has_value()) {
     return Opaque{&expression};
   }
