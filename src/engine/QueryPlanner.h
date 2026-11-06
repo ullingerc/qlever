@@ -755,12 +755,14 @@ class QueryPlanner {
     // by the FILTERs of `group` (see `engine/filterFacts`). Apply the `LangIn`
     // facts to `group` right away (via `addLanguageFilter`, before its triples
     // are planned) and return the `DistanceBound` facts, which become filter
-    // substitutes in `fillDpTab`. Remove each FILTER that is replaced by the
-    // `LangIn` facts alone.
+    // substitutes in `fillDpTab`. Split each FILTER with a conjunct that is
+    // replaced exactly into its conjuncts, and remove the conjuncts that are
+    // replaced by a `LangIn` fact.
     //
-    // NOTE: A FILTER is replaced if its facts are exact, its language filters
-    // could be applied, and it has at most one `DistanceBound` (a plan may
-    // contain only one of several `SpatialJoin`s).
+    // NOTE: A conjunct is replaced exactly if its fact is exact and (for a
+    // `LangIn` fact) the language filter could be applied. The conjunct of an
+    // exact `DistanceBound` stays, it is replaced only in the plans with the
+    // `SpatialJoin` (see `seedFactSubstitutes`).
     static std::vector<DistanceBoundAndFilter> applyFilterFacts(
         ParsedQuery::GraphPattern& group);
 

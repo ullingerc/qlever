@@ -47,13 +47,14 @@ struct LangIn {
 
 using Fact = std::variant<DistanceBound, LangIn>;
 
-// The facts implied by a single FILTER.
-struct FilterFacts {
-  std::vector<Fact> facts_;
-  // True iff each conjunct of the FILTER is an exact fact, so the FILTER holds
-  // iff all `facts_` hold.
-  bool exact_ = false;
-};
+// The facts implied by the conjuncts of a single FILTER, in the order of
+// `SparqlExpressionPimpl::splitConjunction`, with `std::nullopt` for a
+// conjunct without a fact.
+using FilterFacts = std::vector<std::optional<Fact>>;
+
+// Return true iff `fact` exists and is exact (the conjunct holds iff the fact
+// holds).
+bool isExact(const std::optional<Fact>& fact);
 
 // `distance(a, b) <= c` or `distance(a, b) < c` for numeric constants `c`. If
 // there are several constants, the largest one is used. For `<`, the largest

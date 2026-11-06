@@ -84,21 +84,19 @@ std::vector<FilterFacts> recognizeFacts(
   auto defs = collectDefinitions(group._graphPatterns);
   std::vector<FilterFacts> result;
   for (const auto& filter : group._filters) {
-    // The FILTER is exact iff each of its conjuncts is an exact fact.
     FilterFacts& facts = result.emplace_back();
-    facts.exact_ = true;
     for (const auto& conjunct :
          canonicalize(*filter.expression_.getPimpl(), defs)) {
-      auto fact = recognize(conjunct);
-      facts.exact_ &=
-          fact.has_value() &&
-          std::visit([](const auto& f) { return f.exact_; }, fact.value());
-      if (fact.has_value()) {
-        facts.facts_.push_back(std::move(fact).value());
-      }
+      facts.push_back(recognize(conjunct));
     }
   }
   return result;
+}
+
+// _____________________________________________________________________________
+bool isExact(const std::optional<Fact>& fact) {
+  return fact.has_value() &&
+         std::visit([](const auto& f) { return f.exact_; }, fact.value());
 }
 
 }  // namespace filterFacts

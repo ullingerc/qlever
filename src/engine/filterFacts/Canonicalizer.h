@@ -88,8 +88,9 @@ struct Constraint {
 using Conjunct = std::variant<Constraint, Opaque>;
 
 // Bring the expression of a FILTER into canonical form: split `&&` into
-// conjuncts, substitute `defs`, fold constants, move the constant side of a
-// comparison to the right, and normalize distances to metres.
+// conjuncts (in the order of `SparqlExpressionPimpl::splitConjunction`),
+// substitute `defs`, fold constants, move the constant side of a comparison to
+// the right, and normalize distances to metres.
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpression& filter, const Definitions& defs);
 

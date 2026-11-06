@@ -112,9 +112,9 @@ TEST(QueryPlannerFilterFacts, DistanceShapes) {
        "FILTER(?d <= ?r)",
        500, ""},
       // Several values (the `SpatialJoin` uses the largest one), and a
-      // conjunct that is not a fact.
+      // conjunct that is not a fact (only this conjunct stays).
       {"VALUES ?r { 500 1000 } FILTER(geof:distance(?ga, ?gb, unit:M) <= ?r)",
-       1000, "geof:distance(?ga, ?gb, unit:M) <= ?r"},
+       1000, "(geof:distance(?ga, ?gb, unit:M) <= ?r)"},
       {"FILTER(geof:distance(?ga, ?gb, unit:M) <= 500 && ?a != ?b)", 500,
        "?a != ?b"},
   };
@@ -129,7 +129,8 @@ TEST(QueryPlannerFilterFacts, DistanceShapes) {
       if (filter.empty()) {
         EXPECT_THAT(summary.filters_, IsEmpty()) << shape;
       } else {
-        EXPECT_THAT(summary.filters_, ElementsAre(::testing::HasSubstr(filter)))
+        EXPECT_THAT(summary.filters_,
+                    ElementsAre(absl::StrCat("Filter ", filter)))
             << shape;
       }
     }
@@ -258,6 +259,9 @@ TEST(QueryPlannerFilterFacts, ResultsAreEqual) {
       {absl::StrCat(geoms, "VALUES ?r { 500 } FILTER(", dist, " <= ?r)"), 8},
       {absl::StrCat(geoms, "FILTER(500 >= ", dist, ")"), 8},
       {absl::StrCat(geoms, "FILTER(", dist, " < 500)"), 8},
+      // The conjunct `?a != ?b` stays, and removes the four pairs of a point
+      // with itself.
+      {absl::StrCat(geoms, "FILTER(", dist, " <= 500 && ?a != ?b)"), 4},
       // Two radii: the `SpatialJoin` uses 1000 m, the FILTER does the rest.
       {absl::StrCat(geoms, "VALUES ?r { 500 1000 } FILTER(", dist, " <= ?r)"),
        8 + 10},
@@ -391,6 +395,7 @@ TEST(QueryPlannerFilterFacts, LanguageFilterResultsAreEqual) {
       {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", 1},
       {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l IN (\"en\", \"de\"))", 2},
       {"?x <label> ?y FILTER(LANG(?y) = \"en\" || LANG(?y) = \"fr\")", 2},
+      {"?x <label> ?y FILTER(LANG(?y) IN (\"en\", \"fr\") && ?x != <x1>)", 1},
       {"?x <label> ?y VALUES ?l { \"en\" \"de\" } FILTER(LANG(?y) = ?l)", 2},
       {"?x ?p ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"en\")", 2},
       {"?x <label> ?y BIND(LANG(?y) AS ?l) FILTER(?l = \"\")", 1},

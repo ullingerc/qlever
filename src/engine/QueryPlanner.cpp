@@ -3766,30 +3766,42 @@ QueryPlanner::GraphPatternPlanner::applyFilterFacts(
   std::vector<SparqlFilter> remainingFilters;
   for (auto&& [filter, facts] :
        ::ranges::views::zip(group._filters, factsPerFilter)) {
-    // Apply the language filters and collect the distance bounds.
-    bool isReplaced = facts.exact_;
-    std::vector<filterFacts::DistanceBound> bounds;
-    for (auto& fact : facts.facts_) {
-      if (auto* bound = std::get_if<filterFacts::DistanceBound>(&fact)) {
-        bounds.push_back(std::move(*bound));
-      } else if (auto* lang = std::get_if<filterFacts::LangIn>(&fact)) {
-        isReplaced &= group.addLanguageFilter(lang->var_, lang->langs_);
+    // Apply the language filters, and find the conjuncts that are replaced
+    // exactly: by a language filter, or by the `SpatialJoin` of a distance
+    // bound.
+    std::vector<bool> isReplaced;
+    for (auto& fact : facts) {
+      bool replaced = filterFacts::isExact(fact);
+      if (auto* lang = fact ? std::get_if<filterFacts::LangIn>(&fact.value())
+                            : nullptr) {
+        replaced &= group.addLanguageFilter(lang->var_, lang->langs_);
       }
+      isReplaced.push_back(replaced);
     }
-    isReplaced &= bounds.size() <= 1;
 
-    // Remove the FILTER if it is replaced by the language filters alone, else
-    // keep it and remember its position for the `SpatialJoin` that replaces
-    // it.
-    if (isReplaced && bounds.empty()) {
-      continue;
+    // If no conjunct is replaced, keep the FILTER as it is. Otherwise, split
+    // it into its conjuncts, and drop the conjuncts replaced by a language
+    // filter. Each `DistanceBound` remembers the position of its conjunct.
+    bool split = ql::ranges::any_of(isReplaced, std::identity{});
+    auto conjuncts =
+        split ? filter.expression_.splitConjunction()
+              : std::vector<sparqlExpression::SparqlExpressionPimpl>{};
+    if (!split) {
+      remainingFilters.push_back(std::move(filter));
     }
-    remainingFilters.push_back(std::move(filter));
-    for (auto& bound : bounds) {
-      distanceBounds.push_back(
-          {std::move(bound), isReplaced
-                                 ? std::optional{remainingFilters.size() - 1}
-                                 : std::nullopt});
+    for (auto&& [i, fact] : ::ranges::views::enumerate(facts)) {
+      auto* bound = fact
+                        ? std::get_if<filterFacts::DistanceBound>(&fact.value())
+                        : nullptr;
+      if (split && (bound != nullptr || !isReplaced[i])) {
+        remainingFilters.push_back(SparqlFilter{std::move(conjuncts[i])});
+      }
+      if (bound != nullptr) {
+        distanceBounds.push_back(
+            {std::move(*bound), split && isReplaced[i]
+                                    ? std::optional{remainingFilters.size() - 1}
+                                    : std::nullopt});
+      }
     }
   }
   group._filters = std::move(remainingFilters);

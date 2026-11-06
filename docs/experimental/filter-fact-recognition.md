@@ -102,15 +102,16 @@ All code lives in `src/engine/filterFacts/`.
      only holds for the value of this row. Each fact inherits this flag. For
      `distance < c`, the largest double below `c` is the radius, so the fact
      remains exact.
-   - A FILTER is exact if each of its conjuncts is an exact fact
-     (`FilterFacts::exact_`). It is replaced if, in addition, all its
-     `addLanguageFilter` calls succeed and it has at most one `DistanceBound`
-     (a plan may contain only one of several `SpatialJoin`s).
-   - A replaced FILTER without a `DistanceBound` is removed from the group (as
-     the parser does without the switch). Otherwise, the `SpatialJoin` of the
-     `DistanceBound` also includes the entry of the FILTER, so the FILTER is
-     not applied to plans with the `SpatialJoin`, and still applied to all
-     other plans.
+   - A conjunct is replaced exactly if its fact is exact and (for a `LangIn`
+     fact) `addLanguageFilter` succeeds. A FILTER with such a conjunct is split
+     into its conjuncts (`SparqlExpressionPimpl::splitConjunction`, which
+     shares the subtrees), so only the other conjuncts stay. For example,
+     `FILTER(dist <= 500 && ?a != ?b)` becomes a `SpatialJoin` and
+     `FILTER(?a != ?b)`. A FILTER without such a conjunct stays unchanged.
+   - A conjunct replaced by a `LangIn` fact is removed from the group (as the
+     parser does without the switch). The conjunct of a `DistanceBound` stays,
+     but the `SpatialJoin` also includes its entry, so it is not applied to
+     plans with the `SpatialJoin`, and still applied to all other plans.
 
    In the planner, every `DistanceBound` gets an entry with `isImplied_ = true`
    in the list of filters and substitutes. Such an entry only offers its
@@ -223,9 +224,10 @@ runs the query on a small index with the switch on and off
   argument in floating point, as in the existing rewrite. A geometry at almost
   exactly the maximum distance may be classified differently by the
   `SpatialJoin` than by the FILTER (which the existing rewrite also drops).
-- **No splitting of `&&`.** A FILTER with a conjunct that is not an exact
-  fact (e.g. `dist <= 500 && ?a != ?b`) is kept completely, although only the
-  inexact conjuncts would have to stay.
+- **Descriptors of split FILTERs.** The parser stores the original input of
+  each conjunct of `&&` as its descriptor, so a split FILTER is shown with the
+  text of its conjunct. Each conjunct counts against the limit of 64 FILTERs
+  per group.
 - **Facts per group, not per plan.** A fact is used as soon as its group is
   planned. Facts derived from a FILTER whose variables are never bound in the
   group still produce a substitute that is simply never completed. It is never

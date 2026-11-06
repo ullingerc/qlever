@@ -393,7 +393,11 @@ std::vector<Fact> facts(std::string_view body) {
       absl::StrCat(prefixes, "SELECT * { ", body, " }"));
   std::vector<Fact> result;
   for (auto& filterFacts : recognizeFacts(query._rootGraphPattern)) {
-    ql::ranges::move(filterFacts.facts_, std::back_inserter(result));
+    for (auto& fact : filterFacts) {
+      if (fact.has_value()) {
+        result.push_back(std::move(fact).value());
+      }
+    }
   }
   return result;
 }
@@ -530,29 +534,38 @@ TEST(FilterFactsRecognizers, SeveralFacts) {
                                        V{"?ga"}, V{"?gb"}, 500})));
 }
 
-// Test that a FILTER is exact iff each of its conjuncts is an exact fact.
-TEST(FilterFactsRecognizers, ExactFilters) {
-  auto isExact = [](std::string_view filter) {
+// Test that each conjunct of a FILTER gets its own fact (or none), which is
+// exact unless it uses a variable with several values.
+TEST(FilterFactsRecognizers, ExactConjuncts) {
+  auto exactConjuncts = [](std::string_view filter) {
     auto query = ad_utility::testing::parseQuery(
         absl::StrCat(prefixes, "SELECT * { ", geoms, "VALUES ?y { \"a\"@en } ",
                      filter, " }"));
     auto factsPerFilter = recognizeFacts(query._rootGraphPattern);
     AD_CORRECTNESS_CHECK(factsPerFilter.size() == 1);
-    return factsPerFilter[0].exact_;
+    std::vector<bool> result;
+    for (const auto& fact : factsPerFilter[0]) {
+      result.push_back(isExact(fact));
+    }
+    return result;
   };
 
-  // Exact facts, also several of them.
-  EXPECT_TRUE(isExact("FILTER(geof:metricDistance(?ga, ?gb) <= 500)"));
-  EXPECT_TRUE(isExact("FILTER(geof:metricDistance(?ga, ?gb) < 500)"));
-  EXPECT_TRUE(isExact("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")"));
-  EXPECT_TRUE(isExact(
-      "FILTER(LANG(?y) = \"en\" && geof:metricDistance(?ga, ?gb) <= 500)"));
+  // Exact facts.
+  EXPECT_THAT(exactConjuncts("FILTER(geof:metricDistance(?ga, ?gb) < 500)"),
+              ElementsAre(true));
+  EXPECT_THAT(exactConjuncts("FILTER(LANG(?y) = \"en\" || LANG(?y) = \"de\")"),
+              ElementsAre(true));
+  EXPECT_THAT(exactConjuncts("FILTER(LANG(?y) = \"en\" && "
+                             "geof:metricDistance(?ga, ?gb) <= 500)"),
+              ElementsAre(true, true));
 
-  // A conjunct that is not a fact, or a fact from several values.
-  EXPECT_FALSE(
-      isExact("FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)"));
-  EXPECT_FALSE(isExact(
-      "VALUES ?r { 500 1000 } FILTER(geof:metricDistance(?ga, ?gb) <= ?r)"));
+  // A conjunct that is not a fact, and a fact from several values.
+  EXPECT_THAT(exactConjuncts(
+                  "FILTER(geof:metricDistance(?ga, ?gb) <= 500 && ?a != ?b)"),
+              ElementsAre(true, false));
+  EXPECT_THAT(exactConjuncts("VALUES ?r { 500 1000 } "
+                             "FILTER(geof:metricDistance(?ga, ?gb) <= ?r)"),
+              ElementsAre(false));
 }
 
 }  // namespace
