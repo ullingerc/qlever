@@ -15,6 +15,7 @@
 
 #include "backports/three_way_comparison.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
+#include "engine/sparqlExpressions/SparqlExpressionPimpl.h"
 #include "global/ValueIdComparators.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/TripleComponent.h"
@@ -111,7 +112,7 @@ using Conjunct = std::variant<Constraint, LangEquals, Opaque>;
 // NOTE 2: The result points into `filter` (for the `Opaque` conjuncts), so
 // `filter` must outlive it.
 std::vector<Conjunct> canonicalize(
-    const sparqlExpression::SparqlExpression& filter,
+    const sparqlExpression::SparqlExpressionPimpl& filter,
     const Definitions& defs = {});
 
 }  // namespace filterFacts
