@@ -61,11 +61,11 @@ struct Distance {
 
 // The comparison `lhs_ op_ rhs_` of a distance with a number `rhs_` (in
 // meters), where `op_` is `<` or `<=`.
-struct Constraint {
+struct DistanceComparison {
   Distance lhs_;
   valueIdComparators::Comparison op_;
   double rhs_;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_)
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(DistanceComparison, lhs_, op_, rhs_)
 };
 
 // The comparison `LANG(var_) = c` for at least one of the constants `c` in
@@ -89,15 +89,15 @@ struct Opaque {};
 // expression and its canonical form.
 struct Conjunct {
   sparqlExpression::SparqlExpressionPimpl expression_;
-  std::variant<Constraint, LangEquals, Opaque> canonical_;
+  std::variant<DistanceComparison, LangEquals, Opaque> canonical_;
 };
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
 // its conjuncts, bring each comparison `distance < number` or
-// `distance <= number` into a `Constraint` (with the number in meters), and
-// each comparison of `LANG(?x)` with constants into a `LangEquals`. A variable
-// with a definition in `defs` is replaced by its definition (for the distance,
-// the number, `LANG(?x)` and the constants).
+// `distance <= number` into a `DistanceComparison` (with the number in meters),
+// and each comparison of `LANG(?x)` with constants into a `LangEquals`. A
+// variable with a definition in `defs` is replaced by its definition (for the
+// distance, the number, `LANG(?x)` and the constants).
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpressionPimpl& filter,
     const Definitions& defs = {});
