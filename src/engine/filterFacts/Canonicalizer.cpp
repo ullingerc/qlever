@@ -13,8 +13,10 @@
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
+#include "engine/sparqlExpressions/SparqlExpression.h"
 #include "parser/ParsedQuery.h"
 #include "parser/VariableCounter.h"
+#include "util/Algorithm.h"
 #include "util/UnitOfMeasurement.h"
 
 namespace filterFacts {
@@ -348,11 +350,12 @@ Conjunct toConjunct(const SparqlExpression& expression,
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpressionPimpl& filter,
     const Definitions& defs) {
-  return ::ranges::to<std::vector>(
-      filter.splitConjunction() |
-      ql::views::transform([&defs](const auto& conjunct) {
-        return toConjunct(*conjunct.getPimpl(), defs);
-      }));
+  return ad_utility::transform(
+      filter.splitConjunction(),
+      [&defs](sparqlExpression::SparqlExpressionPimpl conjunct) {
+        auto canonical = toCanonicalForm(*conjunct.getPimpl(), defs);
+        return Conjunct{std::move(conjunct), std::move(canonical)};
+      });
 }
 
 }  // namespace filterFacts

@@ -13,7 +13,6 @@
 #include <optional>
 #include <string>
 
-#include "backports/three_way_comparison.h"
 #include "engine/filterFacts/Canonicalizer.h"
 #include "util/HashSet.h"
 
@@ -24,12 +23,10 @@
 // must still be applied after this operation.
 namespace filterFacts {
 
-// The distance between the geometries `a_` and `b_` (each a variable or a
-// constant geometry, at least one of them a variable) is at most
-// `maxMeters_`.
+// The `distance_` (between two different operands, at least one of them a
+// variable) is at most `maxMeters_`.
 struct DistanceBound {
-  TripleComponent a_;
-  TripleComponent b_;
+  Distance distance_;
   double maxMeters_;
   // True iff the fact holds exactly when its conjunct holds.
   bool exact_ = true;

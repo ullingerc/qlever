@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "backports/three_way_comparison.h"
-#include "engine/sparqlExpressions/SparqlExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionPimpl.h"
 #include "global/ValueIdComparators.h"
 #include "parser/GraphPatternOperation.h"
@@ -54,8 +53,7 @@ struct Definitions {
 Definitions collectDefinitions(
     const std::vector<parsedQuery::GraphPatternOperation>& group);
 
-// `geof:distance(a_, b_)` in meters. `a_` and `b_` are variables or constant
-// geometries.
+// `geof:distance(a_, b_)` in meters. `a_` and `b_` are variables or constants.
 struct Distance {
   TripleComponent a_;
   TripleComponent b_;
@@ -91,13 +89,14 @@ struct LangEquals {
 };
 
 // Any other expression.
-struct Opaque {
-  const sparqlExpression::SparqlExpression* expression_;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Opaque, expression_)
-};
+struct Opaque {};
 
-// A conjunct of a FILTER (the FILTER holds iff all its conjuncts hold).
-using Conjunct = std::variant<Constraint, LangEquals, Opaque>;
+// A conjunct of a FILTER (the FILTER holds iff all its conjuncts hold): its
+// expression and its canonical form.
+struct Conjunct {
+  sparqlExpression::SparqlExpressionPimpl expression_;
+  std::variant<Constraint, LangEquals, Opaque> canonical_;
+};
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
 // its conjuncts, bring each comparison `distance < number` or

@@ -75,8 +75,9 @@ getSpatialJoinConfigForFilter(
     using enum SpatialJoinType::Enum;
     return std::pair{
         LibSpatialJoinConfig{WITHIN_DIST, bound->maxMeters_, std::nullopt},
-        sparqlExpression::GeoFunctionCall{WITHIN_DIST, std::move(bound->a_),
-                                          std::move(bound->b_)}};
+        sparqlExpression::GeoFunctionCall{WITHIN_DIST,
+                                          std::move(bound->distance_.a_),
+                                          std::move(bound->distance_.b_)}};
   }
   return std::nullopt;
 }
@@ -126,7 +127,7 @@ namespace {
 // `geof:metricDistance(a, b) <= maxMeters`.
 SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
   using namespace sparqlExpression;
-  // The operands of a `DistanceBound` are variables or constant geometries (see
+  // The operands of a `DistanceBound` are variables or constants (see
   // `getGeoDistanceExpressionParameters`).
   auto toExpression =
       [](const TripleComponent& operand) -> SparqlExpression::Ptr {
@@ -140,13 +141,13 @@ SparqlFilter distanceBoundToFilter(const filterFacts::DistanceBound& bound) {
   };
   auto expression =
       std::make_unique<LessEqualExpression>(LessEqualExpression::Children{
-          makeMetricDistExpression(toExpression(bound.a_),
-                                   toExpression(bound.b_)),
+          makeMetricDistExpression(toExpression(bound.distance_.a_),
+                                   toExpression(bound.distance_.b_)),
           std::make_unique<IdExpression>(
               Id::makeFromDouble(bound.maxMeters_))});
   auto descriptor =
-      absl::StrCat("geof:metricDistance(", bound.a_.toString(), ", ",
-                   bound.b_.toString(), ") <= ", bound.maxMeters_);
+      absl::StrCat("geof:metricDistance(", bound.distance_.a_.toString(), ", ",
+                   bound.distance_.b_.toString(), ") <= ", bound.maxMeters_);
   return SparqlFilter{
       SparqlExpressionPimpl{std::move(expression), std::move(descriptor)}};
 }
@@ -195,8 +196,9 @@ void rewriteFiltersWithFacts(parsedQuery::GraphPattern& group) {
         continue;
       }
       bool needsDefinitions =
-          bound.has_value() && !filterFacts::recognizeDistanceBound(
-                                   filterFacts::canonicalize(piece)[0]);
+          bound.has_value() &&
+          !filterFacts::recognizeDistanceBound(
+              filterFacts::canonicalize(conjunct.expression_)[0]);
       if (needsDefinitions) {
         result.push_back(distanceBoundToFilter(bound.value()));
       }
