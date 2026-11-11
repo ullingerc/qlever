@@ -136,10 +136,8 @@ std::optional<double> getNumber(const SparqlExpression& expression,
   }
 
   // A number.
-  const auto* id =
-      dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
-  return id == nullptr ? std::nullopt
-                       : TripleComponent{id->value()}.getNumber();
+  auto constant = resolved.getConstantValue();
+  return constant.has_value() ? constant->getNumber() : std::nullopt;
 }
 
 // Return the possible values of `expression` if it is a literal or a variable
@@ -258,27 +256,17 @@ Conjunct toConjunct(const SparqlExpression& expression,
   return Constraint{Distance{call->left_, call->right_}, op.value(), meters};
 }
 
-// Split `expression` at `&&` and append the canonical form of each conjunct to
-// `result`.
-void split(const SparqlExpression& expression, const Definitions& defs,
-           std::vector<Conjunct>& result) {
-  if (sparqlExpression::isAndExpression(expression)) {
-    for (const auto& child : expression.children()) {
-      split(*child, defs, result);
-    }
-  } else {
-    result.push_back(toConjunct(expression, defs));
-  }
-}
-
 }  // namespace
 
 // _____________________________________________________________________________
-std::vector<Conjunct> canonicalize(const SparqlExpression& filter,
-                                   const Definitions& defs) {
-  std::vector<Conjunct> result;
-  split(filter, defs, result);
-  return result;
+std::vector<Conjunct> canonicalize(
+    const sparqlExpression::SparqlExpressionPimpl& filter,
+    const Definitions& defs) {
+  return ::ranges::to<std::vector>(
+      filter.splitConjunction() |
+      ql::views::transform([&defs](const auto& conjunct) {
+        return toConjunct(*conjunct.getPimpl(), defs);
+      }));
 }
 
 }  // namespace filterFacts
