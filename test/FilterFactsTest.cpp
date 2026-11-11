@@ -49,7 +49,7 @@ Canonical canonical(std::string_view filter,
   const auto& group = result.query_._rootGraphPattern;
   auto defs = collectDefinitions(group._graphPatterns);
   for (const auto& f : group._filters) {
-    ql::ranges::move(canonicalize(*f.expression_.getPimpl(), defs),
+    ql::ranges::move(canonicalize(f.expression_, defs),
                      std::back_inserter(result.conjuncts_));
   }
   return result;

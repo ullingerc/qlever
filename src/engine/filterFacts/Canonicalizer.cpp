@@ -9,8 +9,6 @@
 
 #include "engine/filterFacts/Canonicalizer.h"
 
-#include "engine/sparqlExpressions/LiteralExpression.h"
-#include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
 #include "parser/ParsedQuery.h"
@@ -142,12 +140,8 @@ std::optional<std::vector<double>> getNumbers(
   }
 
   // A single number.
-  const auto* id =
-      dynamic_cast<const sparqlExpression::IdExpression*>(&resolved);
-  if (id == nullptr) {
-    return std::nullopt;
-  }
-  auto number = TripleComponent{id->value()}.getNumber();
+  auto constant = resolved.getConstantValue();
+  auto number = constant.has_value() ? constant->getNumber() : std::nullopt;
   return number.has_value() ? std::optional{std::vector{number.value()}}
                             : std::nullopt;
 }
@@ -188,27 +182,17 @@ Conjunct toConjunct(const SparqlExpression& expression,
                     min == max};
 }
 
-// Split `expression` at `&&` and append the canonical form of each conjunct to
-// `result`.
-void split(const SparqlExpression& expression, const Definitions& defs,
-           std::vector<Conjunct>& result) {
-  if (sparqlExpression::isAndExpression(expression)) {
-    for (const auto& child : expression.children()) {
-      split(*child, defs, result);
-    }
-  } else {
-    result.push_back(toConjunct(expression, defs));
-  }
-}
-
 }  // namespace
 
 // _____________________________________________________________________________
-std::vector<Conjunct> canonicalize(const SparqlExpression& filter,
-                                   const Definitions& defs) {
-  std::vector<Conjunct> result;
-  split(filter, defs, result);
-  return result;
+std::vector<Conjunct> canonicalize(
+    const sparqlExpression::SparqlExpressionPimpl& filter,
+    const Definitions& defs) {
+  return ::ranges::to<std::vector>(
+      filter.splitConjunction() |
+      ql::views::transform([&defs](const auto& conjunct) {
+        return toConjunct(*conjunct.getPimpl(), defs);
+      }));
 }
 
 }  // namespace filterFacts

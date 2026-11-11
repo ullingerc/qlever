@@ -49,7 +49,9 @@ ResolvedGeoOperand resolveGeoOperand(
 static std::optional<
     std::pair<LibSpatialJoinConfig, sparqlExpression::GeoFunctionCall>>
 getSpatialJoinConfigForFilter(
-    const sparqlExpression::SparqlExpression& filterBody) {
+    const sparqlExpression::SparqlExpressionPimpl& filter) {
+  const auto& filterBody = *filter.getPimpl();
+
   // The filter body directly is an optimizable `geof:sf...` function.
   if (auto call = getGeoFunctionExpressionParameters(filterBody)) {
     return std::pair{LibSpatialJoinConfig{call.value().function_},
@@ -64,7 +66,7 @@ getSpatialJoinConfigForFilter(
   }
   // The filter body bounds the distance between two geometries (see
   // `filterFacts::recognizeDistanceBound`).
-  auto conjuncts = filterFacts::canonicalize(filterBody);
+  auto conjuncts = filterFacts::canonicalize(filter);
   if (conjuncts.size() != 1) {
     return std::nullopt;
   }
@@ -82,10 +84,8 @@ getSpatialJoinConfigForFilter(
 std::shared_ptr<SpatialJoin> rewriteFilterToSpatialJoin(
     const SparqlFilter& filter, QueryExecutionContext* qec,
     absl::FunctionRef<Variable()> generateUniqueVarName) {
-  const auto& filterBody = *filter.expression_.getPimpl();
-
   // Currently, we can only optimize GeoSPARQL filters.
-  auto configAndCall = getSpatialJoinConfigForFilter(filterBody);
+  auto configAndCall = getSpatialJoinConfigForFilter(filter.expression_);
   if (!configAndCall.has_value()) {
     return nullptr;
   }
@@ -159,8 +159,7 @@ void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
   for (auto& filter : filters) {
     // Recognize the `DistanceBound` of each conjunct of `filter`. Keep a
     // FILTER without any as it is.
-    auto conjuncts =
-        filterFacts::canonicalize(*filter.expression_.getPimpl(), defs);
+    auto conjuncts = filterFacts::canonicalize(filter.expression_, defs);
     auto bounds = ::ranges::to<std::vector>(
         conjuncts | ql::views::transform(&filterFacts::recognizeDistanceBound));
     if (ql::ranges::none_of(bounds,
@@ -179,9 +178,8 @@ void rewriteFiltersWithFacts(std::vector<SparqlFilter>& filters,
     // not exact, the conjunct is kept as well.
     for (auto&& [piece, bound] : ::ranges::views::zip(pieces, bounds)) {
       bool needsDefinitions =
-          bound.has_value() &&
-          !filterFacts::recognizeDistanceBound(
-              filterFacts::canonicalize(*piece.getPimpl())[0]);
+          bound.has_value() && !filterFacts::recognizeDistanceBound(
+                                   filterFacts::canonicalize(piece)[0]);
       if (needsDefinitions) {
         result.push_back(distanceBoundToFilter(bound.value()));
       }
