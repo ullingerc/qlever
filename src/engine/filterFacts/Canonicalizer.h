@@ -105,11 +105,8 @@ struct Conjunct {
 // with a definition in `defs` is replaced by its definition (for the distance,
 // the number, the unit, `LANG(?x)` and the constants).
 //
-// NOTE 1: The comparisons may also have swapped operands (`500 >= distance`),
-// and the number may be computed with `+`, `-`, `*` and `/`.
-//
-// NOTE 2: The result points into `filter` (for the `Opaque` conjuncts), so
-// `filter` must outlive it.
+// NOTE: The comparisons may also have swapped operands (`500 >= distance`), and
+// the number may be computed with `+`, `-`, `*` and `/`.
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpressionPimpl& filter,
     const Definitions& defs = {});

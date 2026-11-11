@@ -182,16 +182,12 @@ void rewriteFiltersWithFacts(parsedQuery::GraphPattern& group) {
       continue;
     }
 
-    // Split `filter` into its conjuncts.
-    auto pieces = conjuncts.size() > 1 ? filter.expression_.splitConjunction()
-                                       : std::vector{filter.expression_};
-    AD_CORRECTNESS_CHECK(pieces.size() == bounds.size());
-
-    // Drop the replaced conjuncts. Replace a conjunct whose fact needs the
-    // definitions by an equivalent FILTER without them, which can be rewritten
-    // on its own. If the fact is not exact, the conjunct is kept as well.
-    for (auto&& [piece, bound, replaced] :
-         ::ranges::views::zip(pieces, bounds, isReplaced)) {
+    // Split `filter` into its conjuncts. Drop the replaced conjuncts. Replace a
+    // conjunct whose fact needs the definitions by an equivalent FILTER without
+    // them, which can be rewritten on its own. If the fact is not exact, the
+    // conjunct is kept as well.
+    for (auto&& [conjunct, bound, replaced] :
+         ::ranges::views::zip(conjuncts, bounds, isReplaced)) {
       if (replaced) {
         continue;
       }
@@ -203,7 +199,7 @@ void rewriteFiltersWithFacts(parsedQuery::GraphPattern& group) {
         result.push_back(distanceBoundToFilter(bound.value()));
       }
       if (!needsDefinitions || !bound->exact_) {
-        result.push_back(SparqlFilter{std::move(piece)});
+        result.push_back(SparqlFilter{std::move(conjunct.expression_)});
       }
     }
   }

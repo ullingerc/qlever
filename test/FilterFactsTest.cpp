@@ -55,15 +55,31 @@ Canonical canonical(std::string_view filter,
   return result;
 }
 
-// Matcher for a `Constraint` `distance op meters` (compared with a tolerance,
-// because the factors of the conversion of units are rounded).
-auto constraint(Comparison op, double meters, bool exact = true) {
+// Matcher for a `Conjunct` that is the `Constraint` `distance op meters`
+// (compared with a tolerance, because the factors of the conversion of units
+// are rounded).
+auto constraint(Comparison op, double meters, double tolerance = 1e-3,
+                bool exact = true) {
   using namespace ::testing;
-  return VariantWith<Constraint>(
-      AllOf(Field(&Constraint::lhs_, Eq(Distance{V{"?ga"}, V{"?gb"}})),
-            Field(&Constraint::op_, op),
-            Field(&Constraint::rhs_, DoubleNear(meters, 1e-3)),
-            Field(&Constraint::exact_, exact)));
+  return Field(&Conjunct::canonical_,
+               VariantWith<Constraint>(AllOf(
+                   Field(&Constraint::lhs_, Eq(Distance{V{"?ga"}, V{"?gb"}})),
+                   Field(&Constraint::op_, op),
+                   Field(&Constraint::rhs_, DoubleNear(meters, tolerance)),
+                   Field(&Constraint::exact_, exact))));
+}
+
+// Matcher for a `Conjunct` that is `Opaque` with the given `expression`.
+auto opaque(const sparqlExpression::SparqlExpression* expression) {
+  using namespace ::testing;
+  return AllOf(
+      Field(&Conjunct::canonical_, VariantWith<Opaque>(_)),
+      Field(&Conjunct::expression_,
+            ResultOf(
+                [](const sparqlExpression::SparqlExpressionPimpl& pimpl) {
+                  return pimpl.getPimpl();
+                },
+                expression)));
 }
 
 // Test that `distance < number` and `distance <= number` become a
@@ -144,7 +160,7 @@ TEST(FilterFactsCanonicalizer, ConstantFolding) {
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
     auto trace = generateLocationTrace(l);
     EXPECT_THAT(canonical(filter, definitions).conjuncts_,
-                ElementsAre(constraint(Comparison::LE, meters, exact)));
+                ElementsAre(constraint(Comparison::LE, meters, 1e-3, exact)));
   };
   expect("", "geof:metricDistance(?ga, ?gb) <= 250 * 2", 500);
   expect("", "geof:metricDistance(?ga, ?gb) <= 250 + 250", 500);
@@ -164,7 +180,9 @@ TEST(FilterFactsCanonicalizer, ConstantFolding) {
            {"VALUES ?r { 1 2 } VALUES ?s { 1 2 }",
             "geof:metricDistance(?ga, ?gb) <= ?r + ?s"}}) {
     EXPECT_THAT(canonical(filter, definitions).conjuncts_,
-                ElementsAre(VariantWith<Opaque>(::testing::_)))
+                ElementsAre(::testing::Field(
+                    &Conjunct::canonical_,
+                    ::testing::VariantWith<Opaque>(::testing::_))))
         << filter;
   }
 }
@@ -248,23 +266,22 @@ TEST(FilterFactsCanonicalizer, CollectDefinitions) {
 
 // Test that every other expression stays `Opaque`.
 TEST(FilterFactsCanonicalizer, Opaque) {
-  for (std::string_view filter :
-       {"geof:metricDistance(?ga, ?gb) > 500",
-        "500 <= geof:metricDistance(?ga, ?gb)",
-        "geof:metricDistance(?ga, ?gb) <= \"500\"",
-        "geof:metricDistance(?ga, ?gb) <= ?a",
-        "geof:metricDistance(?ga, ?gb) + 1 <= 500", "?a <= 500", "BOUND(?a)",
-        "geof:metricDistance(?ga, ?gb) <= 500 || ?a = 1",
-        "geof:distance(?ga, ?gb, unit:M2) <= 500"}) {
+  // Expect that `filter` is a single `Opaque` conjunct with the whole
+  // expression of the FILTER.
+  auto expectOpaque = [](std::string_view filter,
+                         ad_utility::source_location l =
+                             AD_CURRENT_SOURCE_LOC()) {
+    auto trace = generateLocationTrace(l);
     auto result = canonical(filter);
     EXPECT_THAT(result.conjuncts_,
                 ElementsAre(opaque(result.query_._rootGraphPattern._filters[0]
                                        .expression_.getPimpl())));
   };
 
-  // A comparison other than `distance < number` or `distance <= number`.
+  // A comparison other than `distance < number` or `distance <= number` (also
+  // with swapped operands).
   expectOpaque("geof:metricDistance(?ga, ?gb) > 500");
-  expectOpaque("500 >= geof:metricDistance(?ga, ?gb)");
+  expectOpaque("500 <= geof:metricDistance(?ga, ?gb)");
 
   // A right side that is not a number.
   expectOpaque("geof:metricDistance(?ga, ?gb) <= \"500\"");
@@ -298,15 +315,14 @@ TEST(FilterFactsRecognizers, DistanceBound) {
   // `<=` and `<` (where the maximum distance is the largest `double` below
   // the number).
   EXPECT_THAT(recognize("geof:distance(?ga, ?gb, unit:M) <= 500"),
-              ::testing::Optional(DistanceBound{V{"?ga"}, V{"?gb"}, 500}));
+              ::testing::Optional(DistanceBound{distance, 500}));
 
   // A `DistanceBound` from a `Constraint` that is not exact is not exact.
   auto conjuncts =
       canonical("geof:metricDistance(?ga, ?gb) <= ?r", "VALUES ?r { 500 1000 }")
           .conjuncts_;
-  EXPECT_THAT(
-      recognizeDistanceBound(conjuncts.at(0)),
-      ::testing::Optional(DistanceBound{V{"?ga"}, V{"?gb"}, 1000, false}));
+  EXPECT_THAT(recognizeDistanceBound(conjuncts.at(0)),
+              ::testing::Optional(DistanceBound{distance, 1000, false}));
   EXPECT_THAT(
       recognize("geof:metricDistance(?ga, ?gb) < 500"),
       ::testing::Optional(DistanceBound{

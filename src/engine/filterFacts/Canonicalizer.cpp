@@ -299,8 +299,8 @@ std::optional<LangEquals> toLangEquals(const SparqlExpression& expression,
 // `distance <= number` (also with swapped operands) become a `Constraint`, a
 // comparison of `LANG(?x)` with constants becomes a `LangEquals`, everything
 // else is `Opaque`.
-Conjunct toConjunct(const SparqlExpression& expression,
-                    const Definitions& defs) {
+std::variant<Constraint, LangEquals, Opaque> toCanonicalForm(
+    const SparqlExpression& expression, const Definitions& defs) {
   if (auto langEquals = toLangEquals(expression, defs)) {
     return std::move(langEquals).value();
   }
@@ -310,7 +310,7 @@ Conjunct toConjunct(const SparqlExpression& expression,
   // for every other expression.
   auto comparison = getLessComparison(expression);
   if (!comparison.has_value()) {
-    return Opaque{&expression};
+    return Opaque{};
   }
   auto [op, isSwapped] = comparison.value();
   const auto& distance = *expression.children()[isSwapped ? 1 : 0];
@@ -323,23 +323,19 @@ Conjunct toConjunct(const SparqlExpression& expression,
   auto numbers = getNumbers(number, defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
       !numbers.has_value()) {
-    return Opaque{&expression};
+    return Opaque{};
   }
 
   // Convert the largest number from the unit of the distance to meters.
   //
-  // NOTE: For meters and kilometers, the conversion is exact (in particular, a
-  // number in meters is not converted to kilometers and back, which may change
-  // it). For the other units, it is exact only up to the rounding of the
-  // conversion factor.
+  // NOTE: A number in meters is not converted to kilometers and back (which may
+  // change it). For the other units, the conversion is exact only up to the
+  // rounding of the conversion factor.
   auto [min, max] = ql::ranges::minmax(numbers.value());
-  double meters = max;
-  if (call->unit_ == UnitOfMeasurement::KILOMETERS) {
-    meters *= 1000;
-  } else if (call->unit_ != UnitOfMeasurement::METERS) {
-    meters =
-        ad_utility::detail::valueInUnitToKilometer(meters, call->unit_) * 1000;
-  }
+  double meters =
+      call->unit_ == UnitOfMeasurement::METERS
+          ? max
+          : ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
   return Constraint{Distance{call->left_, call->right_}, op, meters,
                     min == max};
 }

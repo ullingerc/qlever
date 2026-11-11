@@ -18,9 +18,10 @@
 
 // The recognition of typed facts in the canonical conjuncts of a FILTER (see
 // `Canonicalizer.h`). A fact holds if its conjunct holds. If the fact is exact
-// (it holds iff its conjunct holds), a rewrite of the query may replace the
-// conjunct by an operation that implements the fact. Otherwise, the conjunct
-// must still be applied after this operation.
+// (it holds iff its conjunct holds, up to the rounding of the conversion of
+// units, see `canonicalize`), a rewrite of the query may replace the conjunct
+// by an operation that implements the fact. Otherwise, the conjunct must still
+// be applied after this operation.
 namespace filterFacts {
 
 // The `distance_` (between two different operands, at least one of them a
