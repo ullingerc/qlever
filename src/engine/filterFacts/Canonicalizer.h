@@ -66,12 +66,13 @@ struct Distance {
 // NOTE: The conjunct and the comparison are equivalent iff `exact_` is true. It
 // is false if the number is a variable from a `VALUES` clause with different
 // numbers in different rows: then `rhs_` is the largest of them.
-struct Constraint {
+struct DistanceComparison {
   Distance lhs_;
   valueIdComparators::Comparison op_;
   double rhs_;
   bool exact_ = true;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_, exact_)
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(DistanceComparison, lhs_, op_, rhs_,
+                                        exact_)
 };
 
 // The comparison `LANG(var_) = c` for at least one of the constants `c` in
@@ -95,15 +96,15 @@ struct Opaque {};
 // expression and its canonical form.
 struct Conjunct {
   sparqlExpression::SparqlExpressionPimpl expression_;
-  std::variant<Constraint, LangEquals, Opaque> canonical_;
+  std::variant<DistanceComparison, LangEquals, Opaque> canonical_;
 };
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
 // its conjuncts, bring each comparison `distance < number` or
-// `distance <= number` into a `Constraint` (with the number in meters), and
-// each comparison of `LANG(?x)` with constants into a `LangEquals`. A variable
-// with a definition in `defs` is replaced by its definition (for the distance,
-// the number, the unit, `LANG(?x)` and the constants).
+// `distance <= number` into a `DistanceComparison` (with the number in meters),
+// and each comparison of `LANG(?x)` with constants into a `LangEquals`. A
+// variable with a definition in `defs` is replaced by its definition (for the
+// distance, the number, the unit, `LANG(?x)` and the constants).
 //
 // NOTE: The comparisons may also have swapped operands (`500 >= distance`), and
 // the number may be computed with `+`, `-`, `*` and `/`.

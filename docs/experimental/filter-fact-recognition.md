@@ -58,7 +58,7 @@ The code lives in `src/engine/filterFacts/` and in `rewriteFiltersWithFacts`
      that pattern binds `?v` freely).
 2. **Canonicalizer** (`canonicalize`). Each FILTER becomes a list of
    `Conjunct`s (split at `&&`), each one of:
-   - `Constraint{Distance{a, b}, op, rhs, exact}`: `distance(a, b) < rhs` or
+   - `DistanceComparison{Distance{a, b}, op, rhs, exact}`: `distance(a, b) < rhs` or
      `<= rhs` in meters. Also with swapped operands (`500 >= d`), with the
      number computed by `+ - * /`, and with the distance, the number and the
      unit from the definitions. With several values (from
