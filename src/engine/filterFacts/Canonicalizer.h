@@ -65,12 +65,13 @@ struct Distance {
 // NOTE: The conjunct and the comparison are equivalent iff `exact_` is true. It
 // is false if the number is a variable from a `VALUES` clause with different
 // numbers in different rows: then `rhs_` is the largest of them.
-struct Constraint {
+struct DistanceComparison {
   Distance lhs_;
   valueIdComparators::Comparison op_;
   double rhs_;
   bool exact_ = true;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(Constraint, lhs_, op_, rhs_, exact_)
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(DistanceComparison, lhs_, op_, rhs_,
+                                        exact_)
 };
 
 // Any other expression.
@@ -80,13 +81,13 @@ struct Opaque {};
 // expression and its canonical form.
 struct Conjunct {
   sparqlExpression::SparqlExpressionPimpl expression_;
-  std::variant<Constraint, Opaque> canonical_;
+  std::variant<DistanceComparison, Opaque> canonical_;
 };
 
 // Bring the expression of a FILTER into canonical form: split it at `&&` into
 // its conjuncts, and bring each comparison `distance < number` or
-// `distance <= number` into a `Constraint` (with the number in meters). A
-// variable with a definition in `defs` is replaced by its definition (for the
+// `distance <= number` into a `DistanceComparison` (with the number in meters).
+// A variable with a definition in `defs` is replaced by its definition (for the
 // distance and the number).
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpressionPimpl& filter,

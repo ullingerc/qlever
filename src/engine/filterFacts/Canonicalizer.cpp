@@ -149,8 +149,9 @@ std::optional<std::vector<double>> getNumbers(
 }
 
 // Return the canonical form of a single conjunct: `distance < number` and
-// `distance <= number` become a `Constraint`, everything else is `Opaque`.
-std::variant<Constraint, Opaque> toCanonicalForm(
+// `distance <= number` become a `DistanceComparison`, everything else is
+// `Opaque`.
+std::variant<DistanceComparison, Opaque> toCanonicalForm(
     const SparqlExpression& expression, const Definitions& defs) {
   // Match `distance op number` for a distance in a unit of length, return
   // `Opaque` for every other expression.
@@ -176,8 +177,8 @@ std::variant<Constraint, Opaque> toCanonicalForm(
       call->unit_ == UnitOfMeasurement::METERS
           ? max
           : ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
-  return Constraint{Distance{call->left_, call->right_}, op.value(), meters,
-                    min == max};
+  return DistanceComparison{Distance{call->left_, call->right_}, op.value(),
+                            meters, min == max};
 }
 
 }  // namespace
