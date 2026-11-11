@@ -11,8 +11,10 @@
 
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
+#include "engine/sparqlExpressions/SparqlExpression.h"
 #include "parser/ParsedQuery.h"
 #include "parser/VariableCounter.h"
+#include "util/Algorithm.h"
 #include "util/UnitOfMeasurement.h"
 
 namespace filterFacts {
@@ -148,36 +150,32 @@ std::optional<std::vector<double>> getNumbers(
 
 // Return the canonical form of a single conjunct: `distance < number` and
 // `distance <= number` become a `Constraint`, everything else is `Opaque`.
-Conjunct toConjunct(const SparqlExpression& expression,
-                    const Definitions& defs) {
+std::variant<Constraint, Opaque> toCanonicalForm(
+    const SparqlExpression& expression, const Definitions& defs) {
   // Match `distance op number` for a distance in a unit of length, return
   // `Opaque` for every other expression.
   auto op = sparqlExpression::getComparison(expression);
   if (op != Comparison::LT && op != Comparison::LE) {
-    return Opaque{&expression};
+    return Opaque{};
   }
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
       resolve(*expression.children()[0], defs));
   auto numbers = getNumbers(*expression.children()[1], defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
       !numbers.has_value()) {
-    return Opaque{&expression};
+    return Opaque{};
   }
 
   // Convert the largest number from the unit of the distance to meters.
   //
-  // NOTE: For meters and kilometers, the conversion is exact (in particular, a
-  // number in meters is not converted to kilometers and back, which may change
-  // it). For the other units, it is exact only up to the rounding of the
-  // conversion factor.
+  // NOTE: A number in meters is not converted to kilometers and back (which may
+  // change it). For the other units, the conversion is exact only up to the
+  // rounding of the conversion factor.
   auto [min, max] = ql::ranges::minmax(numbers.value());
-  double meters = max;
-  if (call->unit_ == UnitOfMeasurement::KILOMETERS) {
-    meters *= 1000;
-  } else if (call->unit_ != UnitOfMeasurement::METERS) {
-    meters =
-        ad_utility::detail::valueInUnitToKilometer(meters, call->unit_) * 1000;
-  }
+  double meters =
+      call->unit_ == UnitOfMeasurement::METERS
+          ? max
+          : ad_utility::detail::valueInUnitToKilometer(max, call->unit_) * 1000;
   return Constraint{Distance{call->left_, call->right_}, op.value(), meters,
                     min == max};
 }
@@ -188,11 +186,12 @@ Conjunct toConjunct(const SparqlExpression& expression,
 std::vector<Conjunct> canonicalize(
     const sparqlExpression::SparqlExpressionPimpl& filter,
     const Definitions& defs) {
-  return ::ranges::to<std::vector>(
-      filter.splitConjunction() |
-      ql::views::transform([&defs](const auto& conjunct) {
-        return toConjunct(*conjunct.getPimpl(), defs);
-      }));
+  return ad_utility::transform(
+      filter.splitConjunction(),
+      [&defs](sparqlExpression::SparqlExpressionPimpl conjunct) {
+        auto canonical = toCanonicalForm(*conjunct.getPimpl(), defs);
+        return Conjunct{std::move(conjunct), std::move(canonical)};
+      });
 }
 
 }  // namespace filterFacts
