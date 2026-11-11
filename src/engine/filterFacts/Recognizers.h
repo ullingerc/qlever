@@ -30,7 +30,7 @@ struct DistanceBound {
   double maxMeters_;
   // True iff the fact holds exactly when its conjunct holds.
   bool exact_ = true;
-  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(DistanceBound, a_, b_, maxMeters_,
+  QL_DEFINE_DEFAULTED_EQUALITY_OPERATOR(DistanceBound, distance_, maxMeters_,
                                         exact_)
 };
 

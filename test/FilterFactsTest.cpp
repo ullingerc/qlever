@@ -119,7 +119,7 @@ TEST(FilterFactsCanonicalizer, Definitions) {
                    ad_utility::source_location l = AD_CURRENT_SOURCE_LOC()) {
     auto trace = generateLocationTrace(l);
     EXPECT_THAT(canonical(filter, definitions).conjuncts_,
-                ElementsAre(constraint(op, meters, exact)));
+                ElementsAre(constraint(op, meters, 1e-3, exact)));
   };
   expect("VALUES ?r { 500 }", "geof:metricDistance(?ga, ?gb) <= ?r",
          Comparison::LE, 500);
