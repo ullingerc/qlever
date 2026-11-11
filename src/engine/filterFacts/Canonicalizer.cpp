@@ -220,9 +220,10 @@ std::optional<LangEquals> toLangEquals(const SparqlExpression& expression,
 }
 
 // Return the canonical form of a single conjunct: `distance < number` and
-// `distance <= number` become a `Constraint`, a comparison of `LANG(?x)` with
-// constants becomes a `LangEquals`, everything else is `Opaque`.
-std::variant<Constraint, LangEquals, Opaque> toCanonicalForm(
+// `distance <= number` become a `DistanceComparison`, a comparison of
+// `LANG(?x)` with constants becomes a `LangEquals`, everything else is
+// `Opaque`.
+std::variant<DistanceComparison, LangEquals, Opaque> toCanonicalForm(
     const SparqlExpression& expression, const Definitions& defs) {
   if (auto langEquals = toLangEquals(expression, defs)) {
     return std::move(langEquals).value();
@@ -252,7 +253,8 @@ std::variant<Constraint, LangEquals, Opaque> toCanonicalForm(
                       : ad_utility::detail::valueInUnitToKilometer(
                             number.value(), call->unit_) *
                             1000;
-  return Constraint{Distance{call->left_, call->right_}, op.value(), meters};
+  return DistanceComparison{Distance{call->left_, call->right_}, op.value(),
+                            meters};
 }
 
 }  // namespace
