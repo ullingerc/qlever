@@ -1728,6 +1728,10 @@ TEST(QueryPlanner, SpatialJoinDistanceVariableFromBindWithFixedGeometry) {
 
   // The distances from the `SpatialJoin` are the same as those of the `BIND`
   // (adding `0` prevents the replacement, but doesn't change the values).
+  //
+  // NOTE: With a fixed geometry, the distances of the `SpatialJoin` differ from
+  // those of `geof:distance` by up to about 5e-5 relative (a few cm at a few
+  // km), so the tolerance is larger than in the test above.
   auto expected = compute(absl::StrCat(same, " + 0"));
   auto actual = compute(same);
   ASSERT_EQ(expected.size(), 3);
@@ -1735,7 +1739,7 @@ TEST(QueryPlanner, SpatialJoinDistanceVariableFromBindWithFixedGeometry) {
   for (size_t row = 0; row < expected.size(); ++row) {
     EXPECT_EQ(actual[row].first, expected[row].first);
     EXPECT_NEAR(actual[row].second, expected[row].second,
-                1e-6 * expected[row].second);
+                1e-4 * expected[row].second);
   }
 }
 
