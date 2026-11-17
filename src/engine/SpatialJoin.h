@@ -177,9 +177,10 @@ class SpatialJoin : public Operation {
       const parsedQuery::Bind& bind) const override;
 
   // If `bind` computes the distance between the two join variables of this
-  // `SpatialJoin`, and this `SpatialJoin` already computes exact distances,
-  // return a copy of this `SpatialJoin` that binds the distance to the target
-  // of the `bind`. Otherwise return `std::nullopt`.
+  // `SpatialJoin` (or the fixed value of a join variable, see
+  // `rewriteFilterToSpatialJoin`), and this `SpatialJoin` already computes
+  // exact distances, return a copy of this `SpatialJoin` that binds the
+  // distance to the target of the `bind`. Otherwise return `std::nullopt`.
   std::optional<std::shared_ptr<QueryExecutionTree>>
   makeTreeWithDistanceVariable(const parsedQuery::Bind& bind) const;
 

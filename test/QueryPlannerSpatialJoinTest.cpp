@@ -1665,6 +1665,80 @@ TEST(QueryPlanner, SpatialJoinDistanceVariableFromBindResult) {
   }
 }
 
+// Test that a `BIND` of the distance between the join variable of a
+// `SpatialJoin` and a fixed geometry is replaced by the distance variable of
+// the `SpatialJoin` iff its other child binds exactly this geometry, and that
+// the distances are the same.
+TEST(QueryPlanner, SpatialJoinDistanceVariableFromBindWithFixedGeometry) {
+  auto scan = h::IndexScanFromStrings;
+  using V = Variable;
+  auto point = [](std::string_view coordinates) {
+    return absl::StrCat("\"POINT(", coordinates, ")\"^^<", GEO_WKT_LITERAL,
+                        ">");
+  };
+  // The geometries `?y` within 10 km of a fixed point, with the given `BIND`.
+  auto query = [&point](std::string_view bind, std::string_view suffix = "") {
+    return absl::StrCat(
+        "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> "
+        "SELECT * WHERE { ?a <p> ?y . FILTER(geof:distance(?y, ",
+        point("7.84 48.0"), ") <= 10) BIND(", bind, " AS ?d) } ", suffix);
+  };
+  V fixed{absl::StrCat(QLEVER_INTERNAL_VARIABLE_QUERY_PLANNER_PREFIX, 0)};
+  auto sj = [&](std::optional<V> distanceVariable) {
+    return h::spatialJoinFilterSubstitute(
+        10'000, -1, V{"?y"}, fixed, std::move(distanceVariable),
+        PayloadVariables::all(), SpatialJoinAlgorithm::LIBSPATIALJOIN,
+        SpatialJoinType::WITHIN_DIST, std::nullopt, scan("?a", "<p>", "?y"),
+        h::ValuesClause(absl::StrCat(
+            "VALUES (", fixed.name(),
+            ") { (G:", GeoPoint{48.0, 7.84}.toStringRepresentation(), ") }")));
+  };
+
+  // The `BIND` is replaced for the same geometry, in any order.
+  auto same = absl::StrCat("geof:distance(?y, ", point("7.84 48.0"), ")");
+  h::expect(query(same), sj(V{"?d"}));
+  h::expect(query(absl::StrCat("geof:distance(", point("7.84 48.0"), ", ?y)")),
+            sj(V{"?d"}));
+
+  // The `BIND` is kept for another geometry.
+  auto other = absl::StrCat("geof:distance(?y, ", point("7.9 48.0"), ")");
+  h::expect(query(other), h::Bind(sj(std::nullopt), other, V{"?d"}));
+
+  // Three points within 10 km of the fixed point, and one farther away.
+  std::string kg;
+  for (auto [subject, coordinates] :
+       {std::pair{"<a1>", "7.83505 48.01267"},
+        std::pair{"<a2>", "7.85298 47.99557"}, std::pair{"<a3>", "7.9 47.98"},
+        std::pair{"<a4>", "8.4 48.0"}}) {
+    absl::StrAppend(&kg, subject, " <p> ", point(coordinates), " .\n");
+  }
+  auto* qec = ad_utility::testing::getQec(kg);
+  auto compute = [&](std::string_view bind) {
+    qec->clearCacheUnpinnedOnly();
+    auto qet = h::parseAndPlan(query(bind, "ORDER BY ?a"), qec);
+    auto dist = qet->getVariableColumn(V{"?d"});
+    auto a = qet->getVariableColumn(V{"?a"});
+    auto table = qet->getResult()->idTableView().clone();
+    std::vector<std::pair<Id, double>> rows;
+    for (size_t row = 0; row < table.numRows(); ++row) {
+      rows.emplace_back(table(row, a), table(row, dist).getDouble());
+    }
+    return rows;
+  };
+
+  // The distances from the `SpatialJoin` are the same as those of the `BIND`
+  // (adding `0` prevents the replacement, but doesn't change the values).
+  auto expected = compute(absl::StrCat(same, " + 0"));
+  auto actual = compute(same);
+  ASSERT_EQ(expected.size(), 3);
+  ASSERT_EQ(actual.size(), expected.size());
+  for (size_t row = 0; row < expected.size(); ++row) {
+    EXPECT_EQ(actual[row].first, expected[row].first);
+    EXPECT_NEAR(actual[row].second, expected[row].second,
+                1e-6 * expected[row].second);
+  }
+}
+
 // _____________________________________________________________________________
 TEST(QueryPlanner, FilterIsNotRewritten) {
   auto scan = h::IndexScanFromStrings;

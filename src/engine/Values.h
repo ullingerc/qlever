@@ -45,6 +45,12 @@ class Values : virtual public Operation {
 
   virtual float getMultiplicity(size_t col) override;
 
+  // The parsed values.
+  //
+  // NOTE: `computeResult` moves the values out, so this is only meaningful
+  // before the result is computed (e.g. during query planning).
+  const SparqlValues& getParsedValues() const { return parsedValues_; }
+
  private:
   uint64_t getSizeEstimateBeforeLimit() override;
 

@@ -31,6 +31,7 @@
 #include "engine/NamedResultCache.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/SpatialJoinConfig.h"
+#include "engine/Values.h"
 #include "engine/VariableToColumnMap.h"
 #include "engine/idTable/IdTable.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
@@ -708,6 +709,30 @@ SpatialJoin::makeTreeWithBindColumn(const parsedQuery::Bind& bind) const {
       .pushDownBindToChild(bind, std::move(children), 1);
 }
 
+namespace {
+
+// Return true if `operand` (an argument of a distance) has the value of the
+// join variable `joinVariable` in every row: `operand` is this variable, or a
+// fixed value that `child` binds to this variable in its only row (as the
+// `VALUES` child for a fixed geometry, see `rewriteFilterToSpatialJoin`).
+bool hasValueOfJoinVariable(const TripleComponent& operand,
+                            const Variable& joinVariable,
+                            const QueryExecutionTree& child) {
+  if (operand.isVariable()) {
+    return operand.getVariable() == joinVariable;
+  }
+  const auto* values =
+      dynamic_cast<const Values*>(child.getRootOperation().get());
+  if (values == nullptr) {
+    return false;
+  }
+  const auto& [variables, rows] = values->getParsedValues();
+  return variables == std::vector{joinVariable} && rows.size() == 1 &&
+         rows.front().front() == operand;
+}
+
+}  // namespace
+
 // _____________________________________________________________________________
 std::optional<std::shared_ptr<QueryExecutionTree>>
 SpatialJoin::makeTreeWithDistanceVariable(const parsedQuery::Bind& bind) const {
@@ -719,18 +744,20 @@ SpatialJoin::makeTreeWithDistanceVariable(const parsedQuery::Bind& bind) const {
   }
 
   // The `BIND` expression must be the distance between the two join variables
-  // (in any order) in a unit of length.
+  // (in any order) in a unit of length. A join variable may also be given by
+  // the fixed value that its child binds it to.
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
       *bind._expression.getPimpl());
-  if (!call.has_value() || !call->left_.isVariable() ||
-      !call->right_.isVariable() ||
-      !ad_utility::detail::isLengthUnit(call->unit_)) {
+  if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_)) {
     return std::nullopt;
   }
-  const auto& left = call->left_.getVariable();
-  const auto& right = call->right_.getVariable();
-  if (!(left == config_.left_ && right == config_.right_) &&
-      !(left == config_.right_ && right == config_.left_)) {
+  auto isDistanceOfJoinVariables = [this](const TripleComponent& left,
+                                          const TripleComponent& right) {
+    return hasValueOfJoinVariable(left, config_.left_, *childLeft_) &&
+           hasValueOfJoinVariable(right, config_.right_, *childRight_);
+  };
+  if (!isDistanceOfJoinVariables(call->left_, call->right_) &&
+      !isDistanceOfJoinVariables(call->right_, call->left_)) {
     return std::nullopt;
   }
 
