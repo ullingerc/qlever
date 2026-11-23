@@ -9,7 +9,6 @@
 
 #include "engine/filterFacts/Canonicalizer.h"
 
-#include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
 #include "engine/sparqlExpressions/QueryRewriteExpressionHelpers.h"
 #include "engine/sparqlExpressions/RelationalExpressions.h"
@@ -173,6 +172,32 @@ const SparqlExpression& resolve(const SparqlExpression& expression,
   return expression;
 }
 
+// Return the values of `variable` in `defs` (from `VALUES` or a `BIND` of a
+// constant), and `std::nullopt` if it has none.
+std::optional<std::vector<TripleComponent>> getConstants(
+    const Variable& variable, const Definitions& defs) {
+  auto it = defs.constants_.find(variable);
+  if (it == defs.constants_.end() || it->second.empty()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+// Return the possible values of `expression` if it is a constant or a variable
+// with values in `defs`, and `std::nullopt` otherwise.
+std::optional<std::vector<TripleComponent>> getConstants(
+    const SparqlExpression& expression, const Definitions& defs) {
+  const auto& resolved = resolve(expression, defs);
+  if (auto variable = resolved.getVariableOrNullopt()) {
+    return getConstants(variable.value(), defs);
+  }
+  auto constant = resolved.getConstantValue();
+  if (!constant.has_value()) {
+    return std::nullopt;
+  }
+  return std::vector{std::move(constant).value()};
+}
+
 // Return `a op b`, and `std::nullopt` for a division by zero (whose result
 // depends on a runtime parameter).
 std::optional<double> fold(sparqlExpression::ArithmeticOperator op, double a,
@@ -198,23 +223,6 @@ std::optional<std::vector<double>> getNumbers(
     const SparqlExpression& expression, const Definitions& defs) {
   const auto& resolved = resolve(expression, defs);
 
-  // A variable with the numbers of a `VALUES` clause or a `BIND`.
-  if (auto variable = resolved.getVariableOrNullopt()) {
-    auto it = defs.constants_.find(variable.value());
-    if (it == defs.constants_.end() || it->second.empty()) {
-      return std::nullopt;
-    }
-    std::vector<double> numbers;
-    for (const auto& constant : it->second) {
-      auto number = constant.getNumber();
-      if (!number.has_value()) {
-        return std::nullopt;
-      }
-      numbers.push_back(number.value());
-    }
-    return numbers;
-  }
-
   // The result of `+`, `-`, `*` or `/` for each pair of values of the two
   // operands, one of which must have a single value (to keep the number of
   // values small).
@@ -238,42 +246,20 @@ std::optional<std::vector<double>> getNumbers(
     return numbers;
   }
 
-  // A single number.
-  auto constant = resolved.getConstantValue();
-  auto number = constant.has_value() ? constant->getNumber() : std::nullopt;
-  return number.has_value() ? std::optional{std::vector{number.value()}}
-                            : std::nullopt;
-}
-
-// Return the single value of `variable` from `defs` (from `VALUES` or a `BIND`
-// of a constant), and `std::nullopt` if it has none or several.
-std::optional<TripleComponent> getConstant(const Variable& variable,
-                                           const Definitions& defs) {
-  auto it = defs.constants_.find(variable);
-  if (it == defs.constants_.end() || it->second.size() != 1) {
+  // A constant or a variable with constants.
+  auto constants = getConstants(resolved, defs);
+  if (!constants.has_value()) {
     return std::nullopt;
   }
-  return it->second.front();
-}
-
-// Return the possible values of `expression` if it is a literal or a variable
-// with values in `defs` (and `std::nullopt` otherwise).
-std::optional<std::vector<TripleComponent>> getConstants(
-    const SparqlExpression& expression, const Definitions& defs) {
-  const auto& resolved = resolve(expression, defs);
-  if (auto variable = resolved.getVariableOrNullopt()) {
-    auto it = defs.constants_.find(variable.value());
-    if (it == defs.constants_.end() || it->second.empty()) {
+  std::vector<double> numbers;
+  for (const auto& constant : constants.value()) {
+    auto number = constant.getNumber();
+    if (!number.has_value()) {
       return std::nullopt;
     }
-    return it->second;
+    numbers.push_back(number.value());
   }
-  if (const auto* literal =
-          dynamic_cast<const sparqlExpression::StringLiteralExpression*>(
-              &resolved)) {
-    return std::vector{TripleComponent{literal->value()}};
-  }
-  return std::nullopt;
+  return numbers;
 }
 
 // Return the canonical form of `LANG(?x) = c`, `c = LANG(?x)`,
@@ -355,8 +341,13 @@ std::variant<DistanceComparison, LangEquals, Opaque> toCanonicalForm(
   const auto& number = *expression.children()[isSwapped ? 0 : 1];
 
   auto call = sparqlExpression::getGeoDistanceExpressionParameters(
-      resolve(distance, defs), [&defs](const Variable& variable) {
-        return getConstant(variable, defs);
+      resolve(distance, defs),
+      [&defs](const Variable& variable) -> std::optional<TripleComponent> {
+        auto constants = getConstants(variable, defs);
+        if (!constants.has_value() || constants->size() != 1) {
+          return std::nullopt;
+        }
+        return constants->front();
       });
   auto numbers = getNumbers(number, defs);
   if (!call.has_value() || !ad_utility::detail::isLengthUnit(call->unit_) ||
