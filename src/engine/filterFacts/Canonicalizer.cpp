@@ -191,11 +191,10 @@ std::optional<std::vector<TripleComponent>> getConstants(
   if (auto variable = resolved.getVariableOrNullopt()) {
     return getConstants(variable.value(), defs);
   }
-  auto constant = resolved.getConstantValue();
-  if (!constant.has_value()) {
-    return std::nullopt;
+  if (auto constant = resolved.getConstantValue()) {
+    return std::vector{std::move(constant).value()};
   }
-  return std::vector{std::move(constant).value()};
+  return std::nullopt;
 }
 
 // Return `a op b`, and `std::nullopt` for a division by zero (whose result
