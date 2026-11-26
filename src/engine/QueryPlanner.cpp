@@ -1529,8 +1529,8 @@ void QueryPlanner::applyFiltersIfPossible(
           plan._qet->getRootOperation()->areVariablesAlwaysDefined(
               filterAndSubst.filter_.expression_.containedVariables())) {
         // Apply this filter via its substitute if it cannot be evaluated
-        // regularly (see `createSpatialJoinWithinPlan`), otherwise regularly.
-        auto spatialJoin = createSpatialJoinWithinPlan(plan, filterAndSubst);
+        // regularly (see `createSpatialJoinOnSinglePlan`), otherwise regularly.
+        auto spatialJoin = createSpatialJoinOnSinglePlan(plan, filterAndSubst);
         SubtreePlan newPlan =
             spatialJoin.has_value()
                 ? std::move(spatialJoin.value())
@@ -2533,7 +2533,7 @@ SubtreePlanVec QueryPlanner::createJoinsWithSubstitutes(
 }
 
 // _____________________________________________________________________________
-std::optional<SubtreePlan> QueryPlanner::createSpatialJoinWithinPlan(
+std::optional<SubtreePlan> QueryPlanner::createSpatialJoinOnSinglePlan(
     const SubtreePlan& plan,
     const FilterAndOptionalSubstitute& filterAndSubst) const {
   // Only apply a substitute this way that is not enforced and whose filter

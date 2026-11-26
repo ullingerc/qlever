@@ -1747,7 +1747,7 @@ TEST(QueryPlanner, SpatialJoinChildrenShareNoVariable) {
 // evaluated as a `SpatialJoin` of the plan with the `Distinct` pairs of values
 // of their variables (their regular filter is not implemented), and only
 // those.
-TEST(QueryPlanner, SpatialJoinCycleWithinPlan) {
+TEST(QueryPlanner, SpatialJoinCycleOnSinglePlan) {
   using column_stripping_test_helpers::countOperations;
 
   // A region `<f1>` that contains the smaller region `<r1>` and the point
@@ -1815,7 +1815,7 @@ TEST(QueryPlanner, SpatialJoinCycleWithinPlan) {
   }
 
   // Two geometric relations between the same two variables: one is applied
-  // within the plan.
+  // to a single plan.
   auto parallel = plan(
       "FILTER geof:sfIntersects(?fg, ?rg) FILTER geof:sfContains(?fg, ?rg)",
       {"?f", "?r"});
@@ -1824,7 +1824,7 @@ TEST(QueryPlanner, SpatialJoinCycleWithinPlan) {
               matchesIdTableFromVector({{id("<f1>"), id("<r1>")}}));
 
   // Two relations with the same region but without a cycle: none is applied
-  // within the plan.
+  // to a single plan.
   auto chain = plan(
       "?t <q> ?tg . FILTER geof:sfContains(?fg, ?rg) "
       "FILTER geof:sfContains(?fg, ?tg)",

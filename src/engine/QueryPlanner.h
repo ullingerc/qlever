@@ -525,7 +525,7 @@ class QueryPlanner {
   // because its variables were bound together by other joins or substitutes
   // (for example, for a cycle of geometric relations). The geometric relations
   // like `geof:sfContains` cannot be evaluated as a regular filter.
-  std::optional<SubtreePlan> createSpatialJoinWithinPlan(
+  std::optional<SubtreePlan> createSpatialJoinOnSinglePlan(
       const SubtreePlan& plan,
       const FilterAndOptionalSubstitute& filterAndSubst) const;
 

@@ -223,7 +223,7 @@ class SpatialJoin : public Operation {
   //
   // NOTE: The values are compared as `Id`s, so UNDEF is only equal to UNDEF
   // (unlike for a regular join). This is used to join a plan with a `Distinct`
-  // of its own columns, see `QueryPlanner::createSpatialJoinWithinPlan`.
+  // of its own columns, see `QueryPlanner::createSpatialJoinOnSinglePlan`.
   qlm::vector<std::array<ColumnIndex, 2>> getSharedColumns() const;
 
   // The left/right children and join variables, swapped for a `WITHIN` join
