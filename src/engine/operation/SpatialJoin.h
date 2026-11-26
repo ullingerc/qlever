@@ -37,6 +37,10 @@ struct PreparedSpatialJoinParams {
   qlm::vector<ColumnIndex> leftSelectedCols_;
   qlm::vector<ColumnIndex> rightSelectedCols_;
   size_t numColumns_;
+  // The columns in `childLeft_` and `childRight_` (not swapped for a `WITHIN`
+  // join) of the variables that occur in both children, see
+  // `SpatialJoin::getSharedColumns`.
+  qlm::vector<std::array<ColumnIndex, 2>> sharedCols_;
 };
 
 // This class is implementing a SpatialJoin operation. This operations joins
@@ -207,8 +211,20 @@ class SpatialJoin : public Operation {
 
   // helper function to generate a variable to column map from `childRight_`
   // that only contains the columns selected by `config_.payloadVariables_`
-  // and (automatically added) the `config_.right_` variable.
+  // and (automatically added) the `config_.right_` variable. The variables
+  // that also occur in `childLeft_` are not contained (see
+  // `getSharedColumns`).
   VariableToColumnMap getVarColMapPayloadVars() const;
+
+  // Return the columns in `childLeft_` and `childRight_` of each variable that
+  // occurs in both children. Only the pairs of rows with equal values in these
+  // columns are joined (like for a regular join), and the result contains
+  // these columns only once.
+  //
+  // NOTE: The values are compared as `Id`s, so UNDEF is only equal to UNDEF
+  // (unlike for a regular join). This is used to join a plan with a `Distinct`
+  // of its own columns, see `QueryPlanner::createSpatialJoinWithinPlan`.
+  qlm::vector<std::array<ColumnIndex, 2>> getSharedColumns() const;
 
   // The left/right children and join variables, swapped for a `WITHIN` join
   // (which is computed using `CONTAINS` on swapped tables, see `prepareJoin()`

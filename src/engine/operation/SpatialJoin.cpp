@@ -217,6 +217,13 @@ qlm::string SpatialJoin::getCacheKeyImpl() const {
     }
     os << "\n";
 
+    // Columns of the variables that occur in both children
+    os << "shared:";
+    for (const auto& [leftCol, rightCol] : getSharedColumns()) {
+      os << " " << leftCol << "=" << rightCol;
+    }
+    os << "\n";
+
     // If we use the s2-point-polyline algorithm, we also need to add the cache
     // entry name to our own cache key.
     if (config_.rightCacheName_.has_value()) {
@@ -270,20 +277,10 @@ size_t SpatialJoin::getResultWidth() const {
     // of the spatial join, the join column is different for both sides (e.g.
     // objects with a distance of at most 500m to each other, then each object
     // might contain different positions, which should be kept).
-    // For the right join table we only use the selected columns.
-    size_t sizeRight;
-    if (config_.payloadVariables_.isAll()) {
-      sizeRight = childRight_->getVariableColumns().size();
-    } else {
-      // We convert to a set here, because we allow multiple occurrences of
-      // variables in payloadVariables_
-      std::vector<Variable> pv = config_.payloadVariables_.getVariables();
-      absl::flat_hash_set<Variable> pvSet{pv.begin(), pv.end()};
-
-      // The payloadVariables_ may contain the right join variable
-      sizeRight = pvSet.size() + (pvSet.contains(config_.right_) ? 0 : 1);
-    }
-    auto widthChildren = childLeft_->getVariableColumns().size() + sizeRight;
+    // For the right join table we only use the selected columns that are not
+    // in the left table.
+    auto widthChildren = childLeft_->getVariableColumns().size() +
+                         getVarColMapPayloadVars().size();
 
     if (config_.distanceVariable_.has_value()) {
       return widthChildren + 1;
@@ -467,7 +464,28 @@ VariableToColumnMap SpatialJoin::getVarColMapPayloadVars() const {
     newVarColMap.insert_or_assign(config_.right_, varColMap.at(config_.right_));
   }
 
+  // The variables that also occur in the left child are already in the result.
+  if (childLeft_) {
+    erase_if(newVarColMap, [this](const auto& varAndCol) {
+      return childLeft_->getVariableColumns().contains(varAndCol.first);
+    });
+  }
   return newVarColMap;
+}
+
+// ____________________________________________________________________________
+qlm::vector<std::array<ColumnIndex, 2>> SpatialJoin::getSharedColumns() const {
+  qlm::vector<std::array<ColumnIndex, 2>> sharedColumns{allocator()};
+  if (!childLeft_ || !childRight_) {
+    return sharedColumns;
+  }
+  for (const auto& [var, colInfo] :
+       copySortedByColumnIndex(childRight_->getVariableColumns())) {
+    if (auto leftCol = childLeft_->getVariableColumnOrNullopt(var)) {
+      sharedColumns.push_back({leftCol.value(), colInfo.columnIndex_});
+    }
+  }
+  return sharedColumns;
 }
 
 // ____________________________________________________________________________
@@ -527,7 +545,8 @@ PreparedSpatialJoinParams SpatialJoin::prepareJoin() const {
                                    rightJoinCol,
                                    std::move(leftSelectedCols),
                                    std::move(rightSelectedCols),
-                                   numColumns};
+                                   numColumns,
+                                   getSharedColumns()};
 }
 
 // ____________________________________________________________________________
@@ -608,18 +627,20 @@ VariableToColumnMap SpatialJoin::computeVariableToColumnMap() const {
     auto sizeLeft = childLeft_->getVariableColumns().size();
     auto varColMapLeft = childLeft_->getVariableColumns();
     AD_CONTRACT_CHECK(
-        !varColMapLeft.contains(config_.right_),
-        "Right variable must not be defined in left child of spatial join.");
-    AD_CONTRACT_CHECK(
         varColMapLeft.contains(config_.left_),
         "Left variable is not defined in left child of spatial join.");
     addColumns(varColMapLeft, 0);
 
+    // The children may share variables (see `getSharedColumns`), but not for
+    // a nearest neighbors search, which would select the nearest neighbors
+    // before checking the shared columns.
+    AD_CONTRACT_CHECK(
+        getSharedColumns().empty() ||
+            !std::holds_alternative<NearestNeighborsConfig>(config_.task_),
+        "The children of a nearest neighbors spatial join must not share a "
+        "variable.");
     auto varColMapRightFiltered = getVarColMapPayloadVars();
     auto sizeRight = varColMapRightFiltered.size();
-    AD_CONTRACT_CHECK(
-        !varColMapRightFiltered.contains(config_.left_),
-        "Left variable must not be defined in right child of spatial join.");
     addColumns(varColMapRightFiltered, sizeLeft);
 
     // Column for the distance

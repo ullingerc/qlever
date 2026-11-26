@@ -29,6 +29,19 @@ void SpatialJoinAlgorithmBase::addResultTableEntry(
     IdTable* result, const IdTableView<0>* idTableLeft,
     const IdTableView<0>* idTableRight, size_t rowLeft, size_t rowRight,
     Id distance, bool swapLeftAndRight) const {
+  // Skip the pair of rows if they differ in a variable that occurs in both
+  // children (the `sharedCols_` are not swapped).
+  auto [originalLeft, originalRowLeft, originalRight, originalRowRight] =
+      swapLeftAndRight
+          ? std::tuple{idTableRight, rowRight, idTableLeft, rowLeft}
+          : std::tuple{idTableLeft, rowLeft, idTableRight, rowRight};
+  for (const auto& [leftCol, rightCol] : params_.sharedCols_) {
+    if (originalLeft->at(originalRowLeft, leftCol) !=
+        originalRight->at(originalRowRight, rightCol)) {
+      return;
+    }
+  }
+
   auto resrow = result->numRows();
   result->emplace_back();
   size_t rescol = 0;

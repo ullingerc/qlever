@@ -264,8 +264,8 @@ LibspatialjoinAlgorithm::ParseMetadata LibspatialjoinAlgorithm::parse(
 // ____________________________________________________________________________
 Result LibspatialjoinAlgorithm::run() {
   const auto [idTableLeft, resultLeft, idTableRight, resultRight, leftJoinCol,
-              rightJoinCol, leftSelectedCols, rightSelectedCols, numColumns] =
-      params_;
+              rightJoinCol, leftSelectedCols, rightSelectedCols, numColumns,
+              sharedCols] = params_;
   // Setup.
   IdTable result{numColumns, qec_->getAllocator()};
   size_t NUM_THREADS = getNumThreads();

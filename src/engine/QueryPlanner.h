@@ -514,6 +514,21 @@ class QueryPlanner {
       const SubtreePlan& a, const SubtreePlan& b,
       const FiltersAndOptionalSubstitutes& filters) const;
 
+  // Apply the filter of `filterAndSubst` to `plan`, which binds both of its
+  // variables, via its `SpatialJoin` substitute: a `SpatialJoin` of `plan`
+  // with the distinct pairs of values of the two variables in (a clone of)
+  // `plan`, which keeps the rows of `plan` whose own pair is in the relation
+  // (see `SpatialJoin::getSharedColumns`). Return `std::nullopt` if the filter
+  // can be evaluated regularly, or has no substitute or an enforced one.
+  //
+  // NOTE: This is needed for a substitute that cannot connect two plans,
+  // because its variables were bound together by other joins or substitutes
+  // (for example, for a cycle of geometric relations). The geometric relations
+  // like `geof:sfContains` cannot be evaluated as a regular filter.
+  std::optional<SubtreePlan> createSpatialJoinWithinPlan(
+      const SubtreePlan& plan,
+      const FilterAndOptionalSubstitute& filterAndSubst) const;
+
   // Helper that generates `IndexScan` query plans on materialized views if they
   // can be used to avoid joins between some of the `triples`. The resulting
   // plans for part of the `triples` are given in a vector of query planning

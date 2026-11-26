@@ -55,6 +55,7 @@
 #include "engine/operation/RowNumber.h"
 #include "engine/operation/Service.h"
 #include "engine/operation/SpatialJoin.h"
+#include "engine/operation/StripColumns.h"
 #include "engine/operation/TextIndexScanForEntity.h"
 #include "engine/operation/TextIndexScanForWord.h"
 #include "engine/operation/TextLimit.h"
@@ -1527,9 +1528,14 @@ void QueryPlanner::applyFiltersIfPossible(
       if (applyAll ||
           plan._qet->getRootOperation()->areVariablesAlwaysDefined(
               filterAndSubst.filter_.expression_.containedVariables())) {
-        // Apply this filter regularly.
-        SubtreePlan newPlan = makeSubtreePlan<Filter>(
-            _qec, plan._qet, filterAndSubst.filter_.expression_);
+        // Apply this filter via its substitute if it cannot be evaluated
+        // regularly (see `createSpatialJoinWithinPlan`), otherwise regularly.
+        auto spatialJoin = createSpatialJoinWithinPlan(plan, filterAndSubst);
+        SubtreePlan newPlan =
+            spatialJoin.has_value()
+                ? std::move(spatialJoin.value())
+                : makeSubtreePlan<Filter>(_qec, plan._qet,
+                                          filterAndSubst.filter_.expression_);
         mergeSubtreePlanIds(newPlan, newPlan, plan);
         newPlan._idsOfIncludedFilters |= (size_t(1) << i);
         newPlan.type = plan.type;
@@ -2524,6 +2530,45 @@ SubtreePlanVec QueryPlanner::createJoinsWithSubstitutes(
     }
   }
   return candidates;
+}
+
+// _____________________________________________________________________________
+std::optional<SubtreePlan> QueryPlanner::createSpatialJoinWithinPlan(
+    const SubtreePlan& plan,
+    const FilterAndOptionalSubstitute& filterAndSubst) const {
+  // Only apply a substitute this way that is not enforced and whose filter
+  // cannot be evaluated regularly (unlike `geof:distance`), if `plan` binds
+  // both of its variables.
+  if (!filterAndSubst.hasSubstitute() || filterAndSubst.forceSubstitution_) {
+    return std::nullopt;
+  }
+  auto spatialJoin = std::dynamic_pointer_cast<const SpatialJoin>(
+      filterAndSubst.substitute_.value()._qet->getRootOperation());
+  AD_CORRECTNESS_CHECK(spatialJoin != nullptr);
+  auto [left, right] = spatialJoin->getSpatialJoinVariables();
+  if (spatialJoin->getJoinType() == SpatialJoinType::WITHIN_DIST ||
+      !plan._qet->getVariableColumnOrNullopt(left).has_value() ||
+      !plan._qet->getVariableColumnOrNullopt(right).has_value()) {
+    return std::nullopt;
+  }
+
+  // Compute the distinct pairs of values of the two variables in `plan`.
+  //
+  // NOTE: This uses a clone of `plan`, so that each operation occurs only once
+  // in the tree (for example, with its own runtime information). The clone has
+  // the same cache key, so `plan` is computed only once.
+  auto pairs = QueryExecutionTree::createDistinctTree(
+      makeExecutionTree<StripColumns>(_qec, plan._qet->clone(),
+                                      std::set<Variable>{left, right}),
+      std::array<ColumnIndex, 2>{0, 1});
+
+  // Join `plan` with these pairs via the `SpatialJoin`. Both variables occur
+  // in both children, so each row of `plan` is joined only with its own pair
+  // (see `SpatialJoin::getSharedColumns`), and kept iff the pair is in the
+  // relation.
+  auto withPlan = spatialJoin->addChild(plan._qet, left);
+  return makeSubtreePlan<SpatialJoin>(
+      withPlan->addChild(std::move(pairs), right));
 }
 
 // _____________________________________________________________________________________________________________________

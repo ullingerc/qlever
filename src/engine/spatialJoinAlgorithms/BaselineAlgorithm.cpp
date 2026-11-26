@@ -20,8 +20,8 @@ Result BaselineAlgorithm::run() {
   throw std::runtime_error("not supported in C++17 mode currently");
 #else
   const auto [idTableLeft, resultLeft, idTableRight, resultRight, leftJoinCol,
-              rightJoinCol, leftSelectedCols, rightSelectedCols, numColumns] =
-      params_;
+              rightJoinCol, leftSelectedCols, rightSelectedCols, numColumns,
+              sharedCols] = params_;
   IdTable result{numColumns, qec_->getAllocator()};
 
   // Rows skipped because their value is not a supported geometry.
