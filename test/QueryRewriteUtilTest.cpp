@@ -346,6 +346,16 @@ TEST(QueryRewriteUtilTest, RewriteFiltersWithFacts) {
               ElementsAre("geof:metricDistance(?y, ?b) <= 1000",
                           "(geof:distance(?y, ?b) <= ?r)"));
 
+  // The same with a constant geometry that is not a point (which stays a
+  // literal, while a point becomes an `Id`).
+  std::string line =
+      "\"LINESTRING(7.8 48.0, 7.8 48.1)\"^^"
+      "<http://www.opengis.net/ont/geosparql#wktLiteral>";
+  EXPECT_THAT(
+      rewrite(absl::StrCat("geof:distance(?y, ", line, ") <= ?r"),
+              "VALUES ?r { 0.5 }"),
+      ElementsAre(absl::StrCat("geof:metricDistance(?y, ", line, ") <= 500")));
+
   // A conjunct with a language filter is replaced by it, unless the language
   // differs between the rows.
   EXPECT_THAT(rewrite("LANG(?y) = \"en\" && ?x != ?a"),
